@@ -24,6 +24,18 @@ class GraphicPacksWindow2;
 class EmulatedUSBDeviceFrame;
 class wxLaunchGameEvent;
 
+// Faro-specific: starts a background named-pipe server (Windows-only,
+// no-op unless running with --embedded) that lets the host app (Faro)
+// trigger an NFC/amiibo touch at any point during gameplay from its own
+// overlay - see the implementation in MainWindow.cpp for why this exists
+// (no viable trigger for this exists anywhere in upstream Cemu: a startup
+// CLI flag fires once before nn::nfp even initializes and validates
+// against the wrong file format, there's no IPC/second-instance channel in
+// main.cpp/CemuApp.cpp, and simulating OS drag&drop isn't viable since wx
+// registers its drop target via OLE, not WM_DROPFILES). Call site is in
+// CemuApp.cpp, right after the main frame is created.
+void StartFaroNfcBridge();
+
 wxDECLARE_EVENT(wxEVT_LAUNCH_GAME, wxLaunchGameEvent);
 wxDECLARE_EVENT(wxEVT_SET_WINDOW_TITLE, wxCommandEvent);
 

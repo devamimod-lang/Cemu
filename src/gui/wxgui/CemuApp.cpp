@@ -376,6 +376,7 @@ bool CemuApp::OnInit()
 	g_window_info.app_active = true;
 
 	HotkeySettings::Init(m_mainFrame);
+	StartFaroNfcBridge();
 
 	SetTopWindow(m_mainFrame);
 	// --embedded: a host app (Faro) is about to reparent this frame's own

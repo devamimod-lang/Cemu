@@ -294,6 +294,81 @@ private:
 	MainWindow* m_window;
 };
 
+#if BOOST_OS_WINDOWS
+// --- Faro NFC/amiibo bridge ---
+//
+// A tiny named-pipe server, reusing the exact same nfc::TouchTagFromFile
+// call OnNFCMenu/wxAmiiboDropTarget above already use - see
+// StartFaroNfcBridge's own doc comment in MainWindow.h for why this is the
+// smallest-footprint option available. One connection per touch request;
+// the pipe name is scoped to this process's own PID since Faro may embed
+// more than one Cemu instance across different sessions over time (never
+// concurrently, but PIDs get reused across runs, so tying it to the
+// specific running process avoids any ambiguity). The blocking
+// promise/future round trip to the main thread mirrors how every other
+// caller of TouchTagFromFile in this file already only ever calls it from
+// the UI thread - nn::nfp's internal state isn't documented as safe to
+// touch from an arbitrary background thread, so this doesn't risk finding out.
+static void FaroNfcBridgeLoop()
+{
+	const std::wstring pipeName = L"\\\\.\\pipe\\FaroCemuNFC-" + std::to_wstring(GetCurrentProcessId());
+	while (true)
+	{
+		HANDLE pipe = CreateNamedPipeW(
+			pipeName.c_str(),
+			PIPE_ACCESS_DUPLEX,
+			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+			1, 4096, 4096, 0, nullptr);
+		if (pipe == INVALID_HANDLE_VALUE)
+			return;
+
+		const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		if (connected)
+		{
+			char buffer[4096];
+			DWORD bytesRead = 0;
+			if (ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytesRead, nullptr) && bytesRead > 0)
+			{
+				std::string message(buffer, bytesRead);
+				while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
+					message.pop_back();
+
+				const std::string prefix = "TOUCH_NFC:";
+				if (message.rfind(prefix, 0) == 0)
+				{
+					std::string path = message.substr(prefix.size());
+					auto promise = std::make_shared<std::promise<std::string>>();
+					std::future<std::string> future = promise->get_future();
+					wxTheApp->CallAfter([promise, path]()
+					{
+						uint32 nfcError = 0;
+						if (nfc::TouchTagFromFile(_utf8ToPath(path), &nfcError))
+							promise->set_value("OK");
+						else
+							promise->set_value("ERROR:" + std::to_string(nfcError));
+					});
+					const std::string reply = future.get();
+					DWORD bytesWritten = 0;
+					WriteFile(pipe, reply.c_str(), (DWORD)reply.size(), &bytesWritten, nullptr);
+				}
+			}
+			FlushFileBuffers(pipe);
+			DisconnectNamedPipe(pipe);
+		}
+		CloseHandle(pipe);
+	}
+}
+#endif
+
+void StartFaroNfcBridge()
+{
+#if BOOST_OS_WINDOWS
+	if (!LaunchSettings::EmbeddedModeEnabled())
+		return;
+	std::thread(FaroNfcBridgeLoop).detach();
+#endif
+}
+
 MainWindow::MainWindow()
 	: wxFrame(nullptr, wxID_ANY, GetInitialWindowTitle(), wxDefaultPosition, wxSize(1280, 720), wxMINIMIZE_BOX | wxMAXIMIZE_BOX | wxSYSTEM_MENU | wxCAPTION | wxCLOSE_BOX | wxCLIP_CHILDREN | wxRESIZE_BORDER)
 {

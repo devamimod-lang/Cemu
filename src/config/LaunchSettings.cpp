@@ -82,6 +82,7 @@ std::optional<int> LaunchSettings::HandleCommandline(const std::vector<std::wstr
 
 	po::options_description hidden{ "Hidden options" };
 	hidden.add_options()
+		("embedded", po::value<bool>()->implicit_value(true), "Internal: never show the main window - a host app is embedding the render surface directly")
 		("nsight", po::value<bool>()->implicit_value(true), "NSight debugging options")
 		("legacy", po::value<bool>()->implicit_value(true), "Intel legacy graphic mode")
 		("ppcrec-lower-addr", po::value<std::string>(), "For debugging: Lower address allowed for PPC recompilation")
@@ -182,6 +183,9 @@ std::optional<int> LaunchSettings::HandleCommandline(const std::vector<std::wstr
 		if (vm.count("ud"))
 			s_render_upside_down = vm["ud"].as<bool>();
 		
+		if (vm.count("embedded"))
+			s_embedded = vm["embedded"].as<bool>();
+
 		if (vm.count("nsight"))
 			s_nsight_mode = vm["nsight"].as<bool>();
 

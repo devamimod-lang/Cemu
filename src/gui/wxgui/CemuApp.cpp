@@ -378,7 +378,15 @@ bool CemuApp::OnInit()
 	HotkeySettings::Init(m_mainFrame);
 
 	SetTopWindow(m_mainFrame);
-	m_mainFrame->Show();
+	// --embedded: a host app (Faro) is about to reparent this frame's own
+	// render panel out into its own window immediately - the frame itself
+	// (menu bar, toolbar, game list) must never actually appear on screen,
+	// not even for a single frame, so this skips Show() entirely instead of
+	// showing-then-hiding from outside (which a host process can only ever
+	// do reactively, after the window already exists and may have already
+	// painted).
+	if (!LaunchSettings::EmbeddedModeEnabled())
+		m_mainFrame->Show();
 
 #if ( BOOST_OS_LINUX || BOOST_OS_BSD ) && HAS_WAYLAND
 	if (wxWlIsWaylandWindow(m_mainFrame))

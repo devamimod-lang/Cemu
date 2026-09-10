@@ -34,6 +34,14 @@ public:
 	static bool OpenDebuggerEnabled() { return s_open_debugger; }
 	static bool NSightModeEnabled() { return s_nsight_mode; }
 
+	// Faro passes this when it spawns Cemu to run inside its own dedicated
+	// session window (see gameSession/src/main/index.ts) - the main frame's
+	// own render panel gets reparented out immediately, so the frame itself
+	// (with its menu bar/toolbar) must never actually show, not even for a
+	// single frame. Hidden option, not meant for a human to type - see
+	// CemuApp::OnInit's own use of this.
+	static bool EmbeddedModeEnabled() { return s_embedded; }
+
 	static bool ForceInterpreter() { return s_force_interpreter; };
 	static bool ForceMultiCoreInterpreter() { return s_force_multicore_interpreter; }
 
@@ -59,6 +67,7 @@ private:
 	inline static bool s_enable_gdbstub = false;
 	inline static bool s_open_debugger = false;
 	inline static bool s_nsight_mode = false;
+	inline static bool s_embedded = false;
 
 	inline static bool s_force_interpreter = false;
 	inline static bool s_force_multicore_interpreter = false;

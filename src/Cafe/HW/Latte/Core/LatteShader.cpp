@@ -713,6 +713,9 @@ static void InitUniformLayoutFromDecompiler(
     shader->uniform.loc_alphaTestRef = offsets.offset_alphaTestRef;
     shader->uniform.loc_pointSize = offsets.offset_pointSize;
     shader->uniform.loc_fragCoordScale = offsets.offset_fragCoordScale;
+    // loc_taaJitter is intentionally NOT set here - Vulkan delivers TAA jitter
+    // via a push constant now (see LatteDecompilerEmitGLSLHeader.hpp), this
+    // field is OpenGL-only (set in LatteShaderGL.cpp instead).
 
     // Texture scale uniforms
     shader->uniform.list_ufTexRescale.clear();

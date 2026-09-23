@@ -376,7 +376,11 @@ bool CemuApp::OnInit()
 	g_window_info.app_active = true;
 
 	HotkeySettings::Init(m_mainFrame);
-	StartFaroNfcBridge();
+	// Gate at the call site (not just inside StartFaroNfcBridge) so the
+	// non-embedded launch path never even calls into that function - see
+	// StartFaroNfcBridge's own doc comment for why.
+	if (LaunchSettings::EmbeddedModeEnabled())
+		StartFaroNfcBridge();
 
 	SetTopWindow(m_mainFrame);
 	// --embedded: a host app (Faro) is about to reparent this frame's own

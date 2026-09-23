@@ -14,6 +14,40 @@ namespace LatteDecompiler
 				cemu_assert_debug(resourceMapping.uniformVarsBufferBindingPoint >= 0);
 				decompilerContext->shaderSource->addFmt("layout(set = {}, binding = {}) uniform ufBlock" _CRLF "{{" _CRLF, (sint32)resourceMapping.setIndex, (sint32)resourceMapping.uniformVarsBufferBindingPoint);
 			}
+			// Faro TAA: sub-pixel camera jitter, delivered via a Vulkan push
+			// constant instead of the per-shader ufBlock above (see
+			// SET_POSITION's own comment - an earlier version that packed this
+			// into ufBlock could flip hasUniformVarBlock from false to true for
+			// a shader that otherwise had none, shifting that shader's other
+			// resource binding points and breaking rendering for it). Push
+			// constants live entirely outside the descriptor-set/binding-point
+			// system, so this can never shift anything else - declared
+			// unconditionally alongside every vertex shader that's eligible
+			// (matches the always-present push constant range added in
+			// PipelineCompiler::CreateDescriptorSetLayout's pipeline layout),
+			// regardless of whether TAA is actually selected right now, so a
+			// shader compiled once doesn't need recompiling if the user
+			// toggles TAA later.
+			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex &&
+				!decompilerContext->analyzer.hasStreamoutWrite)
+			{
+				decompilerContext->shaderSource->add("layout(push_constant) uniform FaroPushConstants" _CRLF "{" _CRLF "\tvec2 uf_taaJitter;" _CRLF "};" _CRLF);
+			}
+		}
+		else
+		{
+			// Faro TAA: OpenGL/Metal never had the binding-point-shift bug the
+			// Vulkan push constant above works around - GL looks this uniform up
+			// by NAME at runtime (glGetUniformLocation in LatteShaderGL.cpp),
+			// completely independent of uniformCurrentOffset/hasUniformVarBlock
+			// below (those only feed resourceMappingVK/MTL, never
+			// resourceMappingGL), so a plain bare uniform declaration here is
+			// safe exactly as it always was.
+			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex &&
+				!decompilerContext->analyzer.hasStreamoutWrite)
+			{
+				decompilerContext->shaderSource->add("uniform vec2 uf_taaJitter;" _CRLF);
+			}
 		}
 
 		uint32 uniformCurrentOffset = 0;
@@ -151,6 +185,12 @@ namespace LatteDecompiler
 			}
 		}
 
+		// Faro TAA camera jitter deliberately has no entry in this offset
+		// sequence at all (there is no offset_taaJitter field) - on Vulkan it's
+		// delivered via a push constant instead of ufBlock (see the
+		// uf_taaJitter declaration comment above, and SET_POSITION's own
+		// comment), and on OpenGL it's looked up by name via
+		// glGetUniformLocation, neither of which needs an offset here.
 		uniformOffsets.offset_endOfBlock = uniformCurrentOffset;
 		if (rendererType == RendererAPI::Vulkan)
 		{
@@ -286,13 +326,27 @@ namespace LatteDecompiler
 			if (decompilerContext->analyzer.hasStreamoutWrite)
 				src->add("#define XFB_BLOCK_LAYOUT(__bufferIndex, __stride, __location) layout(location = __location, xfb_buffer = __bufferIndex, xfb_stride = __stride, xfb_offset = 0)" _CRLF);
 
+			// Faro TAA: jitter comes from the push-constant-based uf_taaJitter
+			// declared earlier in this function (see its own comment for why
+			// it's a push constant and not part of ufBlock). Applied
+			// unconditionally at compile time (not gated on AA mode here) so a
+			// shader never needs recompiling when the user toggles TAA on/off -
+			// VulkanRendererCore.cpp pushes {0,0} whenever TAA isn't the active
+			// mode, making this a no-op at runtime without a shader variant
+			// switch. A geometry shader forwarding an already-jittered vertex
+			// position would otherwise get jittered a second time, so this
+			// stays Vertex-only; streamout exclusion avoids baking a sub-pixel
+			// offset permanently into captured transform-feedback/skinning data.
+			const bool applyTaaJitter = decompilerContext->shaderType == LatteConst::ShaderType::Vertex &&
+				!decompilerContext->analyzer.hasStreamoutWrite;
+			const char* taaJitterCode = applyTaaJitter ? "; gl_Position.xy += uf_taaJitter * gl_Position.w" : "";
 			if (decompilerContext->contextRegistersNew->PA_CL_CLIP_CNTL.get_DX_CLIP_SPACE_DEF())
 			{
-				src->add("#define SET_POSITION(_v) gl_Position = _v" _CRLF);
+				src->addFmt("#define SET_POSITION(_v) gl_Position = _v{}" _CRLF, taaJitterCode);
 			}
 			else
 			{
-				src->add("#define SET_POSITION(_v) gl_Position = _v; gl_Position.z = (gl_Position.z + gl_Position.w) / 2.0" _CRLF);
+				src->addFmt("#define SET_POSITION(_v) gl_Position = _v; gl_Position.z = (gl_Position.z + gl_Position.w) / 2.0{}" _CRLF, taaJitterCode);
 			}
 
 			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex || decompilerContext->shaderType == LatteConst::ShaderType::Geometry)
@@ -322,7 +376,13 @@ namespace LatteDecompiler
 			if (decompilerContext->analyzer.hasStreamoutWrite)
 				src->add("#define XFB_BLOCK_LAYOUT(__bufferIndex, __stride, __location) layout(xfb_buffer = __bufferIndex, xfb_stride = __stride)" _CRLF);
 
-			src->add("#define SET_POSITION(_v) gl_Position = _v\r\n");
+			// Faro TAA: OpenGL never had the binding-point bug the Vulkan side
+			// works around - see the uf_taaJitter declaration comment above.
+			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex &&
+				!decompilerContext->analyzer.hasStreamoutWrite)
+				src->add("#define SET_POSITION(_v) gl_Position = _v; gl_Position.xy += uf_taaJitter * gl_Position.w\r\n");
+			else
+				src->add("#define SET_POSITION(_v) gl_Position = _v\r\n");
 			if (decompilerContext->options->usesGeometryShader)
 				src->add("#define V2G_LAYOUT" _CRLF);
 		}

@@ -478,15 +478,60 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 	}
 
 	{
-		wxString choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
-		m_upscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Upscale filter"), wxDefaultPosition, wxDefaultSize, std::size(choices), choices, 5, wxRA_SPECIFY_COLS);
-		m_upscale_filter->SetToolTip(_("Upscaling filters are used when the game resolution is smaller than the window size"));
-		m_upscale_filter->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
+		// FSR 1.0 (EASU) is an upscaling reconstruction filter only - it
+		// samples a small fixed local neighborhood around each OUTPUT pixel,
+		// which only makes sense when the output has more pixels to fill in
+		// than the source has (upscaling). Fed a downscale ratio (source
+		// bigger than output) it skips over most of the source pixels
+		// between output samples instead of averaging them down, producing
+		// visibly broken/aliased results (confirmed live) - so it's simply
+		// not offered as a downscale option, unlike the other filters here
+		// which work reasonably in either direction.
+		wxString upscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor"), _("FSR 1.0") };
+		m_upscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Upscale filter"), wxDefaultPosition, wxDefaultSize, std::size(upscale_choices), upscale_choices, 5, wxRA_SPECIFY_COLS);
+		m_upscale_filter->SetToolTip(_("Upscaling filters are used when the game resolution is smaller than the window size. FSR 1.0 (AMD FidelityFX Super Resolution) gives the sharpest, most detailed result of these but costs a bit more GPU time - not available on macOS/Metal yet."));
+		m_upscale_filter->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent& event) {
 			GetConfig().upscale_filter = event.GetSelection();
+			// FXAA and SMAA are add-ons to FSR1 only (Vulkan, see LatteRenderTarget.cpp).
+			// The choice is disabled unless FSR1 is the active upscale filter, mirroring
+			// the same gate in LatteRenderTarget_copyToBackbuffer that falls back to
+			// single-pass otherwise.
+			m_antialiasing_mode->Enable(event.GetSelection() == kFsr1Filter);
+			m_smaa_quality->Enable(event.GetSelection() == kFsr1Filter && GetConfig().antialiasing_mode == CemuConfig::kAASmaa);
 		});
 		graphics_panel_sizer->Add(m_upscale_filter, 0, wxALL | wxEXPAND, 5);
 
-		m_downscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Downscale filter"), wxDefaultPosition, wxDefaultSize, std::size(choices), choices, 5, wxRA_SPECIFY_COLS);
+		// FXAA (1 extra pass) and SMAA (3 extra passes: edge -> blend -> neighborhood)
+		// are only offered as add-ons to FSR1 (Vulkan only) - see
+		// Renderer::DrawBackbufferQuadTwoPass / DrawBackbufferQuadFsr1Smaa.
+		// SMAA gives better preservation of thin diagonal geometry (fences, power lines)
+		// than FXAA's single contrast-based pass, at a real extra GPU cost.
+		wxString aa_choices[] = { _("None"), _("FXAA"), _("SMAA"), _("TAA (experimental)") };
+		m_antialiasing_mode = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(aa_choices), aa_choices);
+		m_antialiasing_mode->SetToolTip(_("Antialiasing applied on top of FSR 1.0's upscaled output. Vulkan only. SMAA is higher quality but costs notably more GPU time than FXAA."));
+		m_antialiasing_mode->Enable(GetConfig().upscale_filter == kFsr1Filter);
+		m_antialiasing_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent& event) {
+			GetConfig().antialiasing_mode = event.GetSelection();
+			m_smaa_quality->Enable(event.GetSelection() == CemuConfig::kAASmaa);
+		});
+		graphics_panel_sizer->Add(m_antialiasing_mode, 0, wxALL, 5);
+
+		// Presets match the public iryoku/smaa reference's own SMAA_PRESET_LOW/
+		// MEDIUM/HIGH/ULTRA exactly (search steps, threshold, diagonal/corner
+		// detection) - see RendererOuputShader.cpp's BuildSmaaEdgeShaderSource/
+		// BuildSmaaBlendShaderSource. All 4 are compiled upfront, so switching
+		// this never triggers a shader recompile.
+		wxString smaa_quality_choices[] = { _("Low"), _("Medium"), _("High"), _("Ultra") };
+		m_smaa_quality = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(smaa_quality_choices), smaa_quality_choices);
+		m_smaa_quality->SetToolTip(_("SMAA quality preset. Higher presets search further for edges and enable diagonal/corner detection, at a real extra GPU cost."));
+		m_smaa_quality->Enable(GetConfig().upscale_filter == kFsr1Filter && GetConfig().antialiasing_mode == CemuConfig::kAASmaa);
+		m_smaa_quality->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+			GetConfig().smaa_quality = event.GetSelection();
+		});
+		graphics_panel_sizer->Add(m_smaa_quality, 0, wxALL, 5);
+
+		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
+		m_downscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Downscale filter"), wxDefaultPosition, wxDefaultSize, std::size(downscale_choices), downscale_choices, 5, wxRA_SPECIFY_COLS);
 		m_downscale_filter->SetToolTip(_("Downscaling filters are used when the game resolution is bigger than the window size"));
 		m_downscale_filter->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
 			GetConfig().downscale_filter = event.GetSelection();
@@ -1945,6 +1990,20 @@ void GeneralSettings2::ApplyConfig()
 	m_force_mesh_shaders->SetValue(config.force_mesh_shaders);
 #endif
 	m_upscale_filter->SetSelection(config.upscale_filter);
+	// clamp legacy values (e.g. FxaaEnabled migration left 0/1, but enum range is 0..3)
+	{
+		sint32 aa = config.antialiasing_mode;
+		if (aa < CemuConfig::kAANone || aa > CemuConfig::kAATaa)
+			aa = CemuConfig::kAANone;
+		m_antialiasing_mode->SetSelection(aa);
+		m_antialiasing_mode->Enable(config.upscale_filter == kFsr1Filter);
+
+		sint32 smaaQuality = config.smaa_quality;
+		if (smaaQuality < CemuConfig::kSmaaLow || smaaQuality > CemuConfig::kSmaaUltra)
+			smaaQuality = CemuConfig::kSmaaHigh;
+		m_smaa_quality->SetSelection(smaaQuality);
+		m_smaa_quality->Enable(config.upscale_filter == kFsr1Filter && aa == CemuConfig::kAASmaa);
+	}
 	m_downscale_filter->SetSelection(config.downscale_filter);
 	m_fullscreen_scaling->SetSelection(config.fullscreen_scaling);
 

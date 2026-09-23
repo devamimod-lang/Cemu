@@ -34,9 +34,13 @@
 // External functionality headers
 #include "input/InputManager.h"
 #include "Cafe/TitleList/TitleList.h"
+#include "Cafe/TitleList/GameInfo.h"
+#include "Cafe/Filesystem/fsc.h"
 #include "Cemu/DiscordPresence/DiscordPresence.h"
 #include "util/ScreenSaver/ScreenSaver.h"
 #include "util/helpers/SystemException.h"
+#include "util/helpers/helpers.h"
+#include <wx/mstream.h>
 #include "Cafe/HW/Latte/Renderer/Vulkan/VsyncDriver.h"
 #if BOOST_OS_LINUX && defined(ENABLE_FERAL_GAMEMODE)
 #include <gamemode_client.h>
@@ -364,8 +368,9 @@ static void FaroNfcBridgeLoop()
 void StartFaroNfcBridge()
 {
 #if BOOST_OS_WINDOWS
-	if (!LaunchSettings::EmbeddedModeEnabled())
-		return;
+	// Caller (CemuApp::OnInit) already checks EmbeddedModeEnabled() before
+	// calling this - kept ungated here on purpose, see the call site's
+	// comment.
 	std::thread(FaroNfcBridgeLoop).detach();
 #endif
 }
@@ -2512,12 +2517,64 @@ void MainWindow::UpdateChildWindowTitleRunningState()
 void MainWindow::RestoreSettingsAfterGameExited()
 {
 	RecreateMenu();
+	ResetToDefaultIcon();
 }
 
 void MainWindow::UpdateSettingsAfterGameLaunch()
 {
 	m_update_available = {};
 	RecreateMenu();
+	SetGameIcon(CafeSystem::GetForegroundTitleId());
+}
+
+void MainWindow::SetGameIcon(uint64 titleId)
+{
+	TitleInfo titleInfo;
+	if (!CafeTitleList::GetFirstByTitleId(titleId, titleInfo))
+		return;
+	std::string tempMountPath = TitleInfo::GetUniqueTempMountingPath();
+	if (!titleInfo.Mount(tempMountPath, "", FSC_PRIORITY_BASE))
+		return;
+	auto tgaData = fsc_extractFile((tempMountPath + "/meta/iconTex.tga").c_str());
+	if (!tgaData)
+	{
+		tgaData = fsc_extractFile((tempMountPath + "/meta/iconTex.tga.gz").c_str());
+		if (tgaData)
+		{
+			auto decompressed = zlibDecompress(*tgaData, 70 * 1024);
+			std::swap(tgaData, decompressed);
+		}
+	}
+	titleInfo.Unmount(tempMountPath);
+	if (!tgaData || tgaData->size() <= 16)
+		return;
+
+	wxMemoryInputStream tgaStream(tgaData->data(), tgaData->size());
+	const wxImage image(tgaStream);
+	if (!image.IsOk())
+		return;
+
+#if BOOST_OS_WINDOWS
+	wxIcon bigIcon;
+	bigIcon.CopyFromBitmap(wxBitmap(image.Scale(32, 32, wxIMAGE_QUALITY_BICUBIC)));
+	SetIcon(bigIcon);
+	wxIcon smallIcon;
+	smallIcon.CopyFromBitmap(wxBitmap(image.Scale(16, 16, wxIMAGE_QUALITY_BICUBIC)));
+	SendMessage(this->GetHWND(), WM_SETICON, ICON_SMALL, (LPARAM)smallIcon.GetHICON());
+#else
+	wxIcon icon;
+	icon.CopyFromBitmap(wxBitmap(image.Scale(32, 32, wxIMAGE_QUALITY_BICUBIC)));
+	SetIcon(icon);
+#endif
+}
+
+void MainWindow::ResetToDefaultIcon()
+{
+	SetIcon(wxICON(M_WND_ICON128));
+#if BOOST_OS_WINDOWS
+	HICON hWindowIcon = (HICON)LoadImageA(NULL, "M_WND_ICON16", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+	SendMessage(this->GetHWND(), WM_SETICON, ICON_SMALL, (LPARAM)hWindowIcon);
+#endif
 }
 
 void MainWindow::OnGraphicWindowClose(wxCloseEvent& event)

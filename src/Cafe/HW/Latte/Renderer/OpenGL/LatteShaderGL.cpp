@@ -51,6 +51,7 @@ void LatteShader_prepareSeparableUniforms(LatteDecompilerShader* shader)
 	shader->uniform.loc_alphaTestRef = glGetUniformLocation(shaderGL->GetProgram(), "uf_alphaTestRef");
 	shader->uniform.loc_pointSize = glGetUniformLocation(shaderGL->GetProgram(), "uf_pointSize");
 	shader->uniform.loc_fragCoordScale = glGetUniformLocation(shaderGL->GetProgram(), "uf_fragCoordScale");
+	shader->uniform.loc_taaJitter = glGetUniformLocation(shaderGL->GetProgram(), "uf_taaJitter");
 	cemu_assert_debug(shader->uniform.list_ufTexRescale.empty());
 	for (sint32 t = 0; t < LATTE_NUM_MAX_TEX_UNITS; t++)
 	{

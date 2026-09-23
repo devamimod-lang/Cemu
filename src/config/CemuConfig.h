@@ -94,6 +94,7 @@ enum UpscalingFilter
 	kBicubicFilter,
 	kBicubicHermiteFilter,
 	kNearestNeighborFilter,
+	kFsr1Filter,
 };
 
 enum FullscreenScaling
@@ -485,6 +486,48 @@ struct CemuConfig
 	ConfigValue<sint32> upscale_filter{kBicubicFilter};
 	ConfigValue<sint32> downscale_filter{kLinearFilter};
 	ConfigValue<sint32> fullscreen_scaling{kKeepAspectRatio};
+	// Both FXAA and SMAA need one or more extra passes over the already-
+	// upscaled image (see Renderer::DrawBackbufferQuadTwoPass/
+	// DrawBackbufferQuadFsr1Smaa), so they're only offered as an add-on to the
+	// FSR 1.0 upscale filter rather than standalone filters of their own.
+	// Vulkan only (LatteRenderTarget.cpp falls back to FSR1-only if the active
+	// renderer doesn't support the multi-pass path). SMAA (morphological, 3
+	// passes: edge detection -> blending weights -> neighborhood blend) gives
+	// better preservation of thin diagonal geometry (fences, power lines) than
+	// FXAA's single contrast-based pass, at a real extra GPU cost.
+	// Faro TAA: the sub-pixel jitter itself is injected into the game's own
+	// vertex shaders regardless of upscaler (see LatteDecompilerEmitGLSLHeader.hpp's
+	// SET_POSITION) - but the actual resolve/blend pass, like FXAA/SMAA above,
+	// is currently only wired up as an add-on after FSR1's own EASU+RCAS passes
+	// (see DrawBackbufferQuadFsr1Taa), so kAATaa is a no-op unless
+	// upscale_filter == kFsr1Filter too. Not a fundamental limitation (the
+	// resolve pass doesn't actually need FSR1's upscale), just what the
+	// existing multi-pass dispatch in LatteRenderTarget.cpp currently supports.
+	enum AntialiasingMode
+	{
+		kAANone = 0,
+		kAAFxaa = 1,
+		kAASmaa = 2,
+		kAATaa = 3,
+	};
+	ConfigValue<sint32> antialiasing_mode{kAANone};
+
+	// Only meaningful when antialiasing_mode == kAASmaa - selects which of the
+	// 4 static quality presets from the public SMAA reference
+	// (https://github.com/iryoku/smaa) to use. Higher presets search further
+	// for edges and enable diagonal/corner detection, at a real extra GPU
+	// cost - see RendererOuputShader.cpp's BuildSmaaEdgeShaderSource/
+	// BuildSmaaBlendShaderSource for the exact per-preset constants, and
+	// VulkanRenderer::InitializeStatic, which compiles all 4 presets' shaders
+	// upfront so switching this doesn't need a shader recompile.
+	enum SmaaQuality
+	{
+		kSmaaLow = 0,
+		kSmaaMedium = 1,
+		kSmaaHigh = 2,
+		kSmaaUltra = 3,
+	};
+	ConfigValue<sint32> smaa_quality{kSmaaHigh};
 
 	// audio
 	sint32 audio_api = 0;

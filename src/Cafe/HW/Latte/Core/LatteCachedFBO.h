@@ -138,6 +138,11 @@ public:
 	static void BindDepthBufferOnly(LatteTextureView* view);
 
 	static void GetCurrentFragCoordScale(float* coordScale);
+	// Faro TAA: not really MRT-specific, colocated here purely to match
+	// GetCurrentFragCoordScale's existing "per-draw uniform value getter" home.
+	// See LatteRenderTarget.cpp's LatteRenderTarget_itHLESwapScanBuffer for where
+	// the underlying Halton sequence actually advances (once per real frame).
+	static void GetCurrentTaaJitter(float* jitter);
 	static void GetVirtualViewportDimensions(sint32& width, sint32& height); // returns the width and height of the current GPU viewport (unaffected by graphic pack rules)
 
 	// todo - move this into FBO destructor (?)

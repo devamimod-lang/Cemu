@@ -864,12 +864,25 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
 
 	// ##########################################################################################################################################
 
+	// Faro TAA: sub-pixel camera jitter is delivered to eligible vertex shaders
+	// via this push constant instead of a per-shader uniform-block slot - see
+	// the uf_taaJitter declaration comment in LatteDecompilerEmitGLSLHeader.hpp
+	// for why (injecting it into the ufBlock could shift that shader's other
+	// resource binding points). Declared unconditionally for every pipeline
+	// (not just ones using a vertex shader eligible for jitter) since it's
+	// cheap and keeps this code simple - VulkanRendererCore.cpp only actually
+	// calls vkCmdPushConstants for draws using an eligible vertex shader.
+	VkPushConstantRange taaJitterPushConstantRange{};
+	taaJitterPushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	taaJitterPushConstantRange.offset = 0;
+	taaJitterPushConstantRange.size = sizeof(float) * 2; // vec2 uf_taaJitter
+
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pipelineLayoutInfo.setLayoutCount = descriptorSetLayoutCount;
 	pipelineLayoutInfo.pSetLayouts = descriptorSetLayout;
-	pipelineLayoutInfo.pPushConstantRanges = nullptr;
-	pipelineLayoutInfo.pushConstantRangeCount = 0;
+	pipelineLayoutInfo.pPushConstantRanges = &taaJitterPushConstantRange;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
 
 	VkResult result = vkCreatePipelineLayout(vkRenderer->m_logicalDevice, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
 	if (result != VK_SUCCESS)

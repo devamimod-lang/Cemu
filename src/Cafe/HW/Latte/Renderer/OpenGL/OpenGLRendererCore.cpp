@@ -1023,6 +1023,12 @@ void OpenGLRenderer::draw_genericDrawHandler(uint32 baseVertex, uint32 baseInsta
 			t[1] = 2.0f / (float)viewportHeight;
 			glProgramUniform2fv(vertexShaderGL->GetProgram(), vertexShader->uniform.loc_windowSpaceToClipSpaceTransform, 1, t);
 		}
+		if (vertexShader->uniform.loc_taaJitter >= 0)
+		{
+			float jitter[2];
+			LatteMRT::GetCurrentTaaJitter(jitter);
+			glProgramUniform2fv(vertexShaderGL->GetProgram(), vertexShader->uniform.loc_taaJitter, 1, jitter);
+		}
 		// update uf_texRescaleFactors
 		for (auto& entry : vertexShader->uniform.list_ufTexRescale)
 		{

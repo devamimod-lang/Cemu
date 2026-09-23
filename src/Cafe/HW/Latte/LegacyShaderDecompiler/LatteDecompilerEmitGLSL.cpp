@@ -10,6 +10,7 @@
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerInstructions.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "config/CemuConfig.h"
 #include "config/ActiveSettings.h"
 #include "util/helpers/StringBuf.h"
 

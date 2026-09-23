@@ -77,6 +77,58 @@ public:
 	virtual void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter,
 												sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
 												bool padView, bool clearBackground) = 0;
+
+	// Two-pass variant used for plain FSR1 (no further antialiasing pass):
+	// easuShader renders EASU's upscaled-but-unsharpened result into an
+	// offscreen target, then rcasShader reads that target and writes the
+	// sharpened result into the real backbuffer. Real RCAS needs to read
+	// already-upscaled neighbour pixels that don't exist yet during EASU, so
+	// these two can never be fused into a single pass. Only implemented on
+	// Vulkan (see VulkanRenderer::DrawBackbufferQuadFsr1) - other backends
+	// return false and the caller falls back to a plain single-pass
+	// DrawBackbufferQuad(shader=easuShader) call (which skips RCAS entirely -
+	// unavoidable without a 2nd pass, but that's still a proper EASU upscale).
+	virtual bool DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) { return false; }
+
+	// Three-pass variant used for FXAA+FSR1: easuShader/rcasShader run FSR1's
+	// own 2 passes (see DrawBackbufferQuadFsr1 above) into an offscreen
+	// target, then secondShader (FXAA) renders from that target into the real
+	// backbuffer. Only implemented on Vulkan (see
+	// VulkanRenderer::DrawBackbufferQuadTwoPass) - other backends return
+	// false and the caller falls back to a plain single-pass
+	// DrawBackbufferQuad(shader=easuShader) call.
+	virtual bool DrawBackbufferQuadTwoPass(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader, RendererOutputShader* secondShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) { return false; }
+
+	// Five-pass variant used for FSR1+SMAA: easuShader/rcasShader run FSR1's
+	// own 2 passes into an offscreen target, then
+	// edgeShader/blendShader/neighborhoodShader run SMAA's 3 passes (luma edge
+	// detection, blending weight calculation, neighborhood blending) in
+	// sequence, with the last pass writing to the real backbuffer. Only
+	// implemented on Vulkan (see VulkanRenderer::DrawBackbufferQuadFsr1Smaa) -
+	// other backends return false and the caller falls back to a plain
+	// single-pass DrawBackbufferQuad(shader=easuShader) call.
+	virtual bool DrawBackbufferQuadFsr1Smaa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												RendererOutputShader* edgeShader, RendererOutputShader* blendShader, RendererOutputShader* neighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) { return false; }
+
+	// Faro TAA: three-pass variant used for FSR1+TAA: easuShader/rcasShader run
+	// FSR1's own 2 passes into an offscreen target (same as the other add-on
+	// modes above), then resolveShader blends that against a history texture
+	// persisting from the previous frame (see EnsureTaaHistoryTarget) and
+	// writes to the real backbuffer, which then gets copied into the history
+	// texture for the next frame to read. Only implemented on Vulkan (see
+	// VulkanRenderer::DrawBackbufferQuadFsr1Taa) - other backends return false
+	// and the caller falls back to a plain single-pass
+	// DrawBackbufferQuad(shader=easuShader) call.
+	virtual bool DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												RendererOutputShader* resolveShader, bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+
 	virtual bool BeginFrame(bool mainWindow) = 0;
 
 	// flush control

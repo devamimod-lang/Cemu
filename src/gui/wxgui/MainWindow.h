@@ -78,6 +78,18 @@ public:
 	void UpdateSettingsAfterGameLaunch();
 	void RestoreSettingsAfterGameExited();
 
+	/**
+	 * Faro branding: while a game is running, the window (and therefore the
+	 * taskbar/alt-tab) shows that game's own icon instead of Faro's generic
+	 * one - reuses the exact same iconTex.tga[.gz] extraction wxGameList
+	 * already does for the game list thumbnails (see wxGameList.cpp's
+	 * m_icon_load_worker), just decoded once here instead of cached per-row.
+	 * Called once per boot from UpdateSettingsAfterGameLaunch(); reverted
+	 * from RestoreSettingsAfterGameExited() via ResetToDefaultIcon().
+	 */
+	void SetGameIcon(uint64 titleId);
+	void ResetToDefaultIcon();
+
 	bool FileLoad(const fs::path launchPath, wxLaunchGameEvent::INITIATED_BY initiatedBy);
 
 	[[nodiscard]] bool IsGameLaunched() const { return m_game_launched; }

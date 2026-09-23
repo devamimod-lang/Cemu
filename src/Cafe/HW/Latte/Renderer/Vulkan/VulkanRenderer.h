@@ -272,8 +272,97 @@ public:
 	void ClearColorImage(LatteTextureVk* vkTexture, uint32 sliceIndex, uint32 mipIndex, const VkClearColorValue& color, VkImageLayout outputLayout);
 
 	void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	// Real RCAS needs to read already-upscaled neighbour pixels that don't
+	// exist yet during EASU, so FSR1 is always at least 2 passes: easuShader
+	// renders into m_fsr1EasuIntermediate (see EnsureFsr1EasuIntermediateTarget),
+	// then rcasShader reads that and writes the sharpened result into the real
+	// swapchain/pad framebuffer. Returns false (caller should fall back to a
+	// plain DrawBackbufferQuad(shader=easuShader) call, which skips RCAS
+	// entirely) if the intermediate target couldn't be (re)created this frame.
+	bool DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) override;
+	// FXAA needs a further pass on top of FSR1's own EASU+RCAS passes (see
+	// DrawBackbufferQuadFsr1 above), so it can't be fused into that dispatch
+	// either. Runs EASU->m_fsr1EasuIntermediate, RCAS->m_fxaaIntermediate, then
+	// secondShader (FXAA) from m_fxaaIntermediate into the real swapchain/pad
+	// framebuffer. Returns false (caller should fall back to a plain
+	// DrawBackbufferQuad(shader=easuShader) call) if either intermediate
+	// target couldn't be (re)created for this frame's size.
+	bool DrawBackbufferQuadTwoPass(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader, RendererOutputShader* secondShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) override;
 	void CreateDescriptorPool();
 	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);
+	// Same as above but for a plain VkImageView/VkSampler not backed by a
+	// LatteTextureViewVk - used to bind the FXAA/RCAS intermediate target,
+	// which is a raw internal render target rather than an emulated GX2 texture.
+	VkDescriptorSet backbufferBlit_createDescriptorSetRaw(VkDescriptorSetLayout descriptor_set_layout, VkImageView imageView, VkSampler sampler);
+	// (Re)creates m_fsr1EasuIntermediate* (EASU's raw upscaled-but-unsharpened
+	// output - RCAS's own input) to match the requested size/format if needed.
+	// Same render-pass-compatibility trick as EnsureFxaaIntermediateTarget
+	// below (see its own doc comment).
+	bool EnsureFsr1EasuIntermediateTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyFsr1EasuIntermediateTarget();
+	// (Re)creates m_fxaaIntermediate* (RCAS's output - the fully upscaled AND
+	// sharpened image, which FXAA/SMAA read as their own "FSR1 output" input)
+	// to match the requested size/format if needed. The render pass is built
+	// to be compatible (same format/sample count/attachment layout) with
+	// chainInfo.m_swapchainRenderPass so the already-cached pipeline from
+	// backbufferBlit_createGraphicsPipeline can be reused directly for any
+	// pass that writes here, per Vulkan's render pass compatibility rules -
+	// no second pipeline-creation path needed.
+	bool EnsureFxaaIntermediateTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyFxaaIntermediateTarget();
+
+	// SMAA's 3-pass pipeline, chained after FSR1's own EASU+RCAS passes (see
+	// SMAALookupTextures.h and RendererOuputShader.cpp's
+	// s_smaa_edge/blend/neighborhood_shader_source for the shaders). Same
+	// fallback contract as DrawBackbufferQuadTwoPass: returns false (caller
+	// falls back to a plain DrawBackbufferQuad(shader=easuShader) call) if
+	// the intermediate targets couldn't be (re)created for this frame's size.
+	bool DrawBackbufferQuadFsr1Smaa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												RendererOutputShader* edgeShader, RendererOutputShader* blendShader, RendererOutputShader* neighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
+												bool padView, bool clearBackground) override;
+	// Uploads SMAALookupTextures.h's embedded AreaTex/SearchTex byte arrays
+	// into 2 static Vulkan textures, once, during Initialize(). These never
+	// change afterwards and are reused as filler in every descriptor set
+	// allocated against m_swapchainDescriptorSetLayout that doesn't have a
+	// more specific use for bindings 2/3 (see backbufferBlit_createDescriptorSet
+	// and backbufferBlit_createDescriptorSetRaw), so no shader ever binds an
+	// unwritten descriptor even when it doesn't use SMAA.
+	void CreateSmaaStaticTextures();
+	void DestroySmaaStaticTextures();
+	// (Re)creates m_smaaEdges*/m_smaaBlend* (and, via EnsureFxaaIntermediateTarget,
+	// the shared FSR1-output target) to match the requested size/format.
+	bool EnsureSmaaIntermediateTargets(VkFormat format, uint32 width, uint32 height);
+	void DestroySmaaIntermediateTargets();
+
+	// Faro TAA
+	bool DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
+												RendererOutputShader* resolveShader, bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	// (Re)creates m_taaHistory* to match the requested size/format, WITHOUT
+	// resetting m_taaHistoryValid unless the size/format actually changed (the
+	// whole point of this target is to survive across frames - unlike every
+	// other Ensure*IntermediateTarget here, which get fully recreated content
+	// every single draw). No render pass/framebuffer needed - this is never
+	// rendered into directly, only written via vkCmdCopyImage from
+	// m_taaNativeResolveImage at the end of DrawBackbufferQuadFsr1Taa, and
+	// read as a plain sampled texture at the start of the next frame's
+	// resolve pass. Sized at the GAME's native/source resolution, not the
+	// display output resolution - see DrawBackbufferQuadFsr1Taa's own comment
+	// on why TAA resolves before FSR1's upscale, not after it.
+	bool EnsureTaaHistoryTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyTaaHistoryTarget();
+	// (Re)creates the native-resolution target that the TAA resolve pass
+	// renders into (current frame's jittered image blended with history) -
+	// this is what EASU then reads as ITS input, instead of the game's raw
+	// texture directly. Sized at native/source resolution like
+	// EnsureTaaHistoryTarget above, not output resolution.
+	bool EnsureTaaNativeResolveTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyTaaNativeResolveTarget();
 
 	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
 	void draw_debugPipelineHashState();
@@ -608,6 +697,131 @@ private:
 	std::unordered_map<uint64, VkPipeline> m_backbufferBlitPipelineCache;
 	std::unordered_map<uint64, VkDescriptorSet> m_backbufferBlitDescriptorSetCache;
 	VkPipelineLayout m_pipelineLayout{nullptr};
+
+	// FSR1 EASU intermediate render target (see DrawBackbufferQuadFsr1) - holds
+	// EASU's raw upscaled-but-unsharpened output before RCAS reads it back.
+	// Lazily (re)created by EnsureFsr1EasuIntermediateTarget when the
+	// requested size or format changes (e.g. window resize).
+	VkImage m_fsr1EasuIntermediateImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_fsr1EasuIntermediateAllocation = nullptr;
+	VkImageView m_fsr1EasuIntermediateView = VK_NULL_HANDLE;
+	VkSampler m_fsr1EasuIntermediateSampler = VK_NULL_HANDLE;
+	VkRenderPass m_fsr1EasuIntermediateRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_fsr1EasuIntermediateFramebuffer = VK_NULL_HANDLE;
+	VkDescriptorSet m_fsr1EasuIntermediateDescriptorSet = VK_NULL_HANDLE;
+	VkExtent2D m_fsr1EasuIntermediateExtent{};
+	VkFormat m_fsr1EasuIntermediateFormat = VK_FORMAT_UNDEFINED;
+
+	// FXAA/RCAS intermediate render target (see DrawBackbufferQuadFsr1/
+	// DrawBackbufferQuadTwoPass) - holds RCAS's output (the fully upscaled AND
+	// sharpened image) which FXAA/SMAA read as their own "FSR1 output" input,
+	// or which gets presented directly when no further antialiasing pass is
+	// active. Lazily (re)created by EnsureFxaaIntermediateTarget when the
+	// requested size or format changes (e.g. window resize).
+	VkImage m_fxaaIntermediateImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_fxaaIntermediateAllocation = nullptr;
+	VkImageView m_fxaaIntermediateView = VK_NULL_HANDLE;
+	VkSampler m_fxaaIntermediateSampler = VK_NULL_HANDLE;
+	VkRenderPass m_fxaaIntermediateRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_fxaaIntermediateFramebuffer = VK_NULL_HANDLE;
+	VkDescriptorSet m_fxaaIntermediateDescriptorSet = VK_NULL_HANDLE;
+	VkExtent2D m_fxaaIntermediateExtent{};
+	VkFormat m_fxaaIntermediateFormat = VK_FORMAT_UNDEFINED;
+
+	// SMAA's 2 static lookup textures (see SMAALookupTextures.h) - created
+	// once by CreateSmaaStaticTextures() during Initialize() and never
+	// resized/recreated afterwards, unlike the per-frame-sized targets below.
+	VkImage m_smaaAreaTexImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_smaaAreaTexAllocation = nullptr;
+	VkImageView m_smaaAreaTexView = VK_NULL_HANDLE;
+	VkSampler m_smaaAreaTexSampler = VK_NULL_HANDLE;
+	VkImage m_smaaSearchTexImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_smaaSearchTexAllocation = nullptr;
+	VkImageView m_smaaSearchTexView = VK_NULL_HANDLE;
+	VkSampler m_smaaSearchTexSampler = VK_NULL_HANDLE;
+
+	// SMAA's 2 per-frame-sized intermediate targets (edges mask from pass 1,
+	// blend weights from pass 2 - see DrawBackbufferQuadFsr1Smaa). Lazily
+	// (re)created by EnsureSmaaIntermediateTargets alongside
+	// m_fxaaIntermediate* (which SMAA reuses as its FSR1-output/pass-1-input
+	// target, same as the FXAA two-pass path does). The edges target uses
+	// LOAD_OP_CLEAR since the edge-detection shader uses `discard` on
+	// non-edge pixels; the blend weights target uses DONT_CARE since every
+	// pixel is written unconditionally.
+	VkImage m_smaaEdgesImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_smaaEdgesAllocation = nullptr;
+	VkImageView m_smaaEdgesView = VK_NULL_HANDLE;
+	VkSampler m_smaaEdgesSampler = VK_NULL_HANDLE;
+	VkRenderPass m_smaaEdgesRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_smaaEdgesFramebuffer = VK_NULL_HANDLE;
+	VkImage m_smaaBlendImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_smaaBlendAllocation = nullptr;
+	VkImageView m_smaaBlendView = VK_NULL_HANDLE;
+	VkSampler m_smaaBlendSampler = VK_NULL_HANDLE;
+	VkRenderPass m_smaaBlendRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_smaaBlendFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_smaaIntermediateExtent{};
+	VkFormat m_smaaIntermediateFormat = VK_FORMAT_UNDEFINED;
+	// Descriptor set for the blend-weight-calculation pass (binding 0 =
+	// m_smaaEdgesView, bindings 2/3 = the static area/search textures - see
+	// backbufferBlit_createDescriptorSetRaw). The edge-detection pass reuses
+	// m_fxaaIntermediateDescriptorSet directly (binding 0 = the same FSR1
+	// output target FXAA's own pass 2 already binds; bindings 2/3 are the
+	// same static filler, unused by the edge-detection shader).
+	VkDescriptorSet m_smaaBlendCalcDescriptorSet = VK_NULL_HANDLE;
+	// Descriptor set for the final neighborhood-blending pass (binding 0 =
+	// the FSR1 output target, binding 2 = m_smaaBlendView, binding 3 = the
+	// static search texture as unused filler).
+	VkDescriptorSet m_smaaNeighborhoodDescriptorSet = VK_NULL_HANDLE;
+
+	// Faro TAA: history texture (previous frame's resolved TAA output, at
+	// native/source resolution - see DrawBackbufferQuadFsr1Taa's own comment
+	// on why TAA now resolves before FSR1's upscale). Unlike every target
+	// above, this one is NOT rendered into via a render pass - it's only ever
+	// written by vkCmdCopyImage (see DrawBackbufferQuadFsr1Taa) and read as a
+	// plain sampled texture, and it deliberately survives across frames
+	// instead of being torn down/rebuilt every draw - see
+	// EnsureTaaHistoryTarget's own doc comment.
+	VkImage m_taaHistoryImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_taaHistoryAllocation = nullptr;
+	VkImageView m_taaHistoryView = VK_NULL_HANDLE;
+	VkSampler m_taaHistorySampler = VK_NULL_HANDLE;
+	VkExtent2D m_taaHistoryExtent{};
+	VkFormat m_taaHistoryFormat = VK_FORMAT_UNDEFINED;
+	// Descriptor set for the resolve pass (binding 0 = the game's own native
+	// texture, i.e. texViewVk in DrawBackbufferQuadFsr1Taa - rewritten via
+	// vkUpdateDescriptorSets every single draw since which texture that is
+	// can change frame to frame, exactly like backbufferBlit_createDescriptorSet's
+	// per-view caching handles for every other pass; binding 2 =
+	// m_taaHistoryView, static, rebuilt alongside the history image itself in
+	// EnsureTaaHistoryTarget). Allocated once in EnsureTaaHistoryTarget.
+	VkDescriptorSet m_taaResolveDescriptorSet = VK_NULL_HANDLE;
+	// False on the first frame after (re)creating the history target above -
+	// tells the resolve shader there's nothing meaningful to blend with yet
+	// (see s_taa_resolve_shader_source's taaHistoryValid branch).
+	bool m_taaHistoryValid = false;
+
+	// Faro TAA: the resolve pass's OWN output (current frame blended with
+	// history, at native/source resolution) - this is what EASU reads as its
+	// input instead of the game's raw texture, so upscaling always operates
+	// on an already-antialiased image (see DrawBackbufferQuadFsr1Taa's own
+	// comment). Unlike m_taaHistoryImage above, this one IS rendered into via
+	// a render pass every frame - same pattern as m_fsr1EasuIntermediate*.
+	VkImage m_taaNativeResolveImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_taaNativeResolveAllocation = nullptr;
+	VkImageView m_taaNativeResolveView = VK_NULL_HANDLE;
+	VkSampler m_taaNativeResolveSampler = VK_NULL_HANDLE;
+	VkRenderPass m_taaNativeResolveRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_taaNativeResolveFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_taaNativeResolveExtent{};
+	VkFormat m_taaNativeResolveFormat = VK_FORMAT_UNDEFINED;
+	// Descriptor set for EASU's pass (binding 0 = m_taaNativeResolveView) -
+	// EASU's normal input when TAA is active, in place of the game's raw
+	// texture. Rebuilt alongside the target itself in
+	// EnsureTaaNativeResolveTarget, same pattern as
+	// m_fsr1EasuIntermediateDescriptorSet.
+	VkDescriptorSet m_taaNativeResolveDescriptorSet = VK_NULL_HANDLE;
+
 	VkCommandPool m_commandPool{ nullptr };
 
 	// buffer to cache uniform vars

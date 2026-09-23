@@ -199,6 +199,12 @@ struct LatteDecompilerShader
 		sint32 loc_alphaTestRef; // uf_alphaTestRef
 		sint32 loc_pointSize; // uf_pointSize
 		sint32 loc_fragCoordScale;
+		// Faro TAA: sub-pixel camera jitter, vertex shaders only. OpenGL-only -
+		// the glGetUniformLocation result for uf_taaJitter (LatteShaderGL.cpp).
+		// Vulkan delivers this via a push constant instead (see SET_POSITION's
+		// own comment in LatteDecompilerEmitGLSLHeader.hpp for why), which
+		// doesn't need a per-shader location/offset at all.
+		sint32 loc_taaJitter; // uf_taaJitter (OpenGL only)
 		std::vector<LatteUniformTextureScaleEntry_t> list_ufTexRescale; // list of mappings for uf_tex*Scale <-> uniform location
 		float ufCurrentValueAlphaTestRef;
 		float ufCurrentValueFragCoordScale[2];

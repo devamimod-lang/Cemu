@@ -657,6 +657,54 @@ void LatteMRT::GetVirtualViewportDimensions(sint32& width, sint32& height)
 	height = sLatteRenderTargetState.currentGuestViewport.height;
 }
 
+namespace
+{
+// Faro TAA: Halton(2,3), 8-tap centered sequence (same table used by Azahar's
+// own PICA vertex jitter, ported here for consistency - the jitter pattern
+// itself was never the source of that project's TAA bug, only an unrelated
+// post-process history-sampling issue).
+constexpr std::array<std::pair<float, float>, 8> kTaaHalton = {{
+	{0.0f, -1.0f / 6.0f},
+	{-0.25f, 1.0f / 6.0f},
+	{0.25f, -7.0f / 18.0f},
+	{-0.375f, -1.0f / 18.0f},
+	{0.125f, 5.0f / 18.0f},
+	{-0.125f, -5.0f / 18.0f},
+	{0.375f, 1.0f / 18.0f},
+	{-0.0625f, 7.0f / 18.0f},
+}};
+uint64 s_taaFrameIndex = 0;
+} // namespace
+
+// Advances the TAA jitter to the next Halton tap. Called once per real
+// presented frame (LatteRenderTarget_itHLESwapScanBuffer) - NOT per draw call -
+// so every draw within one frame samples the same sub-pixel offset.
+void LatteRenderTarget_advanceTaaJitter()
+{
+	s_taaFrameIndex++;
+}
+
+// Faro TAA: applies uniformly to every draw call's vertex shader (via
+// SET_POSITION - see LatteDecompilerEmitGLSLHeader.hpp), not just the game's
+// main 3D scene pass - Cemu has no generic way to distinguish that pass from
+// shadow maps, reflections, or 2D/UI overlays (see FSR2_TAA_investigacion.md).
+// In practice this means UI elements get the same tiny sub-pixel wobble as
+// the 3D scene; accepted as a known limitation of camera-only jitter.
+void LatteMRT::GetCurrentTaaJitter(float* jitter)
+{
+	if (GetConfig().antialiasing_mode != CemuConfig::kAATaa ||
+		sLatteRenderTargetState.currentGuestViewport.width <= 0 ||
+		sLatteRenderTargetState.currentGuestViewport.height <= 0)
+	{
+		jitter[0] = 0.0f;
+		jitter[1] = 0.0f;
+		return;
+	}
+	const auto& h = kTaaHalton[s_taaFrameIndex % kTaaHalton.size()];
+	jitter[0] = h.first * 2.0f / (float)sLatteRenderTargetState.currentGuestViewport.width;
+	jitter[1] = h.second * 2.0f / (float)sLatteRenderTargetState.currentGuestViewport.height;
+}
+
 // flag all FBO textures as updated via GPU
 // also handle texture readback
 void LatteRenderTarget_trackUpdates()
@@ -683,6 +731,7 @@ void LatteRenderTarget_itHLESwapScanBuffer()
 		performanceMonitor.gpuTime_frameTime.endMeasuring();
 	LattePerformanceMonitor_frameEnd();
 	LatteGPUState.frameCounter++;
+	LatteRenderTarget_advanceTaaJitter();
 	g_renderer->SwapBuffers(true, true);
 
 	catchOpenGLError();
@@ -885,11 +934,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 		clearBackground = true;
 
 	const bool renderUpsideDown = ActiveSettings::RenderUpsideDownEnabled();
-	// force disable bicubic scaling if output resolution is equal/smaller than input resolution
-	const bool downscaling = (imageWidth <= effectiveWidth || imageHeight <= effectiveHeight);
+	// force disable bicubic scaling if output resolution is smaller than input
+	// resolution. Deliberately strict (<, not <=): at an exact 1:1 match
+	// (internal resolution == output resolution, a common config for users who
+	// just want FSR1's RCAS sharpening or FXAA's edge smoothing without any
+	// real magnification) there's no actual scaling happening either way, but
+	// FSR1/FXAA still have a real visible effect at 1:1 unlike the older
+	// filters (which are effectively identity at 1:1 regardless of which list
+	// they come from) - so 1:1 must route through the upscale path or those
+	// two filters silently never run.
+	const bool downscaling = (imageWidth < effectiveWidth || imageHeight < effectiveHeight);
 	// check for graphic pack shaders
 	RendererOutputShader* shader = nullptr;
 	LatteTextureView::MagFilter filter = LatteTextureView::MagFilter::kLinear;
+	bool usedFsr1 = false;
 	for(const auto& gp : GraphicPack2::GetActiveGraphicPacks())
 	{
 		if(downscaling)
@@ -959,9 +1017,81 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 
 			filter = LatteTextureView::MagFilter::kNearestNeighbor;
 		}
+		else if (scaling_filter == kFsr1Filter)
+		{
+			// FSR1's EASU only makes sense for upscaling (see GeneralSettings2.cpp's
+			// own note on why it's not even offered as a downscale option there) -
+			// falls back to Bicubic here too, as defense in depth for a
+			// settings.xml written before that UI restriction existed. Also
+			// falls back on Metal, which has no FSR1 port yet (s_fsr1_easu_shader/
+			// s_fsr1_rcas_shader stay null there) - either way, this avoids ever
+			// hitting the cemu_assert(shader) below with a null shader.
+			if (downscaling || (renderUpsideDown ? !RendererOutputShader::s_fsr1_easu_shader_ud : !RendererOutputShader::s_fsr1_easu_shader) || !RendererOutputShader::s_fsr1_rcas_shader)
+			{
+				shader = renderUpsideDown ? RendererOutputShader::s_bicubic_shader_ud : RendererOutputShader::s_bicubic_shader;
+			}
+			else
+			{
+				// This is EASU (pass 1 of FSR1) - RCAS (pass 2) always runs as a
+				// genuinely separate pass, since real RCAS needs to read
+				// already-upscaled neighbour pixels that don't exist yet during
+				// EASU itself. See DrawBackbufferQuadFsr1's own doc comment.
+				shader = renderUpsideDown ? RendererOutputShader::s_fsr1_easu_shader_ud : RendererOutputShader::s_fsr1_easu_shader;
+				usedFsr1 = true;
+			}
+
+			filter = LatteTextureView::MagFilter::kLinear;
+		}
 	}
 	cemu_assert(shader);
-	g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+	// FSR1 always needs a 2nd pass (RCAS, see s_fsr1_rcas_shader's doc comment)
+	// on top of the EASU pass selected above. FXAA/SMAA (only offered as
+	// add-ons to FSR1 - see GeneralSettings2.cpp / CemuConfig.h:AntialiasingMode)
+	// then need further passes over the already-upscaled-and-sharpened image
+	// (FXAA: 1 more pass via DrawBackbufferQuadTwoPass, SMAA: 3 more passes via
+	// DrawBackbufferQuadFsr1Smaa). Fall back to the plain single-shader dispatch
+	// if the active renderer doesn't implement the relevant multi-pass path
+	// (OpenGL/Metal) or if it couldn't (re)create its intermediate target(s)
+	// this frame.
+	bool drewMultiPass = false;
+	if (usedFsr1)
+	{
+		const sint32 aaMode = GetConfig().antialiasing_mode;
+		if (aaMode == CemuConfig::kAAFxaa && RendererOutputShader::s_fxaa_shader)
+		{
+			drewMultiPass = g_renderer->DrawBackbufferQuadTwoPass(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader, RendererOutputShader::s_fxaa_shader,
+				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+		}
+		else if (aaMode == CemuConfig::kAASmaa && RendererOutputShader::s_smaa_neighborhood_shader)
+		{
+			// s_smaa_edge_shader/s_smaa_blend_shader are indexed by smaa_quality
+			// (kSmaaLow..kSmaaUltra) - all 4 presets are compiled upfront in
+			// InitializeStatic, so this never needs a shader recompile.
+			sint32 smaaQuality = GetConfig().smaa_quality;
+			if (smaaQuality < 0 || smaaQuality >= RendererOutputShader::kSmaaQualityCount)
+				smaaQuality = CemuConfig::kSmaaHigh;
+			RendererOutputShader* edgeShader = RendererOutputShader::s_smaa_edge_shader[smaaQuality];
+			RendererOutputShader* blendShader = RendererOutputShader::s_smaa_blend_shader[smaaQuality];
+			if (edgeShader && blendShader)
+			{
+				drewMultiPass = g_renderer->DrawBackbufferQuadFsr1Smaa(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader,
+					edgeShader, blendShader, RendererOutputShader::s_smaa_neighborhood_shader,
+					filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+			}
+		}
+		else if (aaMode == CemuConfig::kAATaa && RendererOutputShader::s_taa_resolve_shader)
+		{
+			drewMultiPass = g_renderer->DrawBackbufferQuadFsr1Taa(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader,
+				RendererOutputShader::s_taa_resolve_shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+		}
+		else
+		{
+			drewMultiPass = g_renderer->DrawBackbufferQuadFsr1(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader,
+				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+		}
+	}
+	if (!drewMultiPass)
+		g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 	g_renderer->HandleScreenshotRequest(textureView, isPadView);
 	if (!g_renderer->ImguiBegin(!isPadView))
 		return;

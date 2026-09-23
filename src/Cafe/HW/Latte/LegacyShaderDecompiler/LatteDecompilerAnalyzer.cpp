@@ -8,6 +8,7 @@
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "config/CemuConfig.h"
 #include "Common/MemPtr.h"
 #include "HW/Latte/ISA/LatteReg.h"
 #ifdef ENABLE_METAL
@@ -559,6 +560,13 @@ namespace LatteDecompiler
 
 		if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex && hasAnyViewportScaleDisabled)
 			decompilerContext->hasUniformVarBlock = true; // uf_windowSpaceToClipSpaceTransform
+		// Faro TAA camera jitter intentionally does NOT set hasUniformVarBlock -
+		// on Vulkan it's delivered via a push constant (which lives entirely
+		// outside the descriptor-set/binding-point system this flag controls),
+		// and on OpenGL it's a plain bare uniform looked up by name. Forcing
+		// this flag true here for jitter alone used to shift a shader's other
+		// resource binding points and broke rendering for it - see the
+		// uf_taaJitter declaration comment in LatteDecompilerEmitGLSLHeader.hpp.
 		bool alphaTestEnable = decompilerContext->contextRegistersNew->SX_ALPHA_TEST_CONTROL.get_ALPHA_TEST_ENABLE();
 		if (decompilerContext->shaderType == LatteConst::ShaderType::Pixel && alphaTestEnable != 0)
 			decompilerContext->hasUniformVarBlock = true; // uf_alphaTestRef

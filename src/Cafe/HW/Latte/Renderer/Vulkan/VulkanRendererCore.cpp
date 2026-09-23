@@ -164,6 +164,14 @@ PipelineInfo* VulkanRenderer::draw_getCachedPipeline()
 
 void VulkanRenderer::unregisterGraphicsPipeline(PipelineInfo* pipelineInfo)
 {
+	// Reverted a keyed-lookup "optimization" (find by pipelineInfo->vertexShader->baseHash,
+	// then scan only that submap) that was suspected of leaving stale/dangling entries in
+	// m_pipeline_info_cache when a pipeline's cache entry wasn't actually filed under that
+	// exact key - a later lookup could then bind an already-freed PipelineInfo, which is
+	// consistent with the intermittently invisible/garbage-rendered characters and objects
+	// seen in Breath of the Wild and Splatoon (particularly cel-shaded ones, which use more
+	// pipeline variants per character than simple geometry). Back to the exhaustive scan,
+	// which is slower but can never miss the real entry regardless of which key it's under.
 	bool removedFromCache = false;
 	for (auto& topMapItr : m_pipeline_info_cache)
 	{
@@ -435,6 +443,10 @@ void VulkanRenderer::uniformData_updateUniformVars(uint32 shaderStageIndex, Latt
 	{
 		LatteMRT::GetCurrentFragCoordScale(GET_UNIFORM_DATA_PTR(shader->uniform.loc_fragCoordScale));
 	}
+	// Faro TAA: uf_taaJitter is NOT delivered via the uniform var buffer on
+	// Vulkan (loc_taaJitter is left unset / OpenGL-only) - it's pushed as a
+	// push constant right before each draw call instead, see draw_execute_first
+	// and draw_execute_continued.
 	if (shader->uniform.loc_verticesPerInstance >= 0)
 	{
 		*(int*)GET_UNIFORM_DATA_PTR(shader->uniform.loc_verticesPerInstance) = m_streamoutState.verticesPerInstance;
@@ -459,6 +471,8 @@ void VulkanRenderer::uniformData_updateUniformVarsIncremental(uint32 shaderStage
 	// loc_alphaTestRef -> Skipped because modifying SX_ALPHA_REF ends sequence
 	// loc_pointSize -> Skipped because modifying PA_SU_POINT_SIZE ends sequence
 	// loc_windowSpaceToClipSpaceTransform/loc_fragCoordScale/ -> Skipped because viewport doesn't change
+	// uf_taaJitter -> Not part of the uniform var buffer on Vulkan at all (pushed
+	// as a push constant in draw_execute_first/draw_execute_continued instead)
 	// loc_verticesPerInstance -> Skipped because sequences with streamout enabled are not allowed
 
 	bool hasChange = false; // todo - For loc_remapped and loc_uniformRegister we want to pass a mask of dirty uniform var / buffers. If nothing is dirty we can also skip it
@@ -1035,12 +1049,18 @@ void VulkanRenderer::sync_inputTexturesChanged(bool withinFeedbackLoopRenderPass
 	// barrier here
 	if (writeFlushRequired)
 	{
-		// Continued draws with unchanged descriptors in the same renderpass only introduce feedback hazards.
-		// Relax color feedback without a guest sync, but keep the read indices above updated for later passes.
-		if (withinFeedbackLoopRenderPass && !m_state.descriptorSetsChanged && !m_state.colorBufferSyncPending
-			&& m_state.m_curRenderpassSelfDependencyInfo.GetAspectMask() == VK_IMAGE_ASPECT_COLOR_BIT)
-			return;
-
+		// An upstream "experimental barrier skip" here (returning early for
+		// continued draws with unchanged descriptors in a feedback-loop
+		// render pass, when the game hasn't explicitly requested a
+		// colorbuffer sync via GX2Invalidate) assumes the guest always calls
+		// GX2Invalidate for every case where a write actually needs to be
+		// visible to a later read - that assumption doesn't hold for at
+		// least some real games (Breath of the Wild, Splatoon), where it
+		// causes characters/objects to intermittently render as invisible/
+		// garbage, independent of resolution or upscale/AA settings - almost
+		// certainly a stale color-attachment read winning the race against
+		// the skipped barrier. Always emit the barrier instead - correctness
+		// over the (unmeasured) performance gain this was chasing.
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		memoryBarrier.srcAccessMask = 0;
@@ -1514,6 +1534,14 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 		draw_prepareDynamicOffsetsForDescriptorSet(VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY, dynamicOffsets, numDynOffsets, pipeline_info);
 		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
 	}
+	// Faro TAA: push the current camera jitter - every pipeline layout declares
+	// this exact push constant range (see PipelineCompiler::CreateGraphicsPipeline),
+	// so this is always valid even for shaders that don't actually use it.
+	{
+		float taaJitter[2];
+		LatteMRT::GetCurrentTaaJitter(taaJitter);
+		vkCmdPushConstants(m_state.currentCommandBuffer, vkObjPipeline->m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(taaJitter), taaJitter);
+	}
 	// draw
 	if (hostIndexType != INDEX_TYPE::NONE)
 		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
@@ -1735,6 +1763,14 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 		sint32 numDynOffsets;
 		draw_prepareDynamicOffsetsForDescriptorSet(VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY, dynamicOffsets, numDynOffsets, pipeline_info);
 		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
+	}
+
+	// Faro TAA: see the matching comment in draw_execute_first - every pipeline
+	// layout declares this push constant range, so this is always valid.
+	{
+		float taaJitter[2];
+		LatteMRT::GetCurrentTaaJitter(taaJitter);
+		vkCmdPushConstants(m_state.currentCommandBuffer, vkObjPipeline->m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(taaJitter), taaJitter);
 	}
 
 	// draw

@@ -495,14 +495,15 @@ struct CemuConfig
 	// passes: edge detection -> blending weights -> neighborhood blend) gives
 	// better preservation of thin diagonal geometry (fences, power lines) than
 	// FXAA's single contrast-based pass, at a real extra GPU cost.
-	// Faro TAA: the sub-pixel jitter itself is injected into the game's own
-	// vertex shaders regardless of upscaler (see LatteDecompilerEmitGLSLHeader.hpp's
-	// SET_POSITION) - but the actual resolve/blend pass, like FXAA/SMAA above,
-	// is currently only wired up as an add-on after FSR1's own EASU+RCAS passes
-	// (see DrawBackbufferQuadFsr1Taa), so kAATaa is a no-op unless
-	// upscale_filter == kFsr1Filter too. Not a fundamental limitation (the
-	// resolve pass doesn't actually need FSR1's upscale), just what the
-	// existing multi-pass dispatch in LatteRenderTarget.cpp currently supports.
+	// Faro TAA: the sub-pixel camera jitter that a "real" TAA would use is
+	// disabled (see LatteMRT::GetCurrentTaaJitter's own comment - the resolve
+	// pass has no reprojection, so jittering the camera without undoing that
+	// jitter afterward just shimmers). What kAATaa actually does today is a
+	// motion-adaptive temporal blend (ghost-driven AABB clip in YCoCg, see
+	// s_taa_resolve_shader_source) fed by a spatial pre-pass (FXAA or SMAA,
+	// see taa_spatial_aa below) - available at any upscale/downscale filter,
+	// same as FXAA/SMAA on their own (see DrawBackbufferQuadFxaa/Smaa/Taa vs
+	// the *Fsr1* variants in LatteRenderTarget.cpp).
 	enum AntialiasingMode
 	{
 		kAANone = 0,
@@ -528,6 +529,19 @@ struct CemuConfig
 		kSmaaUltra = 3,
 	};
 	ConfigValue<sint32> smaa_quality{kSmaaHigh};
+
+	// Faro TAA: which spatial filter runs as TAA's own pre-pass, before the
+	// temporal resolve (see antialiasing_mode's own comment). Only meaningful
+	// when antialiasing_mode == kAATaa. FXAA is cheaper but SMAA's
+	// morphological search preserves thin diagonal geometry (fences, power
+	// lines) better - see DrawBackbufferQuadTaa/DrawBackbufferQuadFsr1Taa,
+	// which read this to pick which pass(es) to run.
+	enum TaaSpatialAA
+	{
+		kTaaSpatialFxaa = 0,
+		kTaaSpatialSmaa = 1,
+	};
+	ConfigValue<sint32> taa_spatial_aa{kTaaSpatialFxaa};
 
 	// audio
 	sint32 audio_api = 0;

@@ -126,7 +126,32 @@ public:
 	// and the caller falls back to a plain single-pass
 	// DrawBackbufferQuad(shader=easuShader) call.
 	virtual bool DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
-												RendererOutputShader* resolveShader, bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+
+	// Faro: AA without FSR1 - same 3 add-on modes as the *Fsr1* variants above,
+	// but for when the active upscale/downscale filter is Linear/Bicubic/
+	// Hermite/Nearest instead of FSR1 (which only ever engages for upscaling,
+	// never downscaling - see LatteRenderTarget.cpp). upscaleShader is
+	// whichever single-pass filter shader was actually selected; unlike FSR1
+	// there's no second sharpening pass. Reuses the exact same intermediate
+	// targets the *Fsr1* variants already build (m_fxaaIntermediate*,
+	// m_smaaEdges*/m_smaaBlend*, m_taaFxaa*/m_taaNativeResolve*/m_taaHistory*)
+	// - only implemented on Vulkan, other backends return false and the
+	// caller falls back to a plain single-pass DrawBackbufferQuad(shader=upscaleShader) call.
+	virtual bool DrawBackbufferQuadFxaa(LatteTextureView* texView, RendererOutputShader* upscaleShader, RendererOutputShader* fxaaShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+	virtual bool DrawBackbufferQuadSmaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+												RendererOutputShader* edgeShader, RendererOutputShader* blendShader, RendererOutputShader* neighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+	virtual bool DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
 												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
 
 	virtual bool BeginFrame(bool mainWindow) = 0;

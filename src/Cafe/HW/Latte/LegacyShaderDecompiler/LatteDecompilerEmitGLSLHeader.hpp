@@ -8,14 +8,8 @@ namespace LatteDecompiler
 
 		if (rendererType == RendererAPI::Vulkan)
 		{
-			// for Vulkan uniform vars are in a uniform buffer
-			if (decompilerContext->hasUniformVarBlock)
-			{
-				cemu_assert_debug(resourceMapping.uniformVarsBufferBindingPoint >= 0);
-				decompilerContext->shaderSource->addFmt("layout(set = {}, binding = {}) uniform ufBlock" _CRLF "{{" _CRLF, (sint32)resourceMapping.setIndex, (sint32)resourceMapping.uniformVarsBufferBindingPoint);
-			}
 			// Faro TAA: sub-pixel camera jitter, delivered via a Vulkan push
-			// constant instead of the per-shader ufBlock above (see
+			// constant instead of the per-shader ufBlock below (see
 			// SET_POSITION's own comment - an earlier version that packed this
 			// into ufBlock could flip hasUniformVarBlock from false to true for
 			// a shader that otherwise had none, shifting that shader's other
@@ -24,14 +18,26 @@ namespace LatteDecompiler
 			// system, so this can never shift anything else - declared
 			// unconditionally alongside every vertex shader that's eligible
 			// (matches the always-present push constant range added in
-			// PipelineCompiler::CreateDescriptorSetLayout's pipeline layout),
+			// PipelineCompiler::InitFromCurrentGPUState's pipeline layout),
 			// regardless of whether TAA is actually selected right now, so a
 			// shader compiled once doesn't need recompiling if the user
-			// toggles TAA later.
+			// toggles TAA later. MUST be emitted (and closed with the matching
+			// "};" below) before ufBlock opens - a push_constant block is a
+			// top-level declaration and cannot be nested inside another
+			// uniform block's body, which is exactly what happened when this
+			// was emitted after the ufBlock opening brace (caused a GLSL
+			// syntax error / black screen on any freshly-compiled shader that
+			// also had hasUniformVarBlock true).
 			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex &&
 				!decompilerContext->analyzer.hasStreamoutWrite)
 			{
 				decompilerContext->shaderSource->add("layout(push_constant) uniform FaroPushConstants" _CRLF "{" _CRLF "\tvec2 uf_taaJitter;" _CRLF "};" _CRLF);
+			}
+			// for Vulkan uniform vars are in a uniform buffer
+			if (decompilerContext->hasUniformVarBlock)
+			{
+				cemu_assert_debug(resourceMapping.uniformVarsBufferBindingPoint >= 0);
+				decompilerContext->shaderSource->addFmt("layout(set = {}, binding = {}) uniform ufBlock" _CRLF "{{" _CRLF, (sint32)resourceMapping.setIndex, (sint32)resourceMapping.uniformVarsBufferBindingPoint);
 			}
 		}
 		else

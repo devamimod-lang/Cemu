@@ -492,27 +492,24 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_upscale_filter->SetToolTip(_("Upscaling filters are used when the game resolution is smaller than the window size. FSR 1.0 (AMD FidelityFX Super Resolution) gives the sharpest, most detailed result of these but costs a bit more GPU time - not available on macOS/Metal yet."));
 		m_upscale_filter->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent& event) {
 			GetConfig().upscale_filter = event.GetSelection();
-			// FXAA and SMAA are add-ons to FSR1 only (Vulkan, see LatteRenderTarget.cpp).
-			// The choice is disabled unless FSR1 is the active upscale filter, mirroring
-			// the same gate in LatteRenderTarget_copyToBackbuffer that falls back to
-			// single-pass otherwise.
-			m_antialiasing_mode->Enable(event.GetSelection() == kFsr1Filter);
-			m_smaa_quality->Enable(event.GetSelection() == kFsr1Filter && GetConfig().antialiasing_mode == CemuConfig::kAASmaa);
 		});
 		graphics_panel_sizer->Add(m_upscale_filter, 0, wxALL | wxEXPAND, 5);
 
-		// FXAA (1 extra pass) and SMAA (3 extra passes: edge -> blend -> neighborhood)
-		// are only offered as add-ons to FSR1 (Vulkan only) - see
-		// Renderer::DrawBackbufferQuadTwoPass / DrawBackbufferQuadFsr1Smaa.
-		// SMAA gives better preservation of thin diagonal geometry (fences, power lines)
-		// than FXAA's single contrast-based pass, at a real extra GPU cost.
+		// Faro: FXAA (1 extra pass), SMAA (3 extra passes: edge -> blend ->
+		// neighborhood) and TAA are available regardless of which upscale/
+		// downscale filter is active (Vulkan only) - see
+		// Renderer::DrawBackbufferQuadFxaa/Smaa/Taa (used when FSR1 isn't the
+		// active filter) and DrawBackbufferQuadTwoPass/Fsr1Smaa/Fsr1Taa (used
+		// when it is) in LatteRenderTarget.cpp. SMAA gives better preservation
+		// of thin diagonal geometry (fences, power lines) than FXAA's single
+		// contrast-based pass, at a real extra GPU cost.
 		wxString aa_choices[] = { _("None"), _("FXAA"), _("SMAA"), _("TAA (experimental)") };
 		m_antialiasing_mode = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(aa_choices), aa_choices);
-		m_antialiasing_mode->SetToolTip(_("Antialiasing applied on top of FSR 1.0's upscaled output. Vulkan only. SMAA is higher quality but costs notably more GPU time than FXAA."));
-		m_antialiasing_mode->Enable(GetConfig().upscale_filter == kFsr1Filter);
+		m_antialiasing_mode->SetToolTip(_("Antialiasing applied on top of the upscaled/downscaled output. Vulkan only. SMAA is higher quality but costs notably more GPU time than FXAA."));
 		m_antialiasing_mode->Bind(wxEVT_CHOICE, [this](wxCommandEvent& event) {
 			GetConfig().antialiasing_mode = event.GetSelection();
 			m_smaa_quality->Enable(event.GetSelection() == CemuConfig::kAASmaa);
+			m_taa_spatial_aa->Enable(event.GetSelection() == CemuConfig::kAATaa);
 		});
 		graphics_panel_sizer->Add(m_antialiasing_mode, 0, wxALL, 5);
 
@@ -524,11 +521,22 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		wxString smaa_quality_choices[] = { _("Low"), _("Medium"), _("High"), _("Ultra") };
 		m_smaa_quality = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(smaa_quality_choices), smaa_quality_choices);
 		m_smaa_quality->SetToolTip(_("SMAA quality preset. Higher presets search further for edges and enable diagonal/corner detection, at a real extra GPU cost."));
-		m_smaa_quality->Enable(GetConfig().upscale_filter == kFsr1Filter && GetConfig().antialiasing_mode == CemuConfig::kAASmaa);
+		m_smaa_quality->Enable(GetConfig().antialiasing_mode == CemuConfig::kAASmaa);
 		m_smaa_quality->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 			GetConfig().smaa_quality = event.GetSelection();
 		});
 		graphics_panel_sizer->Add(m_smaa_quality, 0, wxALL, 5);
+
+		// Faro TAA: which spatial filter runs as TAA's own pre-pass - see
+		// CemuConfig::TaaSpatialAA's own comment. Only meaningful in TAA mode.
+		wxString taa_spatial_choices[] = { _("FXAA"), _("SMAA") };
+		m_taa_spatial_aa = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(taa_spatial_choices), taa_spatial_choices);
+		m_taa_spatial_aa->SetToolTip(_("Spatial filter TAA uses as its own pre-pass before the temporal blend. FXAA is cheaper; SMAA preserves thin diagonal geometry (fences, power lines) better."));
+		m_taa_spatial_aa->Enable(GetConfig().antialiasing_mode == CemuConfig::kAATaa);
+		m_taa_spatial_aa->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+			GetConfig().taa_spatial_aa = event.GetSelection();
+		});
+		graphics_panel_sizer->Add(m_taa_spatial_aa, 0, wxALL, 5);
 
 		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
 		m_downscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Downscale filter"), wxDefaultPosition, wxDefaultSize, std::size(downscale_choices), downscale_choices, 5, wxRA_SPECIFY_COLS);
@@ -1996,13 +2004,18 @@ void GeneralSettings2::ApplyConfig()
 		if (aa < CemuConfig::kAANone || aa > CemuConfig::kAATaa)
 			aa = CemuConfig::kAANone;
 		m_antialiasing_mode->SetSelection(aa);
-		m_antialiasing_mode->Enable(config.upscale_filter == kFsr1Filter);
 
 		sint32 smaaQuality = config.smaa_quality;
 		if (smaaQuality < CemuConfig::kSmaaLow || smaaQuality > CemuConfig::kSmaaUltra)
 			smaaQuality = CemuConfig::kSmaaHigh;
 		m_smaa_quality->SetSelection(smaaQuality);
-		m_smaa_quality->Enable(config.upscale_filter == kFsr1Filter && aa == CemuConfig::kAASmaa);
+		m_smaa_quality->Enable(aa == CemuConfig::kAASmaa);
+
+		sint32 taaSpatialAa = config.taa_spatial_aa;
+		if (taaSpatialAa < CemuConfig::kTaaSpatialFxaa || taaSpatialAa > CemuConfig::kTaaSpatialSmaa)
+			taaSpatialAa = CemuConfig::kTaaSpatialFxaa;
+		m_taa_spatial_aa->SetSelection(taaSpatialAa);
+		m_taa_spatial_aa->Enable(aa == CemuConfig::kAATaa);
 	}
 	m_downscale_filter->SetSelection(config.downscale_filter);
 	m_fullscreen_scaling->SetSelection(config.fullscreen_scaling);

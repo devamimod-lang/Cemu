@@ -142,9 +142,9 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	upscale_filter = graphic.get("UpscaleFilter", kBicubicHermiteFilter);
 	downscale_filter = graphic.get("DownscaleFilter", kLinearFilter);
 	fullscreen_scaling = graphic.get("FullscreenScaling", kKeepAspectRatio);
-	// SMAA/FXAA are add-ons to FSR1 only (Vulkan, see LatteRenderTarget.cpp). AntialiasingMode
-	// supersedes the old FxaaEnabled bool - keep legacy read for migration so users upgrading
-	// from an FXAA-only build don't silently lose the setting.
+	// AntialiasingMode supersedes the old FxaaEnabled bool - keep legacy read
+	// for migration so users upgrading from an FXAA-only build don't silently
+	// lose the setting.
 	if (graphic.get("AntialiasingMode").valid())
 		antialiasing_mode = graphic.get("AntialiasingMode", kAANone);
 	else if (graphic.get("FxaaEnabled", false))
@@ -152,6 +152,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	else
 		antialiasing_mode = kAANone;
 	smaa_quality = graphic.get("SmaaQuality", kSmaaHigh);
+	taa_spatial_aa = graphic.get("TaaSpatialAA", kTaaSpatialFxaa);
 	async_compile = graphic.get("AsyncCompile", async_compile);
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
 #ifdef ENABLE_METAL
@@ -388,6 +389,7 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("FullscreenScaling", fullscreen_scaling);
 	graphic.set("AntialiasingMode", antialiasing_mode);
 	graphic.set("SmaaQuality", smaa_quality);
+	graphic.set("TaaSpatialAA", taa_spatial_aa);
 	graphic.set("AsyncCompile", async_compile.GetValue());
 	graphic.set("vkAccurateBarriers", vk_accurate_barriers);
 

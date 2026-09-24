@@ -872,6 +872,7 @@ VulkanRenderer::~VulkanRenderer()
 	DestroyFsr1EasuIntermediateTarget();
 	DestroyTaaHistoryTarget();
 	DestroyTaaNativeResolveTarget();
+	DestroyTaaSpatialNativeTargets();
 
 	if(!m_backbufferBlitDescriptorSetCache.empty())
 	{
@@ -4811,6 +4812,367 @@ bool VulkanRenderer::EnsureTaaNativeResolveTarget(VkFormat format, uint32 width,
 	return true;
 }
 
+void VulkanRenderer::DestroyTaaSpatialNativeTargets()
+{
+	if (m_taaSmaaNeighborhoodDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_taaSmaaNeighborhoodDescriptorSet);
+		m_taaSmaaNeighborhoodDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendCalcDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_taaSmaaBlendCalcDescriptorSet);
+		m_taaSmaaBlendCalcDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, m_taaSmaaBlendFramebuffer, nullptr);
+		m_taaSmaaBlendFramebuffer = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_taaSmaaBlendRenderPass, nullptr);
+		m_taaSmaaBlendRenderPass = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_taaSmaaBlendSampler, nullptr);
+		m_taaSmaaBlendSampler = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_taaSmaaBlendView, nullptr);
+		m_taaSmaaBlendView = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaBlendImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_taaSmaaBlendImage, nullptr);
+		m_taaSmaaBlendImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_taaSmaaBlendAllocation);
+		m_taaSmaaBlendAllocation = nullptr;
+	}
+	if (m_taaSmaaEdgesFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, m_taaSmaaEdgesFramebuffer, nullptr);
+		m_taaSmaaEdgesFramebuffer = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaEdgesRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_taaSmaaEdgesRenderPass, nullptr);
+		m_taaSmaaEdgesRenderPass = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaEdgesSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_taaSmaaEdgesSampler, nullptr);
+		m_taaSmaaEdgesSampler = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaEdgesView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_taaSmaaEdgesView, nullptr);
+		m_taaSmaaEdgesView = VK_NULL_HANDLE;
+	}
+	if (m_taaSmaaEdgesImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_taaSmaaEdgesImage, nullptr);
+		m_taaSmaaEdgesImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_taaSmaaEdgesAllocation);
+		m_taaSmaaEdgesAllocation = nullptr;
+	}
+	if (m_taaFxaaFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, m_taaFxaaFramebuffer, nullptr);
+		m_taaFxaaFramebuffer = VK_NULL_HANDLE;
+	}
+	if (m_taaFxaaRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_taaFxaaRenderPass, nullptr);
+		m_taaFxaaRenderPass = VK_NULL_HANDLE;
+	}
+	if (m_taaFxaaSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_taaFxaaSampler, nullptr);
+		m_taaFxaaSampler = VK_NULL_HANDLE;
+	}
+	if (m_taaFxaaView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_taaFxaaView, nullptr);
+		m_taaFxaaView = VK_NULL_HANDLE;
+	}
+	if (m_taaFxaaImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_taaFxaaImage, nullptr);
+		m_taaFxaaImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_taaFxaaAllocation);
+		m_taaFxaaAllocation = nullptr;
+	}
+	m_taaFxaaExtent = {};
+	m_taaFxaaFormat = VK_FORMAT_UNDEFINED;
+}
+
+// Faro TAA: spatial pre-pass targets, at native/source resolution - see
+// m_taaFxaaImage's own comment. Mirrors EnsureSmaaIntermediateTargets'
+// createTarget lambda exactly for all 3 images (shared FXAA/SMAA-neighborhood
+// output, SMAA edges, SMAA blend weights), just at native instead of output
+// resolution.
+bool VulkanRenderer::EnsureTaaSpatialNativeTargets(VkFormat format, uint32 width, uint32 height)
+{
+	if (width == 0 || height == 0)
+		return false;
+
+	if (m_taaFxaaImage != VK_NULL_HANDLE && m_taaFxaaExtent.width == width &&
+		m_taaFxaaExtent.height == height && m_taaFxaaFormat == format)
+		return true;
+
+	WaitDeviceIdle();
+	DestroyTaaSpatialNativeTargets();
+
+	auto createTarget = [this, format, width, height](VkImage& image, VkImageMemAllocation*& allocation, VkImageView& view, VkSampler& sampler,
+		VkRenderPass& renderPass, VkFramebuffer& framebuffer, bool clearOnLoad) -> bool
+	{
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent = { width, height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = format;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &image) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to create intermediate image");
+			return false;
+		}
+		allocation = memoryManager->imageMemoryAllocate(image);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = format;
+		viewInfo.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+		viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &view) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to create intermediate image view");
+			return false;
+		}
+
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.compareOp = VK_COMPARE_OP_NEVER;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		samplerInfo.maxAnisotropy = 1.0f;
+		samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &sampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to create intermediate sampler");
+			return false;
+		}
+
+		VkAttachmentDescription colorAttachment{};
+		colorAttachment.format = format;
+		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		colorAttachment.loadOp = clearOnLoad ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		VkAttachmentReference colorAttachmentRef{};
+		colorAttachmentRef.attachment = 0;
+		colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorAttachmentRef;
+
+		VkRenderPassCreateInfo renderPassInfo{};
+		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		renderPassInfo.attachmentCount = 1;
+		renderPassInfo.pAttachments = &colorAttachment;
+		renderPassInfo.subpassCount = 1;
+		renderPassInfo.pSubpasses = &subpass;
+		if (vkCreateRenderPass(m_logicalDevice, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to create intermediate render pass");
+			return false;
+		}
+
+		VkImageView attachments[1] = { view };
+		VkFramebufferCreateInfo framebufferInfo{};
+		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebufferInfo.renderPass = renderPass;
+		framebufferInfo.attachmentCount = 1;
+		framebufferInfo.pAttachments = attachments;
+		framebufferInfo.width = width;
+		framebufferInfo.height = height;
+		framebufferInfo.layers = 1;
+		if (vkCreateFramebuffer(m_logicalDevice, &framebufferInfo, nullptr, &framebuffer) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to create intermediate framebuffer");
+			return false;
+		}
+		return true;
+	};
+
+	if (!createTarget(m_taaFxaaImage, m_taaFxaaAllocation, m_taaFxaaView, m_taaFxaaSampler, m_taaFxaaRenderPass, m_taaFxaaFramebuffer, false) ||
+		!createTarget(m_taaSmaaEdgesImage, m_taaSmaaEdgesAllocation, m_taaSmaaEdgesView, m_taaSmaaEdgesSampler, m_taaSmaaEdgesRenderPass, m_taaSmaaEdgesFramebuffer, true) ||
+		!createTarget(m_taaSmaaBlendImage, m_taaSmaaBlendAllocation, m_taaSmaaBlendView, m_taaSmaaBlendSampler, m_taaSmaaBlendRenderPass, m_taaSmaaBlendFramebuffer, false))
+	{
+		DestroyTaaSpatialNativeTargets();
+		return false;
+	}
+
+	// Blend-weight-calc pass input: binding 0 = m_taaSmaaEdgesView, bindings
+	// 2/3 = the same static area/search lookup textures m_smaaBlendCalcDescriptorSet
+	// uses (resolution-independent, shared across every SMAA path).
+	{
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = m_descriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &m_taaSmaaBlendCalcDescriptorSet) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to allocate blend-calc descriptor set");
+			DestroyTaaSpatialNativeTargets();
+			return false;
+		}
+		performanceMonitor.vk.numDescriptorSets.increment();
+
+		VkDescriptorImageInfo imageInfo0{};
+		imageInfo0.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfo0.imageView = m_taaSmaaEdgesView;
+		imageInfo0.sampler = m_taaSmaaEdgesSampler;
+
+		VkDescriptorImageInfo imageInfo2{};
+		imageInfo2.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfo2.imageView = m_smaaAreaTexView;
+		imageInfo2.sampler = m_smaaAreaTexSampler;
+
+		VkDescriptorImageInfo imageInfo3{};
+		imageInfo3.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfo3.imageView = m_smaaSearchTexView;
+		imageInfo3.sampler = m_smaaSearchTexSampler;
+
+		VkDescriptorBufferInfo uniformBufferInfo{};
+		uniformBufferInfo.buffer = m_uniformVarBuffer;
+		uniformBufferInfo.offset = 0;
+		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+
+		VkWriteDescriptorSet writes[4]{};
+		writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[0].dstSet = m_taaSmaaBlendCalcDescriptorSet;
+		writes[0].dstBinding = 0;
+		writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[0].descriptorCount = 1;
+		writes[0].pImageInfo = &imageInfo0;
+
+		writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[1].dstSet = m_taaSmaaBlendCalcDescriptorSet;
+		writes[1].dstBinding = 1;
+		writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		writes[1].descriptorCount = 1;
+		writes[1].pBufferInfo = &uniformBufferInfo;
+
+		writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[2].dstSet = m_taaSmaaBlendCalcDescriptorSet;
+		writes[2].dstBinding = 2;
+		writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[2].descriptorCount = 1;
+		writes[2].pImageInfo = &imageInfo2;
+
+		writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[3].dstSet = m_taaSmaaBlendCalcDescriptorSet;
+		writes[3].dstBinding = 3;
+		writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[3].descriptorCount = 1;
+		writes[3].pImageInfo = &imageInfo3;
+
+		vkUpdateDescriptorSets(m_logicalDevice, std::size(writes), writes, 0, nullptr);
+		performanceMonitor.vk.numDescriptorSamplerTextures.increment();
+	}
+
+	// Neighborhood-blend pass input: binding 0 = the raw game texture -
+	// deliberately left UNWRITTEN here (rewritten via vkUpdateDescriptorSets
+	// every single draw, since which texture that is changes frame to frame -
+	// same reason m_taaResolveDescriptorSet's binding 0 already works this
+	// way). Binding 2 = m_taaSmaaBlendView (real per-frame data), binding 3 =
+	// the static search texture as harmless unused filler. Writes into the
+	// shared m_taaFxaaImage (binding target is chosen via m_taaFxaaRenderPass/
+	// m_taaFxaaFramebuffer at draw time, not part of this descriptor set).
+	{
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = m_descriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &m_taaSmaaNeighborhoodDescriptorSet) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "TAA spatial: failed to allocate neighborhood descriptor set");
+			DestroyTaaSpatialNativeTargets();
+			return false;
+		}
+		performanceMonitor.vk.numDescriptorSets.increment();
+
+		VkDescriptorImageInfo imageInfo2{};
+		imageInfo2.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfo2.imageView = m_taaSmaaBlendView;
+		imageInfo2.sampler = m_taaSmaaBlendSampler;
+
+		VkDescriptorImageInfo imageInfo3{};
+		imageInfo3.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageInfo3.imageView = m_smaaSearchTexView;
+		imageInfo3.sampler = m_smaaSearchTexSampler;
+
+		VkDescriptorBufferInfo uniformBufferInfo{};
+		uniformBufferInfo.buffer = m_uniformVarBuffer;
+		uniformBufferInfo.offset = 0;
+		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+
+		VkWriteDescriptorSet writes[3]{};
+		writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[0].dstSet = m_taaSmaaNeighborhoodDescriptorSet;
+		writes[0].dstBinding = 1;
+		writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		writes[0].descriptorCount = 1;
+		writes[0].pBufferInfo = &uniformBufferInfo;
+
+		writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[1].dstSet = m_taaSmaaNeighborhoodDescriptorSet;
+		writes[1].dstBinding = 2;
+		writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[1].descriptorCount = 1;
+		writes[1].pImageInfo = &imageInfo2;
+
+		writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[2].dstSet = m_taaSmaaNeighborhoodDescriptorSet;
+		writes[2].dstBinding = 3;
+		writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[2].descriptorCount = 1;
+		writes[2].pImageInfo = &imageInfo3;
+
+		vkUpdateDescriptorSets(m_logicalDevice, std::size(writes), writes, 0, nullptr);
+		performanceMonitor.vk.numDescriptorSamplerTextures.increment();
+	}
+
+	m_taaFxaaExtent = { width, height };
+	m_taaFxaaFormat = format;
+	return true;
+}
+
 void VulkanRenderer::DestroyTaaHistoryTarget()
 {
 	if (m_taaResolveDescriptorSet != VK_NULL_HANDLE)
@@ -5247,8 +5609,10 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Smaa(LatteTextureView* texView, Rende
 // Renderer-owned images, so unlike the old version this capture step never
 // needs to touch the swapchain image's layout at all.
 bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
-	RendererOutputShader* resolveShader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,
-	bool padView, bool clearBackground)
+	RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+	RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+	bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+	sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
 {
 	if (!AcquireNextSwapchainImage(!padView))
 		return true; // nothing to draw this frame, but not a failure the caller should fall back for
@@ -5260,6 +5624,7 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	texView->baseTexture->GetEffectiveSize(nativeWidth, nativeHeight, 0);
 
 	if (imageWidth <= 0 || imageHeight <= 0 || nativeWidth <= 0 || nativeHeight <= 0 ||
+		!EnsureTaaSpatialNativeTargets(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
 		!EnsureTaaNativeResolveTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
 		!EnsureTaaHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
 		!EnsureFsr1EasuIntermediateTarget(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
@@ -5269,11 +5634,12 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 
 	// binding 0 (the game's own native texture) changes from draw to draw -
 	// see EnsureTaaHistoryTarget's own comment on why it's rewritten here
-	// every call instead of once at (re)creation time.
+	// every call instead of once at (re)creation time. Now reads TAA's own
+	// FXAA output instead of the raw game texture directly.
 	VkDescriptorImageInfo resolveInputImageInfo{};
-	resolveInputImageInfo.imageLayout = static_cast<LatteTextureVk*>(texViewVk->baseTexture)->GetDefaultLayout();
-	resolveInputImageInfo.imageView = texViewVk->GetViewRGBA()->m_textureImageView;
-	resolveInputImageInfo.sampler = texViewVk->GetDefaultTextureSampler(useLinearTexFilter);
+	resolveInputImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	resolveInputImageInfo.imageView = m_taaFxaaView;
+	resolveInputImageInfo.sampler = m_taaFxaaSampler;
 	VkWriteDescriptorSet resolveInputWrite{};
 	resolveInputWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	resolveInputWrite.dstSet = m_taaResolveDescriptorSet;
@@ -5282,6 +5648,23 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	resolveInputWrite.descriptorCount = 1;
 	resolveInputWrite.pImageInfo = &resolveInputImageInfo;
 	vkUpdateDescriptorSets(m_logicalDevice, 1, &resolveInputWrite, 0, nullptr);
+
+	// SMAA neighborhood pass's own binding 0 (raw game texture) - only
+	// actually read when taa_spatial_aa == kTaaSpatialSmaa below, but written
+	// unconditionally every draw for simplicity (harmless if unused this
+	// frame, same reasoning as resolveInputWrite above).
+	VkDescriptorImageInfo rawGameTexImageInfo{};
+	rawGameTexImageInfo.imageLayout = static_cast<LatteTextureVk*>(texViewVk->baseTexture)->GetDefaultLayout();
+	rawGameTexImageInfo.imageView = texViewVk->GetViewRGBA()->m_textureImageView;
+	rawGameTexImageInfo.sampler = texViewVk->GetDefaultTextureSampler(useLinearTexFilter);
+	VkWriteDescriptorSet smaaNeighborhoodInputWrite{};
+	smaaNeighborhoodInputWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	smaaNeighborhoodInputWrite.dstSet = m_taaSmaaNeighborhoodDescriptorSet;
+	smaaNeighborhoodInputWrite.dstBinding = 0;
+	smaaNeighborhoodInputWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	smaaNeighborhoodInputWrite.descriptorCount = 1;
+	smaaNeighborhoodInputWrite.pImageInfo = &rawGameTexImageInfo;
+	vkUpdateDescriptorSets(m_logicalDevice, 1, &smaaNeighborhoodInputWrite, 0, nullptr);
 
 	// barrier for input texture (same as DrawBackbufferQuad/DrawBackbufferQuadTwoPass)
 	VkMemoryBarrier memoryBarrier{};
@@ -5302,7 +5685,158 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 			0, 1, &barrier, 0, nullptr, 0, nullptr);
 	};
 
-	// === pass 0: resolveShader, texView (current, jittered) + m_taaHistory* -> m_taaNativeResolve* (native res) ===
+	// === TAA's own spatial pre-pass: writes m_taaFxaa* (native res) - either
+	// FXAA (1 pass, reads the raw game texture directly) or SMAA (3 passes:
+	// edge -> blend -> neighborhood, the last of which writes m_taaFxaa* too)
+	// depending on CemuConfig::taa_spatial_aa. Both branches feed the exact
+	// same target, so the resolve pass below doesn't need to know which ran.
+	if (smaaEdgeShader && smaaBlendShader && smaaNeighborhoodShader && GetConfig().taa_spatial_aa == CemuConfig::kTaaSpatialSmaa)
+	{
+		VkViewport nativeViewportSmaa{};
+		nativeViewportSmaa.x = 0;
+		nativeViewportSmaa.y = 0;
+		nativeViewportSmaa.width = (float)nativeWidth;
+		nativeViewportSmaa.height = (float)nativeHeight;
+		nativeViewportSmaa.minDepth = 0.0f;
+		nativeViewportSmaa.maxDepth = 1.0f;
+
+		VkRect2D nativeScissorSmaa{};
+		nativeScissorSmaa.extent = m_taaFxaaExtent;
+
+		// === SMAA edge: smaaEdgeShader, raw game texture -> m_taaSmaaEdges* (native res) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaEdgeShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaSmaaEdgesRenderPass;
+			renderPassInfo.framebuffer = m_taaSmaaEdgesFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+			VkClearValue edgesClearValue{};
+			edgesClearValue.color = { 0.0f, 0.0f, 0.0f, 0.0f };
+			renderPassInfo.clearValueCount = 1;
+			renderPassInfo.pClearValues = &edgesClearValue;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			auto rawGameTexDescSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaEdgeShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &rawGameTexDescSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+
+		// === SMAA blend: smaaBlendShader, m_taaSmaaEdges* (+ static area/search) -> m_taaSmaaBlend* (native res) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaBlendShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaSmaaBlendRenderPass;
+			renderPassInfo.framebuffer = m_taaSmaaBlendFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaBlendShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaSmaaBlendCalcDescriptorSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+
+		// === SMAA neighborhood: smaaNeighborhoodShader, raw game texture + m_taaSmaaBlend* -> m_taaFxaa* (native res, shared output) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaNeighborhoodShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaFxaaRenderPass;
+			renderPassInfo.framebuffer = m_taaFxaaFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+			renderPassInfo.clearValueCount = 0;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaNeighborhoodShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaSmaaNeighborhoodDescriptorSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+	}
+	else
+	{
+		// === FXAA: fxaaShader, raw game texture -> m_taaFxaa* (native res) ===
+		auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, fxaaShader);
+
+		VkRenderPassBeginInfo renderPassInfo{};
+		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		renderPassInfo.renderPass = m_taaFxaaRenderPass;
+		renderPassInfo.framebuffer = m_taaFxaaFramebuffer;
+		renderPassInfo.renderArea.offset = { 0, 0 };
+		renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+		renderPassInfo.clearValueCount = 0;
+
+		VkViewport nativeViewport{};
+		nativeViewport.x = 0;
+		nativeViewport.y = 0;
+		nativeViewport.width = (float)nativeWidth;
+		nativeViewport.height = (float)nativeHeight;
+		nativeViewport.minDepth = 0.0f;
+		nativeViewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewport);
+
+		VkRect2D nativeScissor{};
+		nativeScissor.extent = m_taaFxaaExtent;
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissor);
+
+		auto rawGameTexDescSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_state.currentPipeline = pipeline;
+
+		auto uniforms = fxaaShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+		uniforms.applySRGBEncoding = false;
+		uniforms.targetGamma = uniforms.displayGamma;
+		auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &rawGameTexDescSet, 1, &uniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+		interPassBarrier();
+	}
+
+	// === pass 0: resolveShader, TAA's own spatial pre-pass output (this frame) + m_taaHistory* -> m_taaNativeResolve* (native res) ===
 	auto pass0Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, resolveShader);
 
 	VkRenderPassBeginInfo pass0RenderPassInfo{};
@@ -5490,6 +6024,685 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	m_taaHistoryValid = true;
 
 	// mark current swapchain image as well defined
+	chainInfo.hasDefinedSwapchainImage = true;
+	return true;
+}
+
+// Faro: AA without FSR1 - see these 3 functions' own doc comment in Renderer.h.
+// upscaleShader is whichever single-pass filter (copy/bicubic/hermite/nearest)
+// was actually selected; mirrors DrawBackbufferQuadTwoPass exactly, just with
+// upscaleShader taking the place of the EASU+RCAS pair (one pass instead of two).
+bool VulkanRenderer::DrawBackbufferQuadFxaa(LatteTextureView* texView, RendererOutputShader* upscaleShader, RendererOutputShader* fxaaShader,
+	bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
+{
+	if (!AcquireNextSwapchainImage(!padView))
+		return true; // nothing to draw this frame, but not a failure the caller should fall back for
+
+	auto& chainInfo = GetChainInfo(!padView);
+	LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
+
+	if (imageWidth <= 0 || imageHeight <= 0 ||
+		!EnsureFxaaIntermediateTarget(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
+		return false;
+
+	draw_endRenderPass();
+
+	VkMemoryBarrier memoryBarrier{};
+	memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	memoryBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+	auto interPassBarrier = [this]()
+	{
+		VkMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+	};
+
+	// === pass 1: upscaleShader, source texture -> m_fxaaIntermediate ===
+	auto pass1Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, upscaleShader);
+
+	VkRenderPassBeginInfo pass1RenderPassInfo{};
+	pass1RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass1RenderPassInfo.renderPass = m_fxaaIntermediateRenderPass;
+	pass1RenderPassInfo.framebuffer = m_fxaaIntermediateFramebuffer;
+	pass1RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass1RenderPassInfo.renderArea.extent = m_fxaaIntermediateExtent;
+	pass1RenderPassInfo.clearValueCount = 0;
+
+	VkViewport fullViewport{};
+	fullViewport.x = 0;
+	fullViewport.y = 0;
+	fullViewport.width = (float)imageWidth;
+	fullViewport.height = (float)imageHeight;
+	fullViewport.minDepth = 0.0f;
+	fullViewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &fullViewport);
+
+	VkRect2D pass1Scissor{};
+	pass1Scissor.extent = m_fxaaIntermediateExtent;
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass1Scissor);
+
+	auto pass1DescriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass1RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1Pipeline);
+	m_state.currentPipeline = pass1Pipeline;
+
+	auto pass1Uniforms = upscaleShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	pass1Uniforms.applySRGBEncoding = false;
+	pass1Uniforms.targetGamma = pass1Uniforms.displayGamma;
+	auto pass1UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass1Uniforms, sizeof(decltype(pass1Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &pass1DescriptSet, 1, &pass1UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	interPassBarrier();
+
+	// === pass 2: fxaaShader, m_fxaaIntermediate -> real backbuffer ===
+	auto pass2Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, fxaaShader);
+
+	VkRenderPassBeginInfo pass2RenderPassInfo{};
+	pass2RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass2RenderPassInfo.renderPass = chainInfo.m_swapchainRenderPass;
+	pass2RenderPassInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+	pass2RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass2RenderPassInfo.renderArea.extent = chainInfo.getExtent();
+	pass2RenderPassInfo.clearValueCount = 0;
+
+	VkViewport pass2Viewport{};
+	pass2Viewport.x = imageX;
+	pass2Viewport.y = imageY;
+	pass2Viewport.width = imageWidth;
+	pass2Viewport.height = imageHeight;
+	pass2Viewport.minDepth = 0.0f;
+	pass2Viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &pass2Viewport);
+
+	VkRect2D pass2Scissor{};
+	pass2Scissor.extent = chainInfo.getExtent();
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass2Scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass2RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+	if (clearBackground)
+	{
+		VkClearAttachment clearAttachment{};
+		clearAttachment.clearValue = {0,0,0,0};
+		clearAttachment.colorAttachment = 0;
+		clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		VkClearRect clearExtent = {{{0,0},chainInfo.m_actualExtent}, 0, 1};
+		vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+	}
+
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2Pipeline);
+	m_state.currentPipeline = pass2Pipeline;
+
+	auto pass2Uniforms = fxaaShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	auto pass2UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass2Uniforms, sizeof(decltype(pass2Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fxaaIntermediateDescriptorSet, 1, &pass2UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	// restore viewport
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
+
+	chainInfo.hasDefinedSwapchainImage = true;
+	return true;
+}
+
+// Faro: AA without FSR1 - SMAA variant. Mirrors DrawBackbufferQuadFsr1Smaa
+// exactly, just with upscaleShader taking the place of the EASU+RCAS pair.
+bool VulkanRenderer::DrawBackbufferQuadSmaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+	RendererOutputShader* edgeShader, RendererOutputShader* blendShader, RendererOutputShader* neighborhoodShader,
+	bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
+{
+	if (!AcquireNextSwapchainImage(!padView))
+		return true;
+
+	auto& chainInfo = GetChainInfo(!padView);
+	LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
+
+	if (imageWidth <= 0 || imageHeight <= 0 ||
+		!EnsureSmaaIntermediateTargets(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
+		return false;
+
+	draw_endRenderPass();
+
+	VkMemoryBarrier memoryBarrier{};
+	memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	memoryBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+	auto interPassBarrier = [this]()
+	{
+		VkMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+	};
+
+	// === pass 1: upscaleShader, source texture -> m_fxaaIntermediate ===
+	auto pass1Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, upscaleShader);
+
+	VkRenderPassBeginInfo pass1RenderPassInfo{};
+	pass1RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass1RenderPassInfo.renderPass = m_fxaaIntermediateRenderPass;
+	pass1RenderPassInfo.framebuffer = m_fxaaIntermediateFramebuffer;
+	pass1RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass1RenderPassInfo.renderArea.extent = m_fxaaIntermediateExtent;
+
+	VkViewport fullViewport{};
+	fullViewport.x = 0;
+	fullViewport.y = 0;
+	fullViewport.width = (float)imageWidth;
+	fullViewport.height = (float)imageHeight;
+	fullViewport.minDepth = 0.0f;
+	fullViewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &fullViewport);
+
+	VkRect2D fullScissor{};
+	fullScissor.extent = m_fxaaIntermediateExtent;
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &fullScissor);
+
+	auto pass1DescriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass1RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1Pipeline);
+	m_state.currentPipeline = pass1Pipeline;
+
+	auto pass1Uniforms = upscaleShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	pass1Uniforms.applySRGBEncoding = false;
+	pass1Uniforms.targetGamma = pass1Uniforms.displayGamma;
+	auto pass1UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass1Uniforms, sizeof(decltype(pass1Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &pass1DescriptSet, 1, &pass1UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	interPassBarrier();
+
+	// === pass 2: edgeShader, m_fxaaIntermediate* -> m_smaaEdges* ===
+	auto pass2Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, edgeShader);
+
+	VkRenderPassBeginInfo pass2RenderPassInfo{};
+	pass2RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass2RenderPassInfo.renderPass = m_smaaEdgesRenderPass;
+	pass2RenderPassInfo.framebuffer = m_smaaEdgesFramebuffer;
+	pass2RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass2RenderPassInfo.renderArea.extent = m_smaaIntermediateExtent;
+	VkClearValue edgesClearValue{};
+	edgesClearValue.color = { 0.0f, 0.0f, 0.0f, 0.0f };
+	pass2RenderPassInfo.clearValueCount = 1;
+	pass2RenderPassInfo.pClearValues = &edgesClearValue;
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass2RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2Pipeline);
+	m_state.currentPipeline = pass2Pipeline;
+
+	auto pass2Uniforms = edgeShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	pass2Uniforms.applySRGBEncoding = false;
+	pass2Uniforms.targetGamma = pass2Uniforms.displayGamma;
+	auto pass2UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass2Uniforms, sizeof(decltype(pass2Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fxaaIntermediateDescriptorSet, 1, &pass2UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	interPassBarrier();
+
+	// === pass 3: blendShader, m_smaaEdges* (+ static area/search) -> m_smaaBlend* ===
+	auto pass3Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, blendShader);
+
+	VkRenderPassBeginInfo pass3RenderPassInfo{};
+	pass3RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass3RenderPassInfo.renderPass = m_smaaBlendRenderPass;
+	pass3RenderPassInfo.framebuffer = m_smaaBlendFramebuffer;
+	pass3RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass3RenderPassInfo.renderArea.extent = m_smaaIntermediateExtent;
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass3RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass3Pipeline);
+	m_state.currentPipeline = pass3Pipeline;
+
+	auto pass3Uniforms = blendShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	pass3Uniforms.applySRGBEncoding = false;
+	pass3Uniforms.targetGamma = pass3Uniforms.displayGamma;
+	auto pass3UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass3Uniforms, sizeof(decltype(pass3Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_smaaBlendCalcDescriptorSet, 1, &pass3UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	interPassBarrier();
+
+	// === pass 4: neighborhoodShader, m_fxaaIntermediate* + m_smaaBlend* -> real backbuffer ===
+	auto pass4Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, neighborhoodShader);
+
+	VkRenderPassBeginInfo pass4RenderPassInfo{};
+	pass4RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass4RenderPassInfo.renderPass = chainInfo.m_swapchainRenderPass;
+	pass4RenderPassInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+	pass4RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass4RenderPassInfo.renderArea.extent = chainInfo.getExtent();
+	pass4RenderPassInfo.clearValueCount = 0;
+
+	VkViewport pass4Viewport{};
+	pass4Viewport.x = imageX;
+	pass4Viewport.y = imageY;
+	pass4Viewport.width = imageWidth;
+	pass4Viewport.height = imageHeight;
+	pass4Viewport.minDepth = 0.0f;
+	pass4Viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &pass4Viewport);
+
+	VkRect2D pass4Scissor{};
+	pass4Scissor.extent = chainInfo.getExtent();
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass4Scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass4RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+	if (clearBackground)
+	{
+		VkClearAttachment clearAttachment{};
+		clearAttachment.clearValue = {0,0,0,0};
+		clearAttachment.colorAttachment = 0;
+		clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		VkClearRect clearExtent = {{{0,0},chainInfo.m_actualExtent}, 0, 1};
+		vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+	}
+
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass4Pipeline);
+	m_state.currentPipeline = pass4Pipeline;
+
+	auto pass4Uniforms = neighborhoodShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	auto pass4UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass4Uniforms, sizeof(decltype(pass4Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_smaaNeighborhoodDescriptorSet, 1, &pass4UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	// restore viewport
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
+
+	chainInfo.hasDefinedSwapchainImage = true;
+	return true;
+}
+
+// Faro: AA without FSR1 - TAA variant. Same pass order as DrawBackbufferQuadFsr1Taa
+// (FXAA -> resolve -> upscale -> history capture) but upscaleShader writes the
+// real backbuffer DIRECTLY from m_taaNativeResolve* (single pass, no RCAS)
+// instead of needing a separate EASU+RCAS pair.
+bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+	RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+	RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+	bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
+{
+	if (!AcquireNextSwapchainImage(!padView))
+		return true;
+
+	auto& chainInfo = GetChainInfo(!padView);
+	LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
+
+	sint32 nativeWidth, nativeHeight;
+	texView->baseTexture->GetEffectiveSize(nativeWidth, nativeHeight, 0);
+
+	if (imageWidth <= 0 || imageHeight <= 0 || nativeWidth <= 0 || nativeHeight <= 0 ||
+		!EnsureTaaSpatialNativeTargets(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaNativeResolveTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight))
+		return false;
+
+	draw_endRenderPass();
+
+	// binding 0 (the game's own native texture) changes from draw to draw -
+	// see EnsureTaaHistoryTarget's own comment on why it's rewritten here
+	// every call instead of once at (re)creation time. Reads TAA's own FXAA
+	// output instead of the raw game texture directly.
+	VkDescriptorImageInfo resolveInputImageInfo{};
+	resolveInputImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	resolveInputImageInfo.imageView = m_taaFxaaView;
+	resolveInputImageInfo.sampler = m_taaFxaaSampler;
+	VkWriteDescriptorSet resolveInputWrite{};
+	resolveInputWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	resolveInputWrite.dstSet = m_taaResolveDescriptorSet;
+	resolveInputWrite.dstBinding = 0;
+	resolveInputWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	resolveInputWrite.descriptorCount = 1;
+	resolveInputWrite.pImageInfo = &resolveInputImageInfo;
+	vkUpdateDescriptorSets(m_logicalDevice, 1, &resolveInputWrite, 0, nullptr);
+
+	// SMAA neighborhood pass's own binding 0 (raw game texture) - only
+	// actually read when taa_spatial_aa == kTaaSpatialSmaa below, but written
+	// unconditionally every draw for simplicity (harmless if unused this
+	// frame, same reasoning as resolveInputWrite above).
+	VkDescriptorImageInfo rawGameTexImageInfo{};
+	rawGameTexImageInfo.imageLayout = static_cast<LatteTextureVk*>(texViewVk->baseTexture)->GetDefaultLayout();
+	rawGameTexImageInfo.imageView = texViewVk->GetViewRGBA()->m_textureImageView;
+	rawGameTexImageInfo.sampler = texViewVk->GetDefaultTextureSampler(useLinearTexFilter);
+	VkWriteDescriptorSet smaaNeighborhoodInputWrite{};
+	smaaNeighborhoodInputWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	smaaNeighborhoodInputWrite.dstSet = m_taaSmaaNeighborhoodDescriptorSet;
+	smaaNeighborhoodInputWrite.dstBinding = 0;
+	smaaNeighborhoodInputWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	smaaNeighborhoodInputWrite.descriptorCount = 1;
+	smaaNeighborhoodInputWrite.pImageInfo = &rawGameTexImageInfo;
+	vkUpdateDescriptorSets(m_logicalDevice, 1, &smaaNeighborhoodInputWrite, 0, nullptr);
+
+	// barrier for input texture (same as DrawBackbufferQuad/DrawBackbufferQuadTwoPass)
+	VkMemoryBarrier memoryBarrier{};
+	memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	memoryBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+	auto interPassBarrier = [this]()
+	{
+		VkMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+	};
+
+	// === TAA's own spatial pre-pass: writes m_taaFxaa* (native res) - either
+	// FXAA (1 pass, reads the raw game texture directly) or SMAA (3 passes:
+	// edge -> blend -> neighborhood, the last of which writes m_taaFxaa* too)
+	// depending on CemuConfig::taa_spatial_aa. Both branches feed the exact
+	// same target, so the resolve pass below doesn't need to know which ran.
+	if (smaaEdgeShader && smaaBlendShader && smaaNeighborhoodShader && GetConfig().taa_spatial_aa == CemuConfig::kTaaSpatialSmaa)
+	{
+		VkViewport nativeViewportSmaa{};
+		nativeViewportSmaa.x = 0;
+		nativeViewportSmaa.y = 0;
+		nativeViewportSmaa.width = (float)nativeWidth;
+		nativeViewportSmaa.height = (float)nativeHeight;
+		nativeViewportSmaa.minDepth = 0.0f;
+		nativeViewportSmaa.maxDepth = 1.0f;
+
+		VkRect2D nativeScissorSmaa{};
+		nativeScissorSmaa.extent = m_taaFxaaExtent;
+
+		// === SMAA edge: smaaEdgeShader, raw game texture -> m_taaSmaaEdges* (native res) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaEdgeShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaSmaaEdgesRenderPass;
+			renderPassInfo.framebuffer = m_taaSmaaEdgesFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+			VkClearValue edgesClearValue{};
+			edgesClearValue.color = { 0.0f, 0.0f, 0.0f, 0.0f };
+			renderPassInfo.clearValueCount = 1;
+			renderPassInfo.pClearValues = &edgesClearValue;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			auto rawGameTexDescSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaEdgeShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &rawGameTexDescSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+
+		// === SMAA blend: smaaBlendShader, m_taaSmaaEdges* (+ static area/search) -> m_taaSmaaBlend* (native res) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaBlendShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaSmaaBlendRenderPass;
+			renderPassInfo.framebuffer = m_taaSmaaBlendFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaBlendShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaSmaaBlendCalcDescriptorSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+
+		// === SMAA neighborhood: smaaNeighborhoodShader, raw game texture + m_taaSmaaBlend* -> m_taaFxaa* (native res, shared output) ===
+		{
+			auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, smaaNeighborhoodShader);
+
+			VkRenderPassBeginInfo renderPassInfo{};
+			renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			renderPassInfo.renderPass = m_taaFxaaRenderPass;
+			renderPassInfo.framebuffer = m_taaFxaaFramebuffer;
+			renderPassInfo.renderArea.offset = { 0, 0 };
+			renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+			renderPassInfo.clearValueCount = 0;
+
+			vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewportSmaa);
+			vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissorSmaa);
+
+			vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			m_state.currentPipeline = pipeline;
+
+			auto uniforms = smaaNeighborhoodShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+			uniforms.applySRGBEncoding = false;
+			uniforms.targetGamma = uniforms.displayGamma;
+			auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+			vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaSmaaNeighborhoodDescriptorSet, 1, &uniformOffset);
+			vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+			vkCmdEndRenderPass(m_state.currentCommandBuffer);
+			interPassBarrier();
+		}
+	}
+	else
+	{
+		// === FXAA: fxaaShader, raw game texture -> m_taaFxaa* (native res) ===
+		auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, fxaaShader);
+
+		VkRenderPassBeginInfo renderPassInfo{};
+		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		renderPassInfo.renderPass = m_taaFxaaRenderPass;
+		renderPassInfo.framebuffer = m_taaFxaaFramebuffer;
+		renderPassInfo.renderArea.offset = { 0, 0 };
+		renderPassInfo.renderArea.extent = m_taaFxaaExtent;
+		renderPassInfo.clearValueCount = 0;
+
+		VkViewport nativeViewport{};
+		nativeViewport.x = 0;
+		nativeViewport.y = 0;
+		nativeViewport.width = (float)nativeWidth;
+		nativeViewport.height = (float)nativeHeight;
+		nativeViewport.minDepth = 0.0f;
+		nativeViewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewport);
+
+		VkRect2D nativeScissor{};
+		nativeScissor.extent = m_taaFxaaExtent;
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissor);
+
+		auto rawGameTexDescSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_state.currentPipeline = pipeline;
+
+		auto uniforms = fxaaShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+		uniforms.applySRGBEncoding = false;
+		uniforms.targetGamma = uniforms.displayGamma;
+		auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &rawGameTexDescSet, 1, &uniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+		interPassBarrier();
+	}
+
+	// === pass 0: resolveShader, TAA's own spatial pre-pass output (this frame) + m_taaHistory* -> m_taaNativeResolve* (native res) ===
+	auto pass0Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, resolveShader);
+
+	VkRenderPassBeginInfo pass0RenderPassInfo{};
+	pass0RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass0RenderPassInfo.renderPass = m_taaNativeResolveRenderPass;
+	pass0RenderPassInfo.framebuffer = m_taaNativeResolveFramebuffer;
+	pass0RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass0RenderPassInfo.renderArea.extent = m_taaNativeResolveExtent;
+
+	VkViewport nativeViewport{};
+	nativeViewport.x = 0;
+	nativeViewport.y = 0;
+	nativeViewport.width = (float)nativeWidth;
+	nativeViewport.height = (float)nativeHeight;
+	nativeViewport.minDepth = 0.0f;
+	nativeViewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &nativeViewport);
+
+	VkRect2D nativeScissor{};
+	nativeScissor.extent = m_taaNativeResolveExtent;
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &nativeScissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass0RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass0Pipeline);
+	m_state.currentPipeline = pass0Pipeline;
+
+	auto pass0Uniforms = resolveShader->FillUniformBlockBuffer(*texView, { nativeWidth, nativeHeight }, padView);
+	pass0Uniforms.applySRGBEncoding = false;
+	pass0Uniforms.targetGamma = pass0Uniforms.displayGamma;
+	pass0Uniforms.taaHistoryValid = m_taaHistoryValid;
+	auto pass0UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass0Uniforms, sizeof(decltype(pass0Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaResolveDescriptorSet, 1, &pass0UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	interPassBarrier();
+
+	// === pass 1: upscaleShader, m_taaNativeResolve* (already antialiased) -> real backbuffer (no RCAS needed) ===
+	auto pass1Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, upscaleShader);
+
+	VkRenderPassBeginInfo pass1RenderPassInfo{};
+	pass1RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	pass1RenderPassInfo.renderPass = chainInfo.m_swapchainRenderPass;
+	pass1RenderPassInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+	pass1RenderPassInfo.renderArea.offset = { 0, 0 };
+	pass1RenderPassInfo.renderArea.extent = chainInfo.getExtent();
+	pass1RenderPassInfo.clearValueCount = 0;
+
+	VkViewport pass1Viewport{};
+	pass1Viewport.x = imageX;
+	pass1Viewport.y = imageY;
+	pass1Viewport.width = imageWidth;
+	pass1Viewport.height = imageHeight;
+	pass1Viewport.minDepth = 0.0f;
+	pass1Viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &pass1Viewport);
+
+	VkRect2D pass1Scissor{};
+	pass1Scissor.extent = chainInfo.getExtent();
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass1Scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass1RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+	if (clearBackground)
+	{
+		VkClearAttachment clearAttachment{};
+		clearAttachment.clearValue = {0,0,0,0};
+		clearAttachment.colorAttachment = 0;
+		clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		VkClearRect clearExtent = {{{0,0},chainInfo.m_actualExtent}, 0, 1};
+		vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+	}
+
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1Pipeline);
+	m_state.currentPipeline = pass1Pipeline;
+
+	// texView is still passed here for its metadata only (native/effective
+	// size) - actual sampling reads m_taaNativeResolveDescriptorSet below,
+	// which is exactly that same native resolution.
+	auto pass1Uniforms = upscaleShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	auto pass1UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass1Uniforms, sizeof(decltype(pass1Uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaNativeResolveDescriptorSet, 1, &pass1UniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	// restore viewport
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
+
+	// === capture: m_taaNativeResolveImage -> m_taaHistoryImage, for next frame's resolve pass ===
+	VkImageSubresourceRange colorRange{};
+	colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	colorRange.baseMipLevel = 0;
+	colorRange.levelCount = 1;
+	colorRange.baseArrayLayer = 0;
+	colorRange.layerCount = 1;
+
+	std::array<VkImageMemoryBarrier, 2> preCopyBarriers{};
+	preCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	preCopyBarriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	preCopyBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	preCopyBarriers[0].image = m_taaNativeResolveImage;
+	preCopyBarriers[0].subresourceRange = colorRange;
+	preCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	preCopyBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	preCopyBarriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	preCopyBarriers[1].image = m_taaHistoryImage;
+	preCopyBarriers[1].subresourceRange = colorRange;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, (uint32)preCopyBarriers.size(), preCopyBarriers.data());
+
+	VkImageSubresourceLayers copyLayers{};
+	copyLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copyLayers.mipLevel = 0;
+	copyLayers.baseArrayLayer = 0;
+	copyLayers.layerCount = 1;
+	VkImageCopy copyRegion{};
+	copyRegion.srcSubresource = copyLayers;
+	copyRegion.srcOffset = { 0, 0, 0 };
+	copyRegion.dstSubresource = copyLayers;
+	copyRegion.dstOffset = { 0, 0, 0 };
+	copyRegion.extent = { (uint32)nativeWidth, (uint32)nativeHeight, 1 };
+	vkCmdCopyImage(m_state.currentCommandBuffer, m_taaNativeResolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		m_taaHistoryImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+	VkImageMemoryBarrier postCopyBarrier{};
+	postCopyBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	postCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	postCopyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	postCopyBarrier.image = m_taaHistoryImage;
+	postCopyBarrier.subresourceRange = colorRange;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &postCopyBarrier);
+
+	m_taaHistoryValid = true;
+
 	chainInfo.hasDefinedSwapchainImage = true;
 	return true;
 }

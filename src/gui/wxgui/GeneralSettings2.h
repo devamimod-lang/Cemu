@@ -79,6 +79,7 @@ private:
 	wxRadioBox* m_upscale_filter, *m_downscale_filter, *m_fullscreen_scaling;
 	wxChoice* m_antialiasing_mode;
 	wxChoice* m_smaa_quality;
+	wxChoice* m_taa_spatial_aa;
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;
 	wxCheckBox *m_overlay_fps, *m_overlay_drawcalls, *m_overlay_cpu, *m_overlay_cpu_per_core,*m_overlay_ram, *m_overlay_vram, *m_overlay_debug;

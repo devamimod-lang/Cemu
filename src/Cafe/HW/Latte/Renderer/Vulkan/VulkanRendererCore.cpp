@@ -1535,7 +1535,7 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
 	}
 	// Faro TAA: push the current camera jitter - every pipeline layout declares
-	// this exact push constant range (see PipelineCompiler::CreateGraphicsPipeline),
+	// this exact push constant range (see PipelineCompiler::InitFromCurrentGPUState),
 	// so this is always valid even for shaders that don't actually use it.
 	{
 		float taaJitter[2];

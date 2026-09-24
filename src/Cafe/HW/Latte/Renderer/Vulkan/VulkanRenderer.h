@@ -341,7 +341,22 @@ public:
 
 	// Faro TAA
 	bool DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader,
-												RendererOutputShader* resolveShader, bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	// Faro: AA without FSR1 - see Renderer.h's own doc comment on these three.
+	bool DrawBackbufferQuadFxaa(LatteTextureView* texView, RendererOutputShader* upscaleShader, RendererOutputShader* fxaaShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	bool DrawBackbufferQuadSmaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+												RendererOutputShader* edgeShader, RendererOutputShader* blendShader, RendererOutputShader* neighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	bool DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
+												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
 												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
 	// (Re)creates m_taaHistory* to match the requested size/format, WITHOUT
 	// resetting m_taaHistoryValid unless the size/format actually changed (the
@@ -363,6 +378,15 @@ public:
 	// EnsureTaaHistoryTarget above, not output resolution.
 	bool EnsureTaaNativeResolveTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyTaaNativeResolveTarget();
+	// (Re)creates m_taaFxaaImage (the shared spatial pre-pass output) and,
+	// only if width/height/format actually changed, m_taaSmaaEdges*/
+	// m_taaSmaaBlend* too - see those members' own comments. Sized at
+	// native/source resolution. The SMAA-only targets are created
+	// unconditionally alongside m_taaFxaaImage (cheap, native res) so
+	// switching CemuConfig::taa_spatial_aa live never needs a resize-triggered
+	// recreation of just one half of this group.
+	bool EnsureTaaSpatialNativeTargets(VkFormat format, uint32 width, uint32 height);
+	void DestroyTaaSpatialNativeTargets();
 
 	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
 	void draw_debugPipelineHashState();
@@ -821,6 +845,57 @@ private:
 	// EnsureTaaNativeResolveTarget, same pattern as
 	// m_fsr1EasuIntermediateDescriptorSet.
 	VkDescriptorSet m_taaNativeResolveDescriptorSet = VK_NULL_HANDLE;
+
+	// Faro TAA: spatial pre-pass output, at native/source resolution - runs
+	// BEFORE the temporal resolve above, on the game's raw texture, so the
+	// resolve blends an already spatially-antialiased frame instead of raw
+	// jaggies. Shared final target for EITHER spatial technique the user
+	// picks (CemuConfig::taa_spatial_aa, see DrawBackbufferQuadFsr1Taa/
+	// DrawBackbufferQuadTaa for the actual branch): FXAA writes here directly
+	// in one pass (reads the raw game texture via the existing
+	// backbufferBlit_createDescriptorSet cache, same as
+	// DrawBackbufferQuadTwoPass's own pass 1); SMAA's 3rd pass
+	// (neighborhood blend) writes here too, using m_taaSmaaEdges*/m_taaSmaaBlend*
+	// below as its own native-res intermediates - SMAA's morphological edge
+	// search needs a minimum-width contrast pattern to detect an edge at all,
+	// so it preserves thin diagonal geometry (fences, power lines) FXAA's
+	// blur alone would soften, at 3 passes' worth of extra GPU cost instead
+	// of 1.
+	VkImage m_taaFxaaImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_taaFxaaAllocation = nullptr;
+	VkImageView m_taaFxaaView = VK_NULL_HANDLE;
+	VkSampler m_taaFxaaSampler = VK_NULL_HANDLE;
+	VkRenderPass m_taaFxaaRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_taaFxaaFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_taaFxaaExtent{};
+	VkFormat m_taaFxaaFormat = VK_FORMAT_UNDEFINED;
+
+	// Faro TAA: SMAA's own native-res intermediates when taa_spatial_aa ==
+	// kTaaSpatialSmaa (see m_taaFxaaImage's own comment) - edges from pass 1,
+	// blend weights from pass 2; pass 3 (neighborhood blend) writes into the
+	// shared m_taaFxaaImage above instead of a 3rd dedicated target.
+	// (Re)created by EnsureTaaSmaaNativeTargets alongside m_taaFxaaImage.
+	VkImage m_taaSmaaEdgesImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_taaSmaaEdgesAllocation = nullptr;
+	VkImageView m_taaSmaaEdgesView = VK_NULL_HANDLE;
+	VkSampler m_taaSmaaEdgesSampler = VK_NULL_HANDLE;
+	VkRenderPass m_taaSmaaEdgesRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_taaSmaaEdgesFramebuffer = VK_NULL_HANDLE;
+	VkImage m_taaSmaaBlendImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_taaSmaaBlendAllocation = nullptr;
+	VkImageView m_taaSmaaBlendView = VK_NULL_HANDLE;
+	VkSampler m_taaSmaaBlendSampler = VK_NULL_HANDLE;
+	VkRenderPass m_taaSmaaBlendRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_taaSmaaBlendFramebuffer = VK_NULL_HANDLE;
+	// Blend-weight-calc pass descriptor set (binding 0 = m_taaSmaaEdgesView,
+	// bindings 2/3 = the same static area/search textures
+	// m_smaaBlendCalcDescriptorSet uses).
+	VkDescriptorSet m_taaSmaaBlendCalcDescriptorSet = VK_NULL_HANDLE;
+	// Neighborhood-blend pass descriptor set (binding 2 = m_taaSmaaBlendView,
+	// binding 3 = the static search texture as unused filler) - binding 0
+	// (the raw game texture) is rewritten every draw, same reason
+	// m_taaResolveDescriptorSet's binding 0 already is.
+	VkDescriptorSet m_taaSmaaNeighborhoodDescriptorSet = VK_NULL_HANDLE;
 
 	VkCommandPool m_commandPool{ nullptr };
 

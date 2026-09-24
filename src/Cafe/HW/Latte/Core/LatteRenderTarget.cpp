@@ -692,17 +692,20 @@ void LatteRenderTarget_advanceTaaJitter()
 // the 3D scene; accepted as a known limitation of camera-only jitter.
 void LatteMRT::GetCurrentTaaJitter(float* jitter)
 {
-	if (GetConfig().antialiasing_mode != CemuConfig::kAATaa ||
-		sLatteRenderTargetState.currentGuestViewport.width <= 0 ||
-		sLatteRenderTargetState.currentGuestViewport.height <= 0)
-	{
-		jitter[0] = 0.0f;
-		jitter[1] = 0.0f;
-		return;
-	}
-	const auto& h = kTaaHalton[s_taaFrameIndex % kTaaHalton.size()];
-	jitter[0] = h.first * 2.0f / (float)sLatteRenderTargetState.currentGuestViewport.width;
-	jitter[1] = h.second * 2.0f / (float)sLatteRenderTargetState.currentGuestViewport.height;
+	// Faro TAA: jitter is disabled on purpose. The resolve pass (RendererOuputShader.cpp)
+	// blends history against the current frame at matching pixel coordinates with no
+	// reprojection (no motion vectors, no delta between this frame's and the previous
+	// frame's view/projection matrices) - real per-frame camera jitter needs that
+	// reprojection to cancel back out, otherwise every jittered frame draws geometry
+	// shifted by a different sub-pixel offset and the resolve blends those raw, which
+	// reads as constant shimmer/trembling on edges, grass, shadows and distant detail
+	// (confirmed - this is what happens if jitter is enabled here). Without reprojection,
+	// jittering the camera is strictly worse than not jittering it at all, so this always
+	// returns zero for now. The push-constant delivery mechanism (see SET_POSITION's own
+	// comment in LatteDecompilerEmitGLSLHeader.hpp) is left in place so real jitter can be
+	// re-enabled here later if/when a reprojected resolve is implemented.
+	jitter[0] = 0.0f;
+	jitter[1] = 0.0f;
 }
 
 // flag all FBO textures as updated via GPU
@@ -1079,14 +1082,67 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 					filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 			}
 		}
-		else if (aaMode == CemuConfig::kAATaa && RendererOutputShader::s_taa_resolve_shader)
+		else if (aaMode == CemuConfig::kAATaa && RendererOutputShader::s_taa_resolve_shader && RendererOutputShader::s_fxaa_shader)
 		{
+			// Faro TAA: spatial pre-pass is user-selectable (FXAA vs SMAA,
+			// CemuConfig::taa_spatial_aa) - SMAA's morphological edge search
+			// needs a minimum-width contrast pattern to find an edge at all,
+			// so it barely helps the very thin/sub-pixel aliasing common in
+			// Wii U content (foliage, hair, distant geometry); FXAA's
+			// directional blur catches more of that but is softer. Both
+			// shader sets are always passed down; DrawBackbufferQuadFsr1Taa
+			// picks which one actually runs based on the config value.
+			// TAA stays its own distinct antialiasing_mode entry.
+			sint32 smaaQuality = GetConfig().smaa_quality;
+			if (smaaQuality < 0 || smaaQuality >= RendererOutputShader::kSmaaQualityCount)
+				smaaQuality = CemuConfig::kSmaaHigh;
 			drewMultiPass = g_renderer->DrawBackbufferQuadFsr1Taa(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader,
-				RendererOutputShader::s_taa_resolve_shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+				RendererOutputShader::s_taa_resolve_shader, RendererOutputShader::s_fxaa_shader,
+				RendererOutputShader::s_smaa_edge_shader[smaaQuality], RendererOutputShader::s_smaa_blend_shader[smaaQuality], RendererOutputShader::s_smaa_neighborhood_shader,
+				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 		}
 		else
 		{
 			drewMultiPass = g_renderer->DrawBackbufferQuadFsr1(textureView, shader, RendererOutputShader::s_fsr1_rcas_shader,
+				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+		}
+	}
+	else
+	{
+		// Faro: AA without FSR1 - same 3 add-on modes as above, but using
+		// whichever single-pass filter (copy/bicubic/hermite/nearest) was
+		// actually selected as the upscale/downscale stage instead of FSR1's
+		// EASU+RCAS pair. This is what makes FXAA/SMAA/TAA available at any
+		// resolution (including when downscaling, which FSR1 never engages
+		// for) instead of only when FSR1 is the active filter.
+		const sint32 aaMode = GetConfig().antialiasing_mode;
+		if (aaMode == CemuConfig::kAAFxaa && RendererOutputShader::s_fxaa_shader)
+		{
+			drewMultiPass = g_renderer->DrawBackbufferQuadFxaa(textureView, shader, RendererOutputShader::s_fxaa_shader,
+				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+		}
+		else if (aaMode == CemuConfig::kAASmaa && RendererOutputShader::s_smaa_neighborhood_shader)
+		{
+			sint32 smaaQuality = GetConfig().smaa_quality;
+			if (smaaQuality < 0 || smaaQuality >= RendererOutputShader::kSmaaQualityCount)
+				smaaQuality = CemuConfig::kSmaaHigh;
+			RendererOutputShader* edgeShader = RendererOutputShader::s_smaa_edge_shader[smaaQuality];
+			RendererOutputShader* blendShader = RendererOutputShader::s_smaa_blend_shader[smaaQuality];
+			if (edgeShader && blendShader)
+			{
+				drewMultiPass = g_renderer->DrawBackbufferQuadSmaa(textureView, shader, edgeShader, blendShader, RendererOutputShader::s_smaa_neighborhood_shader,
+					filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+			}
+		}
+		else if (aaMode == CemuConfig::kAATaa && RendererOutputShader::s_taa_resolve_shader && RendererOutputShader::s_fxaa_shader)
+		{
+			// Faro: AA without FSR1, TAA case - see the usedFsr1 branch's
+			// own comment on the FXAA/SMAA spatial-pre-pass choice.
+			sint32 smaaQuality = GetConfig().smaa_quality;
+			if (smaaQuality < 0 || smaaQuality >= RendererOutputShader::kSmaaQualityCount)
+				smaaQuality = CemuConfig::kSmaaHigh;
+			drewMultiPass = g_renderer->DrawBackbufferQuadTaa(textureView, shader, RendererOutputShader::s_taa_resolve_shader, RendererOutputShader::s_fxaa_shader,
+				RendererOutputShader::s_smaa_edge_shader[smaaQuality], RendererOutputShader::s_smaa_blend_shader[smaaQuality], RendererOutputShader::s_smaa_neighborhood_shader,
 				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 		}
 	}

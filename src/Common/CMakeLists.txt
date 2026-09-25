@@ -75,3 +75,19 @@ target_link_libraries(CemuCommon PUBLIC
 	Boost::headers
 	fmt::fmt
 )
+
+# Faro milestone 1 (see GUI_redesign_investigacion.md): a deliberately
+# separate, minimal static lib for the Tauri/Rust FFI bridge - NOT part of
+# CemuCommon. CemuCommon's ExceptionHandler.cpp/.obj installs itself via a
+# static initializer that transitively pulls in CafeSystem/PPCInterpreter/
+# memory-subsystem symbols at link time, so anything sharing that archive
+# drags in most of Cemu's core even for a one-function bridge. This target
+# has no such baggage and no precompiled header, on purpose - it's meant to
+# stay tiny and safely linkable in isolation as more bridge functions get
+# added in later milestones.
+add_library(CemuBridge STATIC
+	CoreBridgeInfo.h
+	CoreBridgeInfo.cpp
+)
+target_include_directories(CemuBridge PUBLIC "../")
+set_property(TARGET CemuBridge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

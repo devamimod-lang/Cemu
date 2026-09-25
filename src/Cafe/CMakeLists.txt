@@ -4,6 +4,10 @@ add_library(CemuCafe
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h
+  CafeSystemBootstrap.cpp
+  CafeSystemBootstrap.h
+  TitleList/TitleListBridge.cpp
+  TitleList/TitleListBridge.h
   Filesystem/fsc.cpp
   Filesystem/fscDeviceHostFS.cpp
   Filesystem/fscDeviceHostFS.h

@@ -54,3 +54,15 @@ bin/graphicPacks/*
 
 # Ignore Finder view option files created by OS X
 .DS_Store
+
+# Tauri frontend (web/) + Rust bridge (src-tauri/)
+# NOTE: build output goes to web-dist/, NOT dist/ - dist/ already holds
+# tracked Linux/Windows packaging assets (see dist/windows/Cemu.manifest
+# etc.), which `vite build`'s default empty-outDir-then-write behavior would
+# otherwise silently wipe.
+node_modules/
+web-dist/
+dist-ssr/
+*.local
+src-tauri/target/
+src-tauri/gen/

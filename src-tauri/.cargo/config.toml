@@ -1,9 +1,0 @@
-# Faro: Cemu's own C++ build uses vcpkg's x64-windows-static triplet (static
-# CRT, /MT) for every dependency - CemuCommon.lib (linked from build.rs) is
-# compiled that way too. Rust's default on this target links the CRT
-# dynamically (/MD), which conflicts with /MT objects at link time (LNK2038
-# RuntimeLibrary mismatch). Match the C++ side instead of changing it - this
-# also means the final Tauri binary doesn't depend on vcruntime/msvcp DLLs at
-# runtime, which helps the single-executable requirement too.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]

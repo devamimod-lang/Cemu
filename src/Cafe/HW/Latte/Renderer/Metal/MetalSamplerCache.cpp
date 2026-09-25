@@ -2,6 +2,7 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
+#include "config/CemuConfig.h"
 
 MTL::SamplerBorderColor GetBorderColor(LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords, bool logWorkaround = false)
 {
@@ -149,6 +150,16 @@ MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister
     samplerDescriptor->setRAddressMode(GetMtlSamplerAddressMode(clampZ));
 
     auto maxAniso = samplerWords->WORD0.get_MAX_ANISO_RATIO();
+
+    // Faro: this sampler cache is keyed purely by register state (shared
+    // across any texture using the same sampler words, see GetSamplerState's
+    // signature - no LatteTexture/overwriteInfo here), so unlike Vulkan/OpenGL
+    // there's no per-texture graphic pack override to defer to - just apply
+    // the global one directly when the game didn't already ask for aniso.
+    if (maxAniso == 0 && GetConfig().force_anisotropic_level > 0 &&
+        filterMin != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::POINT && filterMin != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::ANISO_POINT &&
+        filterMag != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::POINT && filterMag != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::ANISO_POINT)
+        maxAniso = GetConfig().force_anisotropic_level;
 
     if (maxAniso > 0)
         samplerDescriptor->setMaxAnisotropy(1 << maxAniso);

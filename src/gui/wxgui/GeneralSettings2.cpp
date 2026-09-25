@@ -548,6 +548,35 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 	}
 
 	{
+		// Faro: overrides whatever anisotropic level the game's own sampler
+		// requested (see CemuConfig::ForceAnisotropicLevel's own comment).
+		// A graphic pack's own per-texture override still always wins over
+		// this - it's a fallback for games that just never asked for any.
+		// Own titled box (same pattern as Upscale/Downscale filter above) so
+		// it's clear at a glance what this control is, as opposed to the
+		// untitled AA dropdowns further up.
+		wxString aniso_choices[] = { _("Off"), _("2x"), _("4x"), _("8x"), _("16x") };
+		m_force_anisotropic_level = new wxRadioBox(graphics_panel, wxID_ANY, _("Force Anisotropic Filtering"), wxDefaultPosition, wxDefaultSize, std::size(aniso_choices), aniso_choices, 5, wxRA_SPECIFY_COLS);
+		m_force_anisotropic_level->SetToolTip(_("Forces anisotropic filtering for textures the game didn't request it for. Sharpens ground/terrain and other textures seen at a shallow angle; has no effect on textures viewed head-on, and is skipped for textures using point/nearest filtering on purpose."));
+		m_force_anisotropic_level->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
+			GetConfig().force_anisotropic_level = event.GetSelection();
+		});
+		graphics_panel_sizer->Add(m_force_anisotropic_level, 0, wxALL | wxEXPAND, 5);
+
+		// Faro: wider PCF kernel for shadow map samples (see
+		// CemuConfig::ShadowPcfQuality's own comment). Structural - applies to
+		// any shader sampling a depth-compare texture, not tied to a specific
+		// game. Own titled box, same reasoning as above.
+		wxString shadow_pcf_choices[] = { _("Native"), _("3x3"), _("5x5") };
+		m_shadow_pcf_quality = new wxRadioBox(graphics_panel, wxID_ANY, _("Shadow Filtering (PCF)"), wxDefaultPosition, wxDefaultSize, std::size(shadow_pcf_choices), shadow_pcf_choices, 3, wxRA_SPECIFY_COLS);
+		m_shadow_pcf_quality->SetToolTip(_("Widens the shadow map filtering kernel for softer shadow edges. Native is whatever the game's own hardware PCF does (usually a single 2x2 tap); 3x3/5x5 sample more taps around each shadow lookup."));
+		m_shadow_pcf_quality->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
+			GetConfig().shadow_pcf_quality = event.GetSelection();
+		});
+		graphics_panel_sizer->Add(m_shadow_pcf_quality, 0, wxALL | wxEXPAND, 5);
+	}
+
+	{
 		wxString choices[] = { _("Keep aspect ratio"), _("Stretch") };
 		m_fullscreen_scaling = new wxRadioBox(graphics_panel, wxID_ANY, _("Fullscreen scaling"), wxDefaultPosition, wxDefaultSize, std::size(choices), choices, 5, wxRA_SPECIFY_COLS);
 		m_fullscreen_scaling->SetToolTip(_("Controls the output aspect ratio when it doesn't match the ratio of the game"));
@@ -2018,6 +2047,19 @@ void GeneralSettings2::ApplyConfig()
 		m_taa_spatial_aa->Enable(aa == CemuConfig::kAATaa);
 	}
 	m_downscale_filter->SetSelection(config.downscale_filter);
+
+	{
+		sint32 forceAniso = config.force_anisotropic_level;
+		if (forceAniso < CemuConfig::kForceAnisoOff || forceAniso > CemuConfig::kForceAniso16x)
+			forceAniso = CemuConfig::kForceAnisoOff;
+		m_force_anisotropic_level->SetSelection(forceAniso);
+
+		sint32 shadowPcf = config.shadow_pcf_quality;
+		if (shadowPcf < CemuConfig::kShadowPcfNative || shadowPcf > CemuConfig::kShadowPcf5x5)
+			shadowPcf = CemuConfig::kShadowPcfNative;
+		m_shadow_pcf_quality->SetSelection(shadowPcf);
+	}
+
 	m_fullscreen_scaling->SetSelection(config.fullscreen_scaling);
 
 	wxASSERT((uint32)config.overlay.position < m_overlay_position->GetCount());

@@ -819,6 +819,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 
 			if (baseTexture->overwriteInfo.anisotropicLevel >= 0)
 				maxAniso = baseTexture->overwriteInfo.anisotropicLevel;
+			else if (GetConfig().force_anisotropic_level > 0 && samplerInfo.minFilter != VK_FILTER_NEAREST && samplerInfo.magFilter != VK_FILTER_NEAREST)
+				maxAniso = GetConfig().force_anisotropic_level;
 
 			if (maxAniso > 0)
 			{

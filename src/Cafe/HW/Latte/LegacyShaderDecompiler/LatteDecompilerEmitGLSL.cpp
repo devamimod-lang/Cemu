@@ -2389,8 +2389,13 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 	else if (texOpcode == GPU7_TEX_INST_SAMPLE_C_L)
 	{
 		// sample with LOD value set in gpr.w (replaces computed LOD value)
+		// Faro: wider shadow PCF (see _emitShadowPcfHelpers) only replaces
+		// the plain non-offset 2D case - offset shadow lookups keep using
+		// the builtin directly, no pcfTextureLodOffset2DShadow variant exists.
 		if (hasOffset)
 			src->add("textureLodOffset(");
+		else if (GetConfig().shadow_pcf_quality > 0 && texDim == Latte::E_DIM::DIM_2D)
+			src->add("pcfTextureLod2DShadow(");
 		else
 			src->add("textureLod(");
 	}
@@ -2399,13 +2404,18 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 		// sample with LOD set to 0.0 (replaces computed LOD value)
 		if (hasOffset)
 			src->add("textureLodOffset(");
+		else if (GetConfig().shadow_pcf_quality > 0 && texDim == Latte::E_DIM::DIM_2D)
+			src->add("pcfTextureLod2DShadow(");
 		else
 			src->add("textureLod(");
 	}
 	else if (texOpcode == GPU7_TEX_INST_SAMPLE_C)
 	{
+		// Faro: wider shadow PCF, see the _C_L case's own comment above.
 		if (hasOffset)
 			src->add("textureOffset(");
+		else if (GetConfig().shadow_pcf_quality > 0 && texDim == Latte::E_DIM::DIM_2D)
+			src->add("pcfTexture2DShadow(");
 		else
 			src->add("texture(");
 	}

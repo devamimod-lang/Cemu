@@ -153,6 +153,8 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 		antialiasing_mode = kAANone;
 	smaa_quality = graphic.get("SmaaQuality", kSmaaHigh);
 	taa_spatial_aa = graphic.get("TaaSpatialAA", kTaaSpatialFxaa);
+	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
+	shadow_pcf_quality = graphic.get("ShadowPcfQuality", kShadowPcfNative);
 	async_compile = graphic.get("AsyncCompile", async_compile);
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
 #ifdef ENABLE_METAL
@@ -390,6 +392,8 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("AntialiasingMode", antialiasing_mode);
 	graphic.set("SmaaQuality", smaa_quality);
 	graphic.set("TaaSpatialAA", taa_spatial_aa);
+	graphic.set("ForceAnisotropicLevel", force_anisotropic_level);
+	graphic.set("ShadowPcfQuality", shadow_pcf_quality);
 	graphic.set("AsyncCompile", async_compile.GetValue());
 	graphic.set("vkAccurateBarriers", vk_accurate_barriers);
 

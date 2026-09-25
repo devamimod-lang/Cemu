@@ -296,6 +296,58 @@ namespace LatteDecompiler
 		}
 	}
 
+	// Faro: wider PCF (percentage-closer filtering) kernel for shadow map
+	// samples - see CemuConfig::ShadowPcfQuality's own comment and
+	// TEXTURE_SHADOW_FILTERS_investigacion.md. Emits a drop-in replacement for
+	// texture()/textureLod() on sampler2DShadow that averages a small grid of
+	// taps instead of the single hardware-PCF tap the game itself gets -
+	// used by _emitTEXSampleTextureCode's GPU7_TEX_INST_SAMPLE_C* codegen.
+	// Scoped to DIM_2D only (the overwhelming majority of real shadow map
+	// usage on Wii U) - array/cube depth-compare textures keep using the
+	// plain builtin, unaffected by this setting. Only emitted for shaders
+	// that actually sample a 2D shadow map, and only when the quality option
+	// is above "native", so it's a no-op source-size cost otherwise.
+	void _emitShadowPcfHelpers(LatteDecompilerShaderContext* decompilerContext)
+	{
+		sint32 pcfQuality = GetConfig().shadow_pcf_quality;
+		if (pcfQuality <= CemuConfig::kShadowPcfNative)
+			return;
+		bool hasShadow2D = false;
+		for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
+		{
+			if (decompilerContext->output->textureUnitMask[i] &&
+				decompilerContext->shader->textureUsesDepthCompare[i] &&
+				decompilerContext->shader->textureUnitDim[i] == Latte::E_DIM::DIM_2D)
+			{
+				hasShadow2D = true;
+				break;
+			}
+		}
+		if (!hasShadow2D)
+			return;
+		auto src = decompilerContext->shaderSource;
+		sint32 kernelRadius = (pcfQuality == CemuConfig::kShadowPcf5x5) ? 2 : 1;
+		sint32 tapCount = (kernelRadius * 2 + 1) * (kernelRadius * 2 + 1);
+		src->addFmt(
+			"float pcfTexture2DShadow(sampler2DShadow s, vec3 P) {{" _CRLF
+			"	vec2 pcfTexel = 1.0 / vec2(textureSize(s, 0));" _CRLF
+			"	float pcfSum = 0.0;" _CRLF
+			"	for (int pcfY = -{0}; pcfY <= {0}; pcfY++)" _CRLF
+			"	for (int pcfX = -{0}; pcfX <= {0}; pcfX++)" _CRLF
+			"		pcfSum += texture(s, vec3(P.xy + vec2(pcfX, pcfY) * pcfTexel, P.z));" _CRLF
+			"	return pcfSum / {1}.0;" _CRLF
+			"}}" _CRLF
+			"float pcfTextureLod2DShadow(sampler2DShadow s, vec3 P, float lod) {{" _CRLF
+			"	vec2 pcfTexel = 1.0 / vec2(textureSize(s, int(lod)));" _CRLF
+			"	float pcfSum = 0.0;" _CRLF
+			"	for (int pcfY = -{0}; pcfY <= {0}; pcfY++)" _CRLF
+			"	for (int pcfX = -{0}; pcfX <= {0}; pcfX++)" _CRLF
+			"		pcfSum += textureLod(s, vec3(P.xy + vec2(pcfX, pcfY) * pcfTexel, P.z), lod);" _CRLF
+			"	return pcfSum / {1}.0;" _CRLF
+			"}}" _CRLF,
+			kernelRadius, tapCount);
+	}
+
 	void _emitAttributes(LatteDecompilerShaderContext* decompilerContext)
 	{
 		auto shaderSrc = decompilerContext->shaderSource;
@@ -649,6 +701,11 @@ namespace LatteDecompiler
 		_emitUniformBuffers(decompilerContext);
 		// textures
 		_emitTextureDefinitions(decompilerContext);
+		// Faro: shadow PCF helper functions (see their own comment) - must
+		// come after the sampler declarations above so the helpers' sampler
+		// parameters are well-formed GLSL, even though sampler uniforms
+		// don't strictly require forward declaration.
+		_emitShadowPcfHelpers(decompilerContext);
 		// attributes
 		_emitAttributes(decompilerContext);
 		// misc stuff

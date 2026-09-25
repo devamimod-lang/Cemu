@@ -1403,6 +1403,10 @@ void OpenGLRenderer::renderstate_updateTextureSettingsGL(LatteDecompilerShader* 
 
 		if (baseTexture->overwriteInfo.anisotropicLevel >= 0)
 			maxAniso = baseTexture->overwriteInfo.anisotropicLevel;
+		else if (GetConfig().force_anisotropic_level > 0 &&
+			filterMin != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::POINT && filterMin != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::ANISO_POINT &&
+			filterMag != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::POINT && filterMag != Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_XY_FILTER::ANISO_POINT)
+			maxAniso = GetConfig().force_anisotropic_level;
 
 		if (samplerState->maxAniso != maxAniso)
 		{

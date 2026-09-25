@@ -302,6 +302,11 @@ uint32 LatteShaderCache_getShaderCacheExtraVersion(uint64 titleId)
 	// encode the titleId in the version to prevent users from swapping caches between titles
 	const uint32 cacheFileVersion = 1;
 	uint32 extraVersion = ((uint32)(titleId >> 32) + ((uint32)titleId) * 3) + cacheFileVersion + 0xe97af1ad;
+	// Faro: shadow_pcf_quality changes what LatteDecompilerEmitGLSL.cpp emits
+	// for depth-compare texture fetches (see its GPU7_TEX_INST_SAMPLE_C*
+	// codegen) - fold it into the cache key so toggling the setting doesn't
+	// silently keep serving shaders compiled under the old one.
+	extraVersion += (uint32)GetConfig().shadow_pcf_quality.GetValue() * 0x9e3779b1u;
 	return extraVersion;
 }
 

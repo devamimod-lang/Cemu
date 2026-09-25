@@ -543,6 +543,41 @@ struct CemuConfig
 	};
 	ConfigValue<sint32> taa_spatial_aa{kTaaSpatialFxaa};
 
+	// Faro: force anisotropic filtering globally, overriding whatever level the
+	// game's own sampler requested. Only applied when a graphic pack hasn't
+	// already set its own per-texture override (LatteTexture.h's
+	// overwriteInfo.anisotropicLevel always wins over this - see
+	// VulkanRendererCore.cpp/OpenGLRendererCore.cpp's sampler creation).
+	// Encoded the same way as anisotropicLevel: N means 1<<N (1=2x, 2=4x,
+	// 3=8x, 4=16x). Skipped on samplers using NEAREST min/mag filtering
+	// (pixel-art textures rendered with point filtering on purpose) - forcing
+	// anisotropy there looks wrong, not better (same lesson Dolphin learned
+	// the hard way, see dolphin-emu@83d3055).
+	enum ForceAnisotropicLevel
+	{
+		kForceAnisoOff = 0,
+		kForceAniso2x = 1,
+		kForceAniso4x = 2,
+		kForceAniso8x = 3,
+		kForceAniso16x = 4,
+	};
+	ConfigValue<sint32> force_anisotropic_level{kForceAnisoOff};
+
+	// Faro: wider PCF (percentage-closer filtering) kernel for shadow map
+	// samples - see LatteDecompilerEmitGLSL.cpp's GPU7_TEX_INST_SAMPLE_C*
+	// codegen and TEXTURE_SHADOW_FILTERS_investigacion.md. 0 = native (the
+	// single hardware-PCF tap the game itself gets), 1 = 3x3 tap grid,
+	// 2 = 5x5. This is structural, not per-game - it applies to any shader
+	// that samples a depth-compare (shadow) texture, since Latte's
+	// decompiler already tracks that per texture unit for every shader.
+	enum ShadowPcfQuality
+	{
+		kShadowPcfNative = 0,
+		kShadowPcf3x3 = 1,
+		kShadowPcf5x5 = 2,
+	};
+	ConfigValue<sint32> shadow_pcf_quality{kShadowPcfNative};
+
 	// audio
 	sint32 audio_api = 0;
 	sint32 audio_delay = 2;

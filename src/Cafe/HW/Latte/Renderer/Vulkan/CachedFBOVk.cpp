@@ -1,6 +1,8 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/CachedFBOVk.h"
+#include "config/CemuConfig.h"
+
 
 void CachedFBOVk::CreateRenderPass()
 {
@@ -56,7 +58,9 @@ VKRObjectTextureView* CachedFBOVk::GetColorBufferImageView(uint32 index)
 	auto& cb = colorBuffer[index];
 	auto textureViewVk = (LatteTextureViewVk*)cb.texture;
 	if (!textureViewVk)
+	{
 		return nullptr;
+	}
 	auto viewDim = textureViewVk->dim;
 	if (viewDim == Latte::E_DIM::DIM_3D)
 		viewDim = Latte::E_DIM::DIM_2D; // bind 3D texture slices as 2D images
@@ -125,11 +129,8 @@ void CachedFBOVk::InitDynamicRenderingData()
 			m_vkColorAttachments[i].imageView = VK_NULL_HANDLE;
 			continue;
 		}
-		else
-		{
-			m_vkColorAttachments[i].imageLayout = static_cast<LatteTextureVk*>(buffer.texture->baseTexture)->GetDefaultLayout();
-			m_vkColorAttachments[i].imageView = cbView->m_textureImageView;
-		}
+		m_vkColorAttachments[i].imageLayout = static_cast<LatteTextureVk*>(buffer.texture->baseTexture)->GetDefaultLayout();
+		m_vkColorAttachments[i].imageView = cbView->m_textureImageView;
 	}
 
 	m_vkRenderingInfo.pColorAttachments = m_vkColorAttachments;

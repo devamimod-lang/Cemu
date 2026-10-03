@@ -27,6 +27,7 @@ void wxCemuConfig::Load(XMLConfigParser& parser)
 {
 	language = parser.get<sint32>("language", wxLANGUAGE_DEFAULT);
 	msw_theme = parser.get<sint32>("msw_theme", msw_theme);
+	msw_backdrop = parser.get<sint32>("msw_backdrop", msw_backdrop);
 	use_discord_presence = parser.get("use_discord_presence", true);
 	fullscreen_menubar = parser.get("fullscreen_menubar", false);
 	feral_gamemode = parser.get("feral_gamemode", false);
@@ -126,6 +127,7 @@ void wxCemuConfig::Save(XMLConfigParser& config)
 	// general settings
 	config.set<sint32>("language", language);
 	config.set<sint32>("msw_theme", msw_theme);
+	config.set<sint32>("msw_backdrop", msw_backdrop);
 	config.set<bool>("use_discord_presence", use_discord_presence);
 	config.set<bool>("fullscreen_menubar", fullscreen_menubar);
 	config.set<bool>("feral_gamemode", feral_gamemode);

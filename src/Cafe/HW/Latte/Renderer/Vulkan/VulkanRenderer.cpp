@@ -868,6 +868,9 @@ VulkanRenderer::~VulkanRenderer()
 
 	DestroySmaaIntermediateTargets();
 	DestroySmaaStaticTextures();
+	DestroyGtaoTargets();
+	DestroyGiTargets();
+	DestroySsrTargets();
 	DestroyFxaaIntermediateTarget();
 	DestroyFsr1EasuIntermediateTarget();
 	DestroyTaaHistoryTarget();
@@ -3905,20 +3908,33 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererO
 	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		0, 1, &interPassBarrier, 0, nullptr, 0, nullptr);
 
-	// === pass 2: rcasShader, m_fsr1EasuIntermediate -> real backbuffer ===
+	// === Faro GTAO pre-check (optional): redirect RCAS -> m_fxaaIntermediate
+	// so the GTAO pass below has an input. Skipped entirely (zero behavior
+	// change) unless master+SSAO toggles are on and scene depth was
+	// captured. The full check (incl. shader availability) re-runs inside
+	// RunFaroGtaoPass; this is just the cheap probe to pick the target.
+	sint32 gtaoQualityProbe = GetConfig().faro_ssao_quality;
+	if (gtaoQualityProbe < 0 || gtaoQualityProbe > 2)
+		gtaoQualityProbe = 1;
+	bool wantGtao = GetConfig().faro_postfx_enabled && GetConfig().faro_ssao_enabled &&
+		HasCapturedDepth() && RendererOutputShader::s_gtao_shader[gtaoQualityProbe] != nullptr;
+	if (wantGtao && !EnsureFxaaIntermediateTarget(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
+		wantGtao = false;
+
+	// === pass 2: rcasShader, m_fsr1EasuIntermediate -> (wantGtao ? m_fxaaIntermediate : real backbuffer) ===
 	auto pass2Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, rcasShader);
 
 	VkRenderPassBeginInfo pass2RenderPassInfo = {};
 	pass2RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	pass2RenderPassInfo.renderPass = chainInfo.m_swapchainRenderPass;
-	pass2RenderPassInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+	pass2RenderPassInfo.renderPass = wantGtao ? m_fxaaIntermediateRenderPass : chainInfo.m_swapchainRenderPass;
+	pass2RenderPassInfo.framebuffer = wantGtao ? m_fxaaIntermediateFramebuffer : chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
 	pass2RenderPassInfo.renderArea.offset = { 0, 0 };
-	pass2RenderPassInfo.renderArea.extent = chainInfo.getExtent();
+	pass2RenderPassInfo.renderArea.extent = wantGtao ? m_fxaaIntermediateExtent : chainInfo.getExtent();
 	pass2RenderPassInfo.clearValueCount = 0;
 
 	VkViewport pass2Viewport{};
-	pass2Viewport.x = imageX;
-	pass2Viewport.y = imageY;
+	pass2Viewport.x = wantGtao ? 0.0f : imageX;
+	pass2Viewport.y = wantGtao ? 0.0f : imageY;
 	pass2Viewport.width = imageWidth;
 	pass2Viewport.height = imageHeight;
 	pass2Viewport.minDepth = 0.0f;
@@ -3926,12 +3942,12 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererO
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &pass2Viewport);
 
 	VkRect2D pass2Scissor{};
-	pass2Scissor.extent = chainInfo.getExtent();
+	pass2Scissor.extent = wantGtao ? m_fxaaIntermediateExtent : chainInfo.getExtent();
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass2Scissor);
 
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass2RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-	if (clearBackground)
+	if (clearBackground && !wantGtao)
 	{
 		VkClearAttachment clearAttachment{};
 		clearAttachment.clearValue = {0,0,0,0};
@@ -3944,9 +3960,16 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererO
 	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2Pipeline);
 	m_state.currentPipeline = pass2Pipeline;
 
-	// real gamma/SRGB correction only on this, the final pass - see pass 1's
-	// comment above.
+	// real gamma/SRGB correction only on the final pass - when GTAO runs,
+	// this pass writes an intermediate (neutralized like every other
+	// intermediate pass), and the GTAO final copy below applies the real
+	// correction instead. See pass 1's comment above.
 	auto pass2Uniforms = rcasShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	if (wantGtao)
+	{
+		pass2Uniforms.applySRGBEncoding = false;
+		pass2Uniforms.targetGamma = pass2Uniforms.displayGamma;
+	}
 	auto pass2UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass2Uniforms, sizeof(decltype(pass2Uniforms)) });
 
 	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fsr1EasuIntermediateDescriptorSet,
@@ -3956,12 +3979,1040 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1(LatteTextureView* texView, RendererO
 
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 
+	if (wantGtao)
+	{
+		// === Faro GTAO pass: m_fxaaIntermediate + depth -> m_fsr1EasuIntermediate ===
+		// On RunFaroGtaoPass failure the RCAS output above is still fresh in
+		// m_fxaaIntermediate, so the final copy just reads from there instead.
+		VkDescriptorSet gtaoFinalSet = m_fsr1EasuIntermediateDescriptorSet;
+		if (!RunFaroGtaoPass(texView, imageWidth, imageHeight, padView, m_fxaaIntermediateView, m_fxaaIntermediateSampler, m_fsr1EasuIntermediateRenderPass, m_fsr1EasuIntermediateFramebuffer, m_fsr1EasuIntermediateExtent))
+			gtaoFinalSet = m_fxaaIntermediateDescriptorSet;
+
+		// === Faro GTAO final copy: gtaoFinalSet -> real backbuffer (real gamma) ===
+		auto gtaoFinalPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, RendererOutputShader::s_copy_shader);
+
+		VkRenderPassBeginInfo gtaoFinalRPInfo{};
+		gtaoFinalRPInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		gtaoFinalRPInfo.renderPass = chainInfo.m_swapchainRenderPass;
+		gtaoFinalRPInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+		gtaoFinalRPInfo.renderArea.offset = { 0, 0 };
+		gtaoFinalRPInfo.renderArea.extent = chainInfo.getExtent();
+		gtaoFinalRPInfo.clearValueCount = 0;
+
+		VkViewport gtaoFinalViewport{};
+		gtaoFinalViewport.x = imageX;
+		gtaoFinalViewport.y = imageY;
+		gtaoFinalViewport.width = imageWidth;
+		gtaoFinalViewport.height = imageHeight;
+		gtaoFinalViewport.minDepth = 0.0f;
+		gtaoFinalViewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &gtaoFinalViewport);
+
+		VkRect2D gtaoFinalScissor{};
+		gtaoFinalScissor.extent = chainInfo.getExtent();
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &gtaoFinalScissor);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &gtaoFinalRPInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+		if (clearBackground)
+		{
+			VkClearAttachment clearAttachment{};
+			clearAttachment.clearValue = {0,0,0,0};
+			clearAttachment.colorAttachment = 0;
+			clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			VkClearRect clearExtent = {{{0,0},chainInfo.m_actualExtent}, 0, 1};
+			vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+		}
+
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gtaoFinalPipeline);
+		m_state.currentPipeline = gtaoFinalPipeline;
+
+		auto gtaoFinalUniforms = RendererOutputShader::s_copy_shader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+		auto gtaoFinalUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&gtaoFinalUniforms, sizeof(decltype(gtaoFinalUniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &gtaoFinalSet,
+			1, &gtaoFinalUniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	}
+
 	// restore viewport
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
 
 	// mark current swapchain image as well defined
 	chainInfo.hasDefinedSwapchainImage = true;
 	return true;
+}
+
+// Faro GTAO (Phase 1): horizon-based AO between RCAS and the AA stage.
+// Reads m_fxaaIntermediateView (post-RCAS color) + captured scene depth,
+// writes AO-multiplied color to m_fsr1EasuIntermediate for the downstream AA
+// pass to consume instead (caller swaps which intermediate descriptor set it
+// binds). Returns false (caller proceeds without AO) when disabled,
+// depth-invalid, or on any resource failure.
+bool VulkanRenderer::RunFaroGtaoPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+	VkImageView colorInputView, VkSampler colorInputSampler,
+	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent)
+{
+	if (!GetConfig().faro_postfx_enabled || !GetConfig().faro_ssao_enabled)
+		return false;
+	if (!HasCapturedDepth())
+		return false;
+	LatteTextureView* depthView = GetCapturedDepthView();
+	if (!depthView || !depthView->baseTexture)
+		return false;
+	// This texture is sampled through m_gtaoDescriptorSet's binding 2, a
+	// static/reused descriptor set rewritten every call - unlike Cemu-owned
+	// intermediates, this is a real GAME texture subject to normal texture-
+	// cache eviction. Without this, the depth view can be destroyed by the
+	// texture GC as soon as the game stops using it (e.g. a menu transition
+	// that briefly binds no/a different depth surface) while a command
+	// buffer from an earlier frame that still referenced the old view
+	// through this descriptor set hasn't finished executing yet - confirmed
+	// via Vulkan validation: "vkDestroyImageView(): can't be called on
+	// VkImageView ... currently in use by VkDescriptorSet ... which is in
+	// use by VkCommandBuffer ..." immediately followed by a device-lost
+	// crash. Same mechanism LatteRenderTarget_copyToBackbuffer already uses
+	// for the color texture it copies every frame.
+	LatteTC_MarkTextureStillInUse(depthView->baseTexture);
+
+	sint32 quality = GetConfig().faro_ssao_quality;
+	if (quality < 0 || quality > 2)
+		quality = 1;
+	RendererOutputShader* gtaoShader = RendererOutputShader::s_gtao_shader[quality];
+	if (!gtaoShader)
+		return false;
+
+	auto* depthViewVk = static_cast<LatteTextureViewVk*>(depthView);
+	auto* depthTexVk = static_cast<LatteTextureVk*>(depthView->baseTexture);
+	VKRObjectTextureView* sampledDepthView = depthViewVk->GetViewRGBA();
+	if (!sampledDepthView || sampledDepthView->m_textureImageView == VK_NULL_HANDLE)
+		return false;
+
+	// Lazily create the depth sampler once (linear + clamp, depth sampled raw).
+	if (m_gtaoDepthSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_gtaoDepthSampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro GTAO: failed to create depth sampler");
+			return false;
+		}
+	}
+
+	// Lazily allocate the descriptor set once (binding 1 = standard dynamic
+	// UBO, written here; bindings 0/2 rewritten every run below since the
+	// color target is fixed per resize but the depth view changes whenever
+	// the game binds a different depth surface).
+	if (m_gtaoDescriptorSet == VK_NULL_HANDLE)
+	{
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = m_descriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &m_gtaoDescriptorSet) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro GTAO: failed to allocate descriptor set");
+			return false;
+		}
+		performanceMonitor.vk.numDescriptorSets.increment();
+
+		VkDescriptorBufferInfo uniformBufferInfo{};
+		uniformBufferInfo.buffer = m_uniformVarBuffer;
+		uniformBufferInfo.offset = 0;
+		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+		VkWriteDescriptorSet uboWrite{};
+		uboWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		uboWrite.dstSet = m_gtaoDescriptorSet;
+		uboWrite.dstBinding = 1;
+		uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		uboWrite.descriptorCount = 1;
+		uboWrite.pBufferInfo = &uniformBufferInfo;
+		vkUpdateDescriptorSets(m_logicalDevice, 1, &uboWrite, 0, nullptr);
+	}
+
+	VkDescriptorImageInfo colorInfo{};
+	colorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	colorInfo.imageView = colorInputView;
+	colorInfo.sampler = colorInputSampler;
+	VkDescriptorImageInfo depthInfo{};
+	depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	depthInfo.imageView = sampledDepthView->m_textureImageView;
+	depthInfo.sampler = m_gtaoDepthSampler;
+	VkWriteDescriptorSet writes[2]{};
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = m_gtaoDescriptorSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[0].descriptorCount = 1;
+	writes[0].pImageInfo = &colorInfo;
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = m_gtaoDescriptorSet;
+	writes[1].dstBinding = 2;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].descriptorCount = 1;
+	writes[1].pImageInfo = &depthInfo;
+	vkUpdateDescriptorSets(m_logicalDevice, std::size(writes), writes, 0, nullptr);
+
+	// Transition the depth image for sampling (IMAGE_WRITE covers depth
+	// attachment writes, including prior 3D draws), back to its default
+	// layout afterwards so later 3D rendering is unaffected.
+	for (sint32 mip = 0; mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_WRITE, IMAGE_READ>(depthTexVk, depthLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
+	auto gtaoPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, gtaoShader);
+
+	// Self-contained visibility: the pass writing colorInputView may not
+	// have a trailing barrier at every call site (only some dispatch
+	// functions use interPassBarrier), so establish it here.
+	VkMemoryBarrier gtaoInputBarrier{};
+	gtaoInputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	gtaoInputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	gtaoInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 1, &gtaoInputBarrier, 0, nullptr, 0, nullptr);
+
+	VkRenderPassBeginInfo rpInfo{};
+	rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpInfo.renderPass = outputRenderPass;
+	rpInfo.framebuffer = outputFramebuffer;
+	rpInfo.renderArea.offset = { 0, 0 };
+	rpInfo.renderArea.extent = outputExtent;
+	rpInfo.clearValueCount = 0;
+
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)passWidth;
+	viewport.height = (float)passHeight;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+
+	VkRect2D scissor{};
+	scissor.extent = outputExtent;
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gtaoPipeline);
+	m_state.currentPipeline = gtaoPipeline;
+
+	auto gtaoUniforms = gtaoShader->FillUniformBlockBuffer(*texView, { passWidth, passHeight }, padView);
+	gtaoUniforms.applySRGBEncoding = false;
+	gtaoUniforms.targetGamma = gtaoUniforms.displayGamma;
+	// faroGtaoParams.y is now a dimensionless RELATIVE depth-difference
+	// threshold (fraction of the center pixel's own linearized depth), not
+	// an absolute view-space radius - see GtaoLinearize's own comment and
+	// the shader body's doc comment for why: with no real camera far plane
+	// to calibrate against, an absolute-unit threshold was orders of
+	// magnitude off (confirmed via a raw-depth debug visualization showing
+	// real per-pixel scene depth, ruling out broken sampling, combined with
+	// occ staying ~0 despite genuine depth variation) - real near-field
+	// depth deltas in GtaoLinearize's own output units are tiny compared to
+	// any plausible absolute constant. A relative threshold is scale-
+	// invariant to the arbitrary far-plane assumption entirely.
+	// faroGtaoParams.z is now a fixed screen-space march radius in pixels
+	// (previously computed via a pseudo-view-space reconstruction that
+	// depended on the same uncalibrated far plane - removed for the same
+	// reason).
+	// Lowered from 0.05/0.08/0.12 - confirmed visible up close (inventory
+	// menu's close-up character view) but barely visible at typical
+	// third-person gameplay camera distance, where viewZ (and so relScale =
+	// viewZ*relThreshold) is proportionally larger, making the same
+	// world-space crease read as a smaller fraction of the local depth.
+	// Lower threshold = more sensitive (a smaller relative depth dip now
+	// saturates occlusion), trading some risk of over-sensitivity up close
+	// for actually showing up in normal gameplay framing.
+	static const float kGtaoRelThresholdByQuality[3] = { 0.025f, 0.04f, 0.06f };
+	static const float kGtaoMarchPxByQuality[3] = { 32.0f, 40.0f, 56.0f };
+	gtaoUniforms.faroGtaoParams[0] = (float)GetConfig().faro_ssao_intensity / 100.0f;
+	gtaoUniforms.faroGtaoParams[1] = kGtaoRelThresholdByQuality[quality];
+	gtaoUniforms.faroGtaoParams[2] = kGtaoMarchPxByQuality[quality];
+	gtaoUniforms.faroGtaoParams[3] = 1000.0f;
+	auto gtaoUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&gtaoUniforms, sizeof(decltype(gtaoUniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_gtaoDescriptorSet, 1, &gtaoUniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	VkMemoryBarrier interPassBarrier{};
+	interPassBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	interPassBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	interPassBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 1, &interPassBarrier, 0, nullptr, 0, nullptr);
+
+	for (sint32 mip = 0; mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_READ, IMAGE_WRITE>(depthTexVk, depthLayers, depthTexVk->GetDefaultLayout());
+	}
+	return true;
+}
+
+// Faro GI: DISABLED - see this function's own declaration comment in
+// VulkanRenderer.h for why (hang/crash implicated under a downscaling+TAA
+// combo). Kept as a safe no-op stub rather than restoring the full
+// implementation from memory - reconstructing ~300 lines of Vulkan
+// synchronization/resource-management code without a git history to
+// verify against is exactly the kind of risk that caused the original
+// GI-temporal-accumulation crash this codebase already spent a long
+// forensic session tracking down. The shader source (s_gi_shader_body /
+// s_gi_blur_shader_body) is still compiled and kept intact as inert
+// scaffolding in case GI is revisited later with a fresh, carefully
+// reviewed resource-management implementation.
+bool VulkanRenderer::RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+	VkImageView colorInputView, VkSampler colorInputSampler,
+	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent,
+	VkFormat scratchFormat)
+{
+	return false;
+}
+
+void VulkanRenderer::DestroyGiScratchTarget()
+{
+	if (m_giScratchFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, m_giScratchFramebuffer, nullptr);
+		m_giScratchFramebuffer = VK_NULL_HANDLE;
+	}
+	if (m_giScratchRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_giScratchRenderPass, nullptr);
+		m_giScratchRenderPass = VK_NULL_HANDLE;
+	}
+	if (m_giScratchSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_giScratchSampler, nullptr);
+		m_giScratchSampler = VK_NULL_HANDLE;
+	}
+	if (m_giScratchView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_giScratchView, nullptr);
+		m_giScratchView = VK_NULL_HANDLE;
+	}
+	if (m_giScratchImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_giScratchImage, nullptr);
+		m_giScratchImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_giScratchAllocation);
+		m_giScratchAllocation = nullptr;
+	}
+	m_giScratchExtent = {};
+	m_giScratchFormat = VK_FORMAT_UNDEFINED;
+}
+
+bool VulkanRenderer::EnsureGiScratchTarget(VkFormat format, uint32 width, uint32 height)
+{
+	// Never actually called - RunFaroGiPass returns false before reaching
+	// this. Kept as a safe stub matching the header declaration.
+	return false;
+}
+
+void VulkanRenderer::DestroyGiTargets()
+{
+	if (m_giDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_giDescriptorSet);
+		m_giDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_giBlurDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_giBlurDescriptorSet);
+		m_giBlurDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_giDepthSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_giDepthSampler, nullptr);
+		m_giDepthSampler = VK_NULL_HANDLE;
+	}
+	DestroyGiScratchTarget();
+}
+
+void VulkanRenderer::DestroySsrFlatnessScratchTarget()
+{
+	if (m_ssrFlatnessScratchFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, m_ssrFlatnessScratchFramebuffer, nullptr);
+		m_ssrFlatnessScratchFramebuffer = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessScratchRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(m_logicalDevice, m_ssrFlatnessScratchRenderPass, nullptr);
+		m_ssrFlatnessScratchRenderPass = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessScratchView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_ssrFlatnessScratchView, nullptr);
+		m_ssrFlatnessScratchView = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessScratchImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_ssrFlatnessScratchImage, nullptr);
+		m_ssrFlatnessScratchImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_ssrFlatnessScratchAllocation);
+		m_ssrFlatnessScratchAllocation = nullptr;
+	}
+	m_ssrFlatnessScratchExtent = {};
+	m_ssrFlatnessScratchFormat = VK_FORMAT_UNDEFINED;
+}
+
+// Faro SSR: dedicated scratch target for the flatness pre-pass's own
+// blended output - see RunFaroSsrPass's own comment on why a second
+// internal pass is needed (own render pass/framebuffer, rendered into
+// every call).
+bool VulkanRenderer::EnsureSsrFlatnessScratchTarget(VkFormat format, uint32 width, uint32 height)
+{
+	if (width == 0 || height == 0)
+		return false;
+
+	if (m_ssrFlatnessScratchImage != VK_NULL_HANDLE && m_ssrFlatnessScratchExtent.width == width &&
+		m_ssrFlatnessScratchExtent.height == height && m_ssrFlatnessScratchFormat == format)
+		return true;
+
+	WaitDeviceIdle();
+	DestroySsrFlatnessScratchTarget();
+
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent.width = width;
+	imageInfo.extent.height = height;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = format;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// TRANSFER_SRC - copied into m_ssrFlatnessHistoryImage at the end of
+	// every RunFaroSsrPass call (see that method's own comment).
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_ssrFlatnessScratchImage) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness scratch image");
+		DestroySsrFlatnessScratchTarget();
+		return false;
+	}
+	m_ssrFlatnessScratchAllocation = memoryManager->imageMemoryAllocate(m_ssrFlatnessScratchImage);
+
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = m_ssrFlatnessScratchImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.baseMipLevel = 0;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.baseArrayLayer = 0;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_ssrFlatnessScratchView) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness scratch image view");
+		DestroySsrFlatnessScratchTarget();
+		return false;
+	}
+
+	VkAttachmentDescription colorAttachment{};
+	colorAttachment.format = format;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkAttachmentReference colorAttachmentRef{};
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VkRenderPassCreateInfo renderPassInfo{};
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &colorAttachment;
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass;
+	if (vkCreateRenderPass(m_logicalDevice, &renderPassInfo, nullptr, &m_ssrFlatnessScratchRenderPass) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness scratch render pass");
+		DestroySsrFlatnessScratchTarget();
+		return false;
+	}
+
+	VkImageView attachments[1] = { m_ssrFlatnessScratchView };
+	VkFramebufferCreateInfo framebufferInfo{};
+	framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	framebufferInfo.renderPass = m_ssrFlatnessScratchRenderPass;
+	framebufferInfo.attachmentCount = 1;
+	framebufferInfo.pAttachments = attachments;
+	framebufferInfo.width = width;
+	framebufferInfo.height = height;
+	framebufferInfo.layers = 1;
+	if (vkCreateFramebuffer(m_logicalDevice, &framebufferInfo, nullptr, &m_ssrFlatnessScratchFramebuffer) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness scratch framebuffer");
+		DestroySsrFlatnessScratchTarget();
+		return false;
+	}
+
+	m_ssrFlatnessScratchExtent = { width, height };
+	m_ssrFlatnessScratchFormat = format;
+	return true;
+}
+
+void VulkanRenderer::DestroySsrFlatnessHistoryTarget()
+{
+	if (m_ssrFlatnessHistoryView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_ssrFlatnessHistoryView, nullptr);
+		m_ssrFlatnessHistoryView = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessHistoryImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_ssrFlatnessHistoryImage, nullptr);
+		m_ssrFlatnessHistoryImage = VK_NULL_HANDLE;
+		memoryManager->imageMemoryFree(m_ssrFlatnessHistoryAllocation);
+		m_ssrFlatnessHistoryAllocation = nullptr;
+	}
+	m_ssrFlatnessHistoryExtent = {};
+	m_ssrFlatnessHistoryFormat = VK_FORMAT_UNDEFINED;
+	m_ssrFlatnessHistoryValid = false;
+}
+
+// Faro SSR: last frame's copy of the flatness scratch target - unlike that
+// target, a size/format match is NOT the only thing that keeps this one
+// alive; there's no per-frame teardown outside of a real resize, since the
+// entire point is for m_ssrFlatnessHistoryValid frames to keep reading last
+// frame's blended result. Mirrors EnsureTaaHistoryTarget's image/view
+// creation exactly (see its own comment on the one-time UNDEFINED
+// transition below - same reasoning applies here). Must be called with a
+// command buffer actively recording (true for every RunFaroSsrPass caller).
+bool VulkanRenderer::EnsureSsrFlatnessHistoryTarget(VkFormat format, uint32 width, uint32 height)
+{
+	if (width == 0 || height == 0)
+		return false;
+
+	if (m_ssrFlatnessHistoryImage != VK_NULL_HANDLE && m_ssrFlatnessHistoryExtent.width == width &&
+		m_ssrFlatnessHistoryExtent.height == height && m_ssrFlatnessHistoryFormat == format)
+		return true; // already valid for this size/format - history stays intact
+
+	WaitDeviceIdle();
+	DestroySsrFlatnessHistoryTarget();
+
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent.width = width;
+	imageInfo.extent.height = height;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = format;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// No COLOR_ATTACHMENT_BIT - never the target of a render pass, only ever
+	// written via vkCmdCopyImage (TRANSFER_DST) and read as a plain sampled
+	// texture (SAMPLED).
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_ssrFlatnessHistoryImage) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness history image");
+		DestroySsrFlatnessHistoryTarget();
+		return false;
+	}
+	m_ssrFlatnessHistoryAllocation = memoryManager->imageMemoryAllocate(m_ssrFlatnessHistoryImage);
+
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = m_ssrFlatnessHistoryImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.baseMipLevel = 0;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.baseArrayLayer = 0;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_ssrFlatnessHistoryView) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness history image view");
+		DestroySsrFlatnessHistoryTarget();
+		return false;
+	}
+
+	// One-time transition out of UNDEFINED so the descriptor set (which
+	// declares SHADER_READ_ONLY_OPTIMAL) is never pointed at an image still
+	// in an undefined layout, even on the very first frame where nothing
+	// has actually been copied into it yet (faroGtaoParams.z/historyValid
+	// gates the shader from reading anything meaningful out of it then).
+	VkImageMemoryBarrier initBarrier{};
+	initBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	initBarrier.srcAccessMask = 0;
+	initBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	initBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	initBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	initBarrier.image = m_ssrFlatnessHistoryImage;
+	initBarrier.subresourceRange = viewInfo.subresourceRange;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &initBarrier);
+
+	m_ssrFlatnessHistoryExtent = { width, height };
+	m_ssrFlatnessHistoryFormat = format;
+	return true;
+}
+
+bool VulkanRenderer::RunFaroSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+	VkImageView colorInputView, VkSampler colorInputSampler,
+	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent)
+{
+	if (!GetConfig().faro_postfx_enabled || !GetConfig().faro_ssr_enabled)
+		return false;
+	if (!HasCapturedDepth())
+		return false;
+	LatteTextureView* depthView = GetCapturedDepthView();
+	if (!depthView || !depthView->baseTexture)
+		return false;
+	// See RunFaroGtaoPass's own comment on why this is required.
+	LatteTC_MarkTextureStillInUse(depthView->baseTexture);
+
+	RendererOutputShader* ssrShader = RendererOutputShader::s_ssr_shader;
+	RendererOutputShader* ssrFlatnessShader = RendererOutputShader::s_ssr_flatness_shader;
+	if (!ssrShader || !ssrFlatnessShader)
+		return false;
+	// Faro SSR: temporal smoothing for the reflective-surface gate - see
+	// s_ssr_flatness_shader's own doc comment for the full rationale.
+	// Faro-owned, sized to this call's own passWidth/passHeight,
+	// independent of whatever outputFramebuffer the CALLER passed in.
+	// Format MUST match chainInfo.m_swapchainRenderPass's own format (same
+	// reasoning as EnsureFxaaIntermediateTarget's own doc comment) - the
+	// flatness pre-pass's pipeline is still built via backbufferBlit_
+	// createGraphicsPipeline's cached, swapchain-render-pass-compatible
+	// pipeline, so using any other format here would make it incompatible
+	// with m_ssrFlatnessScratchRenderPass. Only the R channel is ever
+	// meaningful; the rest goes unused.
+	auto& chainInfo = GetChainInfo(!padView);
+	if (!EnsureSsrFlatnessScratchTarget(chainInfo.m_surfaceFormat.format, (uint32)passWidth, (uint32)passHeight))
+		return false;
+	if (!EnsureSsrFlatnessHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)passWidth, (uint32)passHeight))
+		return false;
+
+	auto* depthViewVk = static_cast<LatteTextureViewVk*>(depthView);
+	auto* depthTexVk = static_cast<LatteTextureVk*>(depthView->baseTexture);
+	VKRObjectTextureView* sampledDepthView = depthViewVk->GetViewRGBA();
+	if (!sampledDepthView || sampledDepthView->m_textureImageView == VK_NULL_HANDLE)
+		return false;
+
+	if (m_ssrDepthSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_ssrDepthSampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro SSR: failed to create depth sampler");
+			return false;
+		}
+	}
+
+	if (m_ssrFlatnessSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo flatnessSamplerInfo{};
+		flatnessSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		flatnessSamplerInfo.magFilter = VK_FILTER_LINEAR;
+		flatnessSamplerInfo.minFilter = VK_FILTER_LINEAR;
+		flatnessSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		flatnessSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		flatnessSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		flatnessSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		flatnessSamplerInfo.anisotropyEnable = VK_FALSE;
+		flatnessSamplerInfo.compareEnable = VK_FALSE;
+		flatnessSamplerInfo.minLod = 0.0f;
+		flatnessSamplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &flatnessSamplerInfo, nullptr, &m_ssrFlatnessSampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro SSR: failed to create flatness sampler");
+			return false;
+		}
+	}
+
+	if (m_ssrFlatnessDescriptorSet == VK_NULL_HANDLE)
+	{
+		VkDescriptorSetAllocateInfo flatnessAllocInfo{};
+		flatnessAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		flatnessAllocInfo.descriptorPool = m_descriptorPool;
+		flatnessAllocInfo.descriptorSetCount = 1;
+		flatnessAllocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &flatnessAllocInfo, &m_ssrFlatnessDescriptorSet) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro SSR: failed to allocate flatness descriptor set");
+			return false;
+		}
+		performanceMonitor.vk.numDescriptorSets.increment();
+
+		VkDescriptorBufferInfo flatnessUniformBufferInfo{};
+		flatnessUniformBufferInfo.buffer = m_uniformVarBuffer;
+		flatnessUniformBufferInfo.offset = 0;
+		flatnessUniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+		VkWriteDescriptorSet flatnessUboWrite{};
+		flatnessUboWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		flatnessUboWrite.dstSet = m_ssrFlatnessDescriptorSet;
+		flatnessUboWrite.dstBinding = 1;
+		flatnessUboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		flatnessUboWrite.descriptorCount = 1;
+		flatnessUboWrite.pBufferInfo = &flatnessUniformBufferInfo;
+		vkUpdateDescriptorSets(m_logicalDevice, 1, &flatnessUboWrite, 0, nullptr);
+	}
+
+	if (m_ssrDescriptorSet == VK_NULL_HANDLE)
+	{
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = m_descriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &m_ssrDescriptorSet) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro SSR: failed to allocate descriptor set");
+			return false;
+		}
+		performanceMonitor.vk.numDescriptorSets.increment();
+
+		VkDescriptorBufferInfo uniformBufferInfo{};
+		uniformBufferInfo.buffer = m_uniformVarBuffer;
+		uniformBufferInfo.offset = 0;
+		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+		VkWriteDescriptorSet uboWrite{};
+		uboWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		uboWrite.dstSet = m_ssrDescriptorSet;
+		uboWrite.dstBinding = 1;
+		uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		uboWrite.descriptorCount = 1;
+		uboWrite.pBufferInfo = &uniformBufferInfo;
+		vkUpdateDescriptorSets(m_logicalDevice, 1, &uboWrite, 0, nullptr);
+	}
+
+	VkDescriptorImageInfo colorInfo{};
+	colorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	colorInfo.imageView = colorInputView;
+	colorInfo.sampler = colorInputSampler;
+	VkDescriptorImageInfo depthInfo{};
+	depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	depthInfo.imageView = sampledDepthView->m_textureImageView;
+	depthInfo.sampler = m_ssrDepthSampler;
+	// Binding 3: this frame's freshly blended flatness (see the flatness
+	// pre-pass right above) - already transitioned to SHADER_READ_ONLY by
+	// that pass's own interPassBarrier.
+	VkDescriptorImageInfo flatnessScratchInfo{};
+	flatnessScratchInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	flatnessScratchInfo.imageView = m_ssrFlatnessScratchView;
+	flatnessScratchInfo.sampler = m_ssrFlatnessSampler;
+	VkWriteDescriptorSet writes[3]{};
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = m_ssrDescriptorSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[0].descriptorCount = 1;
+	writes[0].pImageInfo = &colorInfo;
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = m_ssrDescriptorSet;
+	writes[1].dstBinding = 2;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].descriptorCount = 1;
+	writes[1].pImageInfo = &depthInfo;
+	writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[2].dstSet = m_ssrDescriptorSet;
+	writes[2].dstBinding = 3;
+	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[2].descriptorCount = 1;
+	writes[2].pImageInfo = &flatnessScratchInfo;
+	vkUpdateDescriptorSets(m_logicalDevice, std::size(writes), writes, 0, nullptr);
+
+	for (sint32 mip = 0; mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_WRITE, IMAGE_READ>(depthTexVk, depthLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
+	// === pass 1/2: ssrFlatnessShader, depth + m_ssrFlatnessHistoryView -> m_ssrFlatnessScratchImage ===
+	// See s_ssr_flatness_shader's own doc comment for why this runs as its
+	// own pass instead of staying inline in the main shader below.
+	{
+		VkDescriptorImageInfo flatnessDepthInfo{};
+		flatnessDepthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		flatnessDepthInfo.imageView = sampledDepthView->m_textureImageView;
+		flatnessDepthInfo.sampler = m_ssrDepthSampler;
+		VkDescriptorImageInfo flatnessHistoryInfo{};
+		flatnessHistoryInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		flatnessHistoryInfo.imageView = m_ssrFlatnessHistoryView;
+		flatnessHistoryInfo.sampler = m_ssrFlatnessSampler;
+		VkWriteDescriptorSet flatnessWrites[2]{};
+		flatnessWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		flatnessWrites[0].dstSet = m_ssrFlatnessDescriptorSet;
+		flatnessWrites[0].dstBinding = 2;
+		flatnessWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		flatnessWrites[0].descriptorCount = 1;
+		flatnessWrites[0].pImageInfo = &flatnessDepthInfo;
+		flatnessWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		flatnessWrites[1].dstSet = m_ssrFlatnessDescriptorSet;
+		flatnessWrites[1].dstBinding = 3;
+		flatnessWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		flatnessWrites[1].descriptorCount = 1;
+		flatnessWrites[1].pImageInfo = &flatnessHistoryInfo;
+		vkUpdateDescriptorSets(m_logicalDevice, std::size(flatnessWrites), flatnessWrites, 0, nullptr);
+
+		auto ssrFlatnessPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, ssrFlatnessShader);
+
+		VkRenderPassBeginInfo flatnessRpInfo{};
+		flatnessRpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		flatnessRpInfo.renderPass = m_ssrFlatnessScratchRenderPass;
+		flatnessRpInfo.framebuffer = m_ssrFlatnessScratchFramebuffer;
+		flatnessRpInfo.renderArea.offset = { 0, 0 };
+		flatnessRpInfo.renderArea.extent = m_ssrFlatnessScratchExtent;
+		flatnessRpInfo.clearValueCount = 0;
+
+		VkViewport flatnessViewport{};
+		flatnessViewport.x = 0.0f;
+		flatnessViewport.y = 0.0f;
+		flatnessViewport.width = (float)passWidth;
+		flatnessViewport.height = (float)passHeight;
+		flatnessViewport.minDepth = 0.0f;
+		flatnessViewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &flatnessViewport);
+
+		VkRect2D flatnessScissor{};
+		flatnessScissor.extent = m_ssrFlatnessScratchExtent;
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &flatnessScissor);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &flatnessRpInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ssrFlatnessPipeline);
+		m_state.currentPipeline = ssrFlatnessPipeline;
+
+		// faroGtaoParams here: x=history blend weight, y=far plane (matches
+		// the main pass's own faroGtaoParams.w below), z=historyValid gate,
+		// w=unused - see s_ssr_flatness_shader_body's own doc comment.
+		// Weighted heavily toward history (0.9) for strong stabilization -
+		// still reacts to a real, sustained change within a handful of
+		// frames, but absorbs single-frame noise/threshold-crossing pops.
+		auto flatnessUniforms = ssrFlatnessShader->FillUniformBlockBuffer(*texView, { passWidth, passHeight }, padView);
+		flatnessUniforms.applySRGBEncoding = false;
+		flatnessUniforms.targetGamma = flatnessUniforms.displayGamma;
+		flatnessUniforms.faroGtaoParams[0] = 0.9f;
+		flatnessUniforms.faroGtaoParams[1] = 1000.0f;
+		flatnessUniforms.faroGtaoParams[2] = m_ssrFlatnessHistoryValid ? 1.0f : 0.0f;
+		flatnessUniforms.faroGtaoParams[3] = 0.0f;
+		auto flatnessUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&flatnessUniforms, sizeof(decltype(flatnessUniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_ssrFlatnessDescriptorSet, 1, &flatnessUniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+		VkMemoryBarrier flatnessInterPassBarrier{};
+		flatnessInterPassBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		flatnessInterPassBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		flatnessInterPassBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &flatnessInterPassBarrier, 0, nullptr, 0, nullptr);
+	}
+
+	// === pass 2/2: ssrShader, color + depth + m_ssrFlatnessScratchImage -> caller's outputFramebuffer ===
+	auto ssrPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, ssrShader);
+
+	VkMemoryBarrier ssrInputBarrier{};
+	ssrInputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	ssrInputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	ssrInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 1, &ssrInputBarrier, 0, nullptr, 0, nullptr);
+
+	VkRenderPassBeginInfo rpInfo{};
+	rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpInfo.renderPass = outputRenderPass;
+	rpInfo.framebuffer = outputFramebuffer;
+	rpInfo.renderArea.offset = { 0, 0 };
+	rpInfo.renderArea.extent = outputExtent;
+	rpInfo.clearValueCount = 0;
+
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)passWidth;
+	viewport.height = (float)passHeight;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+
+	VkRect2D scissor{};
+	scissor.extent = outputExtent;
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ssrPipeline);
+	m_state.currentPipeline = ssrPipeline;
+
+	// faroGtaoParams here: x=intensity, y=march step size (view-units, NOT
+	// a relative depth threshold like GTAO/GI - see s_ssr_shader_body's own
+	// comment), w=far plane. z is unused by SSR.
+	auto ssrUniforms = ssrShader->FillUniformBlockBuffer(*texView, { passWidth, passHeight }, padView);
+	ssrUniforms.applySRGBEncoding = false;
+	ssrUniforms.targetGamma = ssrUniforms.displayGamma;
+	ssrUniforms.faroGtaoParams[0] = (float)GetConfig().faro_ssr_intensity / 100.0f;
+	ssrUniforms.faroGtaoParams[1] = 0.35f;
+	ssrUniforms.faroGtaoParams[2] = 0.0f; // unused by SSR
+	ssrUniforms.faroGtaoParams[3] = 1000.0f;
+	auto ssrUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&ssrUniforms, sizeof(decltype(ssrUniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_ssrDescriptorSet, 1, &ssrUniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	VkMemoryBarrier interPassBarrier{};
+	interPassBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	interPassBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	interPassBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 1, &interPassBarrier, 0, nullptr, 0, nullptr);
+
+	// === capture: m_ssrFlatnessScratchImage -> m_ssrFlatnessHistoryImage, for next frame's flatness pre-pass ===
+	// Both are Renderer-owned - same "compute into scratch, copy to
+	// persistent history" shape as Faro TAA's own m_taaNativeResolveImage ->
+	// m_taaHistoryImage step.
+	{
+		VkImageSubresourceRange flatnessColorRange{};
+		flatnessColorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		flatnessColorRange.baseMipLevel = 0;
+		flatnessColorRange.levelCount = 1;
+		flatnessColorRange.baseArrayLayer = 0;
+		flatnessColorRange.layerCount = 1;
+
+		std::array<VkImageMemoryBarrier, 2> flatnessPreCopyBarriers{};
+		flatnessPreCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		flatnessPreCopyBarriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		flatnessPreCopyBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		flatnessPreCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		flatnessPreCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		flatnessPreCopyBarriers[0].image = m_ssrFlatnessScratchImage;
+		flatnessPreCopyBarriers[0].subresourceRange = flatnessColorRange;
+		flatnessPreCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		flatnessPreCopyBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		flatnessPreCopyBarriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		flatnessPreCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		flatnessPreCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		flatnessPreCopyBarriers[1].image = m_ssrFlatnessHistoryImage;
+		flatnessPreCopyBarriers[1].subresourceRange = flatnessColorRange;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, (uint32)flatnessPreCopyBarriers.size(), flatnessPreCopyBarriers.data());
+
+		VkImageSubresourceLayers flatnessCopyLayers{};
+		flatnessCopyLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		flatnessCopyLayers.mipLevel = 0;
+		flatnessCopyLayers.baseArrayLayer = 0;
+		flatnessCopyLayers.layerCount = 1;
+		VkImageCopy flatnessCopyRegion{};
+		flatnessCopyRegion.srcSubresource = flatnessCopyLayers;
+		flatnessCopyRegion.srcOffset = { 0, 0, 0 };
+		flatnessCopyRegion.dstSubresource = flatnessCopyLayers;
+		flatnessCopyRegion.dstOffset = { 0, 0, 0 };
+		flatnessCopyRegion.extent = { m_ssrFlatnessScratchExtent.width, m_ssrFlatnessScratchExtent.height, 1 };
+		vkCmdCopyImage(m_state.currentCommandBuffer, m_ssrFlatnessScratchImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_ssrFlatnessHistoryImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &flatnessCopyRegion);
+
+		VkImageMemoryBarrier flatnessPostCopyBarrier{};
+		flatnessPostCopyBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		flatnessPostCopyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		flatnessPostCopyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		flatnessPostCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		flatnessPostCopyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		flatnessPostCopyBarrier.image = m_ssrFlatnessHistoryImage;
+		flatnessPostCopyBarrier.subresourceRange = flatnessColorRange;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &flatnessPostCopyBarrier);
+
+		m_ssrFlatnessHistoryValid = true;
+	}
+
+	for (sint32 mip = 0; mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_READ, IMAGE_WRITE>(depthTexVk, depthLayers, depthTexVk->GetDefaultLayout());
+	}
+	return true;
+}
+
+void VulkanRenderer::DestroySsrTargets()
+{
+	if (m_ssrDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_ssrDescriptorSet);
+		m_ssrDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_ssrDepthSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_ssrDepthSampler, nullptr);
+		m_ssrDepthSampler = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_ssrFlatnessDescriptorSet);
+		m_ssrFlatnessDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_ssrFlatnessSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_ssrFlatnessSampler, nullptr);
+		m_ssrFlatnessSampler = VK_NULL_HANDLE;
+	}
+	DestroySsrFlatnessScratchTarget();
+	DestroySsrFlatnessHistoryTarget();
 }
 
 bool VulkanRenderer::DrawBackbufferQuadTwoPass(LatteTextureView* texView, RendererOutputShader* easuShader, RendererOutputShader* rcasShader, RendererOutputShader* secondShader,
@@ -4068,7 +5119,14 @@ bool VulkanRenderer::DrawBackbufferQuadTwoPass(LatteTextureView* texView, Render
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	interPassBarrier();
 
-	// === pass 3: secondShader (FXAA), m_fxaaIntermediate -> real backbuffer ===
+	// === Faro GTAO pass (optional): m_fxaaIntermediate + depth ->
+	// m_fsr1EasuIntermediate. Downstream passes then read the AO-multiplied
+	// image instead of plain RCAS output.
+	VkDescriptorSet gtaoColorSet = m_fxaaIntermediateDescriptorSet;
+	if (RunFaroGtaoPass(texView, imageWidth, imageHeight, padView, m_fxaaIntermediateView, m_fxaaIntermediateSampler, m_fsr1EasuIntermediateRenderPass, m_fsr1EasuIntermediateFramebuffer, m_fsr1EasuIntermediateExtent))
+		gtaoColorSet = m_fsr1EasuIntermediateDescriptorSet;
+
+	// === pass 3: secondShader (FXAA), gtaoColorSet -> real backbuffer ===
 	auto pass3Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, secondShader);
 
 	VkRenderPassBeginInfo pass3RenderPassInfo = {};
@@ -4114,7 +5172,7 @@ bool VulkanRenderer::DrawBackbufferQuadTwoPass(LatteTextureView* texView, Render
 	auto pass3Uniforms = secondShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
 	auto pass3UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass3Uniforms, sizeof(decltype(pass3Uniforms)) });
 
-	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fxaaIntermediateDescriptorSet,
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &gtaoColorSet,
 		1, &pass3UniformOffset);
 
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
@@ -4270,6 +5328,23 @@ void VulkanRenderer::DestroySmaaStaticTextures()
 		memoryManager->imageMemoryFree(m_smaaAreaTexAllocation);
 		m_smaaAreaTexAllocation = nullptr;
 	}
+}
+
+void VulkanRenderer::DestroyGtaoTargets()
+{
+	if (m_gtaoDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_gtaoDescriptorSet);
+		m_gtaoDescriptorSet = VK_NULL_HANDLE;
+	}
+	if (m_gtaoDepthSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_gtaoDepthSampler, nullptr);
+		m_gtaoDepthSampler = VK_NULL_HANDLE;
+	}
+	// Note: the depth VkImageView itself is cache-owned
+	// (LatteTextureViewVk::GetViewRGBA, re-resolved every GTAO run) and must
+	// NOT be destroyed here.
 }
 
 void VulkanRenderer::DestroySmaaIntermediateTargets()
@@ -4878,6 +5953,11 @@ void VulkanRenderer::DestroyTaaSpatialNativeTargets()
 		memoryManager->imageMemoryFree(m_taaSmaaEdgesAllocation);
 		m_taaSmaaEdgesAllocation = nullptr;
 	}
+	if (m_taaFxaaReadDescriptorSet != VK_NULL_HANDLE)
+	{
+		vkFreeDescriptorSets(m_logicalDevice, m_descriptorPool, 1, &m_taaFxaaReadDescriptorSet);
+		m_taaFxaaReadDescriptorSet = VK_NULL_HANDLE;
+	}
 	if (m_taaFxaaFramebuffer != VK_NULL_HANDLE)
 	{
 		vkDestroyFramebuffer(m_logicalDevice, m_taaFxaaFramebuffer, nullptr);
@@ -5167,6 +6247,12 @@ bool VulkanRenderer::EnsureTaaSpatialNativeTargets(VkFormat format, uint32 width
 		vkUpdateDescriptorSets(m_logicalDevice, std::size(writes), writes, 0, nullptr);
 		performanceMonitor.vk.numDescriptorSamplerTextures.increment();
 	}
+
+	// Faro GTAO (non-FSR1 TAA path only - see DrawBackbufferQuadTaa's own
+	// comment): static read descriptor set for m_taaFxaaView, needed since
+	// GTAO repurposes m_taaFxaaImage as its own output buffer after the
+	// spatial pre-pass/resolve above are done with it this frame.
+	m_taaFxaaReadDescriptorSet = backbufferBlit_createDescriptorSetRaw(m_swapchainDescriptorSetLayout, m_taaFxaaView, m_taaFxaaSampler);
 
 	m_taaFxaaExtent = { width, height };
 	m_taaFxaaFormat = format;
@@ -5471,7 +6557,14 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Smaa(LatteTextureView* texView, Rende
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	interPassBarrier();
 
-	// === pass 3: edgeShader, m_fxaaIntermediate* -> m_smaaEdges* ===
+	// === Faro GTAO pass (optional): m_fxaaIntermediate + depth ->
+	// m_fsr1EasuIntermediate. The edge pass below then reads the
+	// AO-multiplied image instead of plain RCAS output.
+	VkDescriptorSet gtaoColorSet = m_fxaaIntermediateDescriptorSet;
+	if (RunFaroGtaoPass(texView, imageWidth, imageHeight, padView, m_fxaaIntermediateView, m_fxaaIntermediateSampler, m_fsr1EasuIntermediateRenderPass, m_fsr1EasuIntermediateFramebuffer, m_fsr1EasuIntermediateExtent))
+		gtaoColorSet = m_fsr1EasuIntermediateDescriptorSet;
+
+	// === pass 3: edgeShader, gtaoColorSet -> m_smaaEdges* ===
 	auto pass3Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, edgeShader);
 
 	VkRenderPassBeginInfo pass3RenderPassInfo{};
@@ -5493,7 +6586,7 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Smaa(LatteTextureView* texView, Rende
 	pass3Uniforms.applySRGBEncoding = false;
 	pass3Uniforms.targetGamma = pass3Uniforms.displayGamma;
 	auto pass3UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass3Uniforms, sizeof(decltype(pass3Uniforms)) });
-	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fxaaIntermediateDescriptorSet, 1, &pass3UniformOffset);
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &gtaoColorSet, 1, &pass3UniformOffset);
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	interPassBarrier();
@@ -5914,20 +7007,48 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	interPassBarrier();
 
-	// === pass 2: rcasShader, m_fsr1EasuIntermediate* -> real backbuffer ===
+	// === Faro GTAO pre-check (optional): redirect RCAS -> m_fxaaIntermediate
+	// so the GTAO pass below has an input. Skipped entirely (zero behavior
+	// change) unless master+SSAO toggles are on and scene depth was
+	// captured. The full check (incl. shader availability) re-runs inside
+	// RunFaroGtaoPass; this is just the cheap probe to pick the target.
+	sint32 gtaoQualityProbe = GetConfig().faro_ssao_quality;
+	if (gtaoQualityProbe < 0 || gtaoQualityProbe > 2)
+		gtaoQualityProbe = 1;
+	bool wantGtao = GetConfig().faro_postfx_enabled && GetConfig().faro_ssao_enabled &&
+		HasCapturedDepth() && RendererOutputShader::s_gtao_shader[gtaoQualityProbe] != nullptr;
+	// TEMP DEBUG (Faro GTAO diagnostic): log once, right before the
+	// EnsureFxaaIntermediateTarget gate, which sub-condition (if any) is false.
+	{
+		static bool s_gtaoTaaDebugLogged = false;
+		if (!s_gtaoTaaDebugLogged && GetConfig().faro_postfx_enabled)
+		{
+			s_gtaoTaaDebugLogged = true;
+			cemuLog_log(LogType::Force, "Faro GTAO debug (Fsr1Taa): wantGtao={} postfx={} ssao={} hasDepth={} shaderNonNull={} quality={}",
+				wantGtao, GetConfig().faro_postfx_enabled.GetValue(), GetConfig().faro_ssao_enabled.GetValue(),
+				HasCapturedDepth(), RendererOutputShader::s_gtao_shader[gtaoQualityProbe] != nullptr, gtaoQualityProbe);
+		}
+	}
+	if (wantGtao && !EnsureFxaaIntermediateTarget(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
+	{
+		wantGtao = false;
+		cemuLog_log(LogType::Force, "Faro GTAO debug (Fsr1Taa): EnsureFxaaIntermediateTarget failed, forcing wantGtao=false");
+	}
+
+	// === pass 2: rcasShader, m_fsr1EasuIntermediate* -> (wantGtao ? m_fxaaIntermediate : real backbuffer) ===
 	auto pass2Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, rcasShader);
 
 	VkRenderPassBeginInfo pass2RenderPassInfo{};
 	pass2RenderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	pass2RenderPassInfo.renderPass = chainInfo.m_swapchainRenderPass;
-	pass2RenderPassInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+	pass2RenderPassInfo.renderPass = wantGtao ? m_fxaaIntermediateRenderPass : chainInfo.m_swapchainRenderPass;
+	pass2RenderPassInfo.framebuffer = wantGtao ? m_fxaaIntermediateFramebuffer : chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
 	pass2RenderPassInfo.renderArea.offset = { 0, 0 };
-	pass2RenderPassInfo.renderArea.extent = chainInfo.getExtent();
+	pass2RenderPassInfo.renderArea.extent = wantGtao ? m_fxaaIntermediateExtent : chainInfo.getExtent();
 	pass2RenderPassInfo.clearValueCount = 0;
 
 	VkViewport pass2Viewport{};
-	pass2Viewport.x = imageX;
-	pass2Viewport.y = imageY;
+	pass2Viewport.x = wantGtao ? 0.0f : imageX;
+	pass2Viewport.y = wantGtao ? 0.0f : imageY;
 	pass2Viewport.width = imageWidth;
 	pass2Viewport.height = imageHeight;
 	pass2Viewport.minDepth = 0.0f;
@@ -5935,12 +7056,12 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &pass2Viewport);
 
 	VkRect2D pass2Scissor{};
-	pass2Scissor.extent = chainInfo.getExtent();
+	pass2Scissor.extent = wantGtao ? m_fxaaIntermediateExtent : chainInfo.getExtent();
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &pass2Scissor);
 
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &pass2RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-	if (clearBackground)
+	if (clearBackground && !wantGtao)
 	{
 		VkClearAttachment clearAttachment{};
 		clearAttachment.clearValue = {0,0,0,0};
@@ -5953,16 +7074,76 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2Pipeline);
 	m_state.currentPipeline = pass2Pipeline;
 
-	// real gamma/SRGB correction only on this, the final pass - passes 0/1
-	// above write intermediate data that still needs RCAS's sharpen, not
-	// final display color, and PrependFragmentPreamble unconditionally
-	// applies SRGB encoding + gamma correction after every outputShader()
-	// call - applying it at every stage would gamma-correct 2-3 times over.
+	// real gamma/SRGB correction only on the final pass - when GTAO runs,
+	// this pass writes an intermediate (neutralized like every other
+	// intermediate pass), and the GTAO final copy below applies the real
+	// correction instead. Passes 0/1 above always write intermediates.
 	auto pass2Uniforms = rcasShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+	if (wantGtao)
+	{
+		pass2Uniforms.applySRGBEncoding = false;
+		pass2Uniforms.targetGamma = pass2Uniforms.displayGamma;
+	}
 	auto pass2UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass2Uniforms, sizeof(decltype(pass2Uniforms)) });
 	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_fsr1EasuIntermediateDescriptorSet, 1, &pass2UniformOffset);
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	if (wantGtao)
+	{
+		// === Faro GTAO pass: m_fxaaIntermediate + depth -> m_fsr1EasuIntermediate ===
+		// On RunFaroGtaoPass failure the RCAS output above is still fresh in
+		// m_fxaaIntermediate, so the final copy just reads from there instead.
+		VkDescriptorSet gtaoFinalSet = m_fsr1EasuIntermediateDescriptorSet;
+		if (!RunFaroGtaoPass(texView, imageWidth, imageHeight, padView, m_fxaaIntermediateView, m_fxaaIntermediateSampler, m_fsr1EasuIntermediateRenderPass, m_fsr1EasuIntermediateFramebuffer, m_fsr1EasuIntermediateExtent))
+			gtaoFinalSet = m_fxaaIntermediateDescriptorSet;
+
+		// === Faro GTAO final copy: gtaoFinalSet -> real backbuffer (real gamma) ===
+		auto gtaoFinalPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, RendererOutputShader::s_copy_shader);
+
+		VkRenderPassBeginInfo gtaoFinalRPInfo{};
+		gtaoFinalRPInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		gtaoFinalRPInfo.renderPass = chainInfo.m_swapchainRenderPass;
+		gtaoFinalRPInfo.framebuffer = chainInfo.m_swapchainFramebuffers[chainInfo.swapchainImageIndex];
+		gtaoFinalRPInfo.renderArea.offset = { 0, 0 };
+		gtaoFinalRPInfo.renderArea.extent = chainInfo.getExtent();
+		gtaoFinalRPInfo.clearValueCount = 0;
+
+		VkViewport gtaoFinalViewport{};
+		gtaoFinalViewport.x = imageX;
+		gtaoFinalViewport.y = imageY;
+		gtaoFinalViewport.width = imageWidth;
+		gtaoFinalViewport.height = imageHeight;
+		gtaoFinalViewport.minDepth = 0.0f;
+		gtaoFinalViewport.maxDepth = 1.0f;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &gtaoFinalViewport);
+
+		VkRect2D gtaoFinalScissor{};
+		gtaoFinalScissor.extent = chainInfo.getExtent();
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &gtaoFinalScissor);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &gtaoFinalRPInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+		if (clearBackground)
+		{
+			VkClearAttachment clearAttachment{};
+			clearAttachment.clearValue = {0,0,0,0};
+			clearAttachment.colorAttachment = 0;
+			clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			VkClearRect clearExtent = {{{0,0},chainInfo.m_actualExtent}, 0, 1};
+			vkCmdClearAttachments(m_state.currentCommandBuffer, 1, &clearAttachment, 1, &clearExtent);
+		}
+
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gtaoFinalPipeline);
+		m_state.currentPipeline = gtaoFinalPipeline;
+
+		auto gtaoFinalUniforms = RendererOutputShader::s_copy_shader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
+		auto gtaoFinalUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&gtaoFinalUniforms, sizeof(decltype(gtaoFinalUniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &gtaoFinalSet,
+			1, &gtaoFinalUniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	}
 
 	// restore viewport
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
@@ -6599,7 +7780,84 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	interPassBarrier();
 
-	// === pass 1: upscaleShader, m_taaNativeResolve* (already antialiased) -> real backbuffer (no RCAS needed) ===
+	// === Faro GTAO pass (optional, non-FSR1 TAA path): m_taaNativeResolve*
+	// (color, native res) + captured depth -> m_taaFxaaImage (repurposed as
+	// GTAO's own output buffer - its own per-frame contents, TAA's spatial
+	// pre-pass output, were already consumed by pass 0/resolve above, so it's
+	// safe to overwrite here, same "ping-pong reuse" pattern as the FSR1
+	// GTAO call sites). Runs BEFORE the final upscale (native res, like every
+	// other GTAO call site) - a depth buffer upscaled with a color-oriented
+	// filter would smear its edges and produce wrong occlusion outlines.
+	// Needed because FSR1's EASU only handles upscaling - whenever the
+	// game's internal render resolution exceeds the display's own output
+	// area (downscaling), Cemu falls back to a plain filter regardless of
+	// the FSR1 setting, so this is the ONLY dispatch path GTAO ever reaches
+	// for that (common - high-res-multiplier graphic packs at a normal
+	// window size) configuration.
+	sint32 gtaoQualityProbe = GetConfig().faro_ssao_quality;
+	if (gtaoQualityProbe < 0 || gtaoQualityProbe > 2)
+		gtaoQualityProbe = 1;
+	bool wantGtao = GetConfig().faro_postfx_enabled && GetConfig().faro_ssao_enabled &&
+		HasCapturedDepth() && RendererOutputShader::s_gtao_shader[gtaoQualityProbe] != nullptr;
+	VkDescriptorSet pass1InputSet = m_taaNativeResolveDescriptorSet;
+	VkImageView chainColorView = m_taaNativeResolveView;
+	VkSampler chainColorSampler = m_taaNativeResolveSampler;
+	bool chainInB = false; // false = result currently sits in m_taaNativeResolve*, true = in m_taaFxaa*
+	if (wantGtao && RunFaroGtaoPass(texView, nativeWidth, nativeHeight, padView,
+		chainColorView, chainColorSampler,
+		m_taaFxaaRenderPass, m_taaFxaaFramebuffer, m_taaFxaaExtent))
+	{
+		pass1InputSet = m_taaFxaaReadDescriptorSet;
+		chainColorView = m_taaFxaaView;
+		chainColorSampler = m_taaFxaaSampler;
+		chainInB = true;
+	}
+
+	// === Faro GI (optional, non-FSR1 TAA path): DISABLED - hard-gated to
+	// false regardless of faro_gi_enabled (RunFaroGiPass itself is also a
+	// no-op stub - see its own comment) after being implicated in a hang/
+	// crash reproduced right in this function under a downscaling+TAA
+	// graphic-pack combo. Kept as dead code (never taken) instead of
+	// removing the call site entirely, so re-enabling it later is a
+	// one-line change once/if the underlying implementation is revisited.
+	bool wantGi = false;
+	if (wantGi)
+	{
+		VkRenderPass giOutRP = chainInB ? m_taaNativeResolveRenderPass : m_taaFxaaRenderPass;
+		VkFramebuffer giOutFB = chainInB ? m_taaNativeResolveFramebuffer : m_taaFxaaFramebuffer;
+		VkExtent2D giOutExt = chainInB ? m_taaNativeResolveExtent : m_taaFxaaExtent;
+		if (RunFaroGiPass(texView, nativeWidth, nativeHeight, padView,
+			chainColorView, chainColorSampler, giOutRP, giOutFB, giOutExt,
+			chainInfo.m_surfaceFormat.format))
+		{
+			pass1InputSet = chainInB ? m_taaNativeResolveDescriptorSet : m_taaFxaaReadDescriptorSet;
+			chainColorView = chainInB ? m_taaNativeResolveView : m_taaFxaaView;
+			chainColorSampler = chainInB ? m_taaNativeResolveSampler : m_taaFxaaSampler;
+			chainInB = !chainInB;
+		}
+	}
+
+	// === Faro SSR (optional, non-FSR1 TAA path): same ping-pong chaining as
+	// GTAO above, running LAST so reflections pick up whatever AO already
+	// darkened the scene with - matches a real deferred pipeline's own
+	// ordering (reflections composite over the final lit image, not the
+	// other way around).
+	bool wantSsr = GetConfig().faro_postfx_enabled && GetConfig().faro_ssr_enabled &&
+		HasCapturedDepth() && RendererOutputShader::s_ssr_shader != nullptr;
+	if (wantSsr)
+	{
+		VkRenderPass ssrOutRP = chainInB ? m_taaNativeResolveRenderPass : m_taaFxaaRenderPass;
+		VkFramebuffer ssrOutFB = chainInB ? m_taaNativeResolveFramebuffer : m_taaFxaaFramebuffer;
+		VkExtent2D ssrOutExt = chainInB ? m_taaNativeResolveExtent : m_taaFxaaExtent;
+		if (RunFaroSsrPass(texView, nativeWidth, nativeHeight, padView,
+			chainColorView, chainColorSampler, ssrOutRP, ssrOutFB, ssrOutExt))
+		{
+			pass1InputSet = chainInB ? m_taaNativeResolveDescriptorSet : m_taaFxaaReadDescriptorSet;
+			chainInB = !chainInB;
+		}
+	}
+
+	// === pass 1: upscaleShader, pass1InputSet (TAA-resolved, optionally GTAO'd/GI'd/SSR'd) -> real backbuffer (no RCAS needed) ===
 	auto pass1Pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, upscaleShader);
 
 	VkRenderPassBeginInfo pass1RenderPassInfo{};
@@ -6639,11 +7897,12 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 	m_state.currentPipeline = pass1Pipeline;
 
 	// texView is still passed here for its metadata only (native/effective
-	// size) - actual sampling reads m_taaNativeResolveDescriptorSet below,
-	// which is exactly that same native resolution.
+	// size) - actual sampling reads pass1InputSet below (m_taaNativeResolve*,
+	// or m_taaFxaaImage if GTAO ran - see its own comment above), both at
+	// that same native resolution.
 	auto pass1Uniforms = upscaleShader->FillUniformBlockBuffer(*texView, { imageWidth, imageHeight }, padView);
 	auto pass1UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass1Uniforms, sizeof(decltype(pass1Uniforms)) });
-	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_taaNativeResolveDescriptorSet, 1, &pass1UniformOffset);
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &pass1InputSet, 1, &pass1UniformOffset);
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 

@@ -563,20 +563,27 @@ struct CemuConfig
 	};
 	ConfigValue<sint32> force_anisotropic_level{kForceAnisoOff};
 
-	// Faro: wider PCF (percentage-closer filtering) kernel for shadow map
-	// samples - see LatteDecompilerEmitGLSL.cpp's GPU7_TEX_INST_SAMPLE_C*
-	// codegen and TEXTURE_SHADOW_FILTERS_investigacion.md. 0 = native (the
-	// single hardware-PCF tap the game itself gets), 1 = 3x3 tap grid,
-	// 2 = 5x5. This is structural, not per-game - it applies to any shader
-	// that samples a depth-compare (shadow) texture, since Latte's
-	// decompiler already tracks that per texture unit for every shader.
-	enum ShadowPcfQuality
-	{
-		kShadowPcfNative = 0,
-		kShadowPcf3x3 = 1,
-		kShadowPcf5x5 = 2,
-	};
-	ConfigValue<sint32> shadow_pcf_quality{kShadowPcfNative};
+	// Faro Global Enhancements: master switch plus per-effect toggles that
+	// apply to every game (no per-title graphic pack needed). Render code
+	// reads these at output-chain build time; all default OFF so existing
+	// behavior is unchanged. Intensities are 0-100 sliders in the UI.
+	// SSAO quality selects the XeGTAO pass preset (0=Low, 1=Medium, 2=High).
+	// FaroShadowScale is reserved for Phase 3 (global shadowmap multiplier
+	// 1-4x); the render path ignores it until then.
+	ConfigValue<bool> faro_postfx_enabled{false};
+	ConfigValue<bool> faro_ssao_enabled{false};
+	ConfigValue<sint32> faro_ssao_intensity{60};
+	ConfigValue<sint32> faro_ssao_quality{1};
+	// GI disabled: kept implemented but force-gated off in code (see
+	// wantGi in VulkanRenderer.cpp) after it was implicated in a hang/
+	// crash under a downscaling+TAA combo - reverted from a full code
+	// removal (which itself introduced a build breakage) back to just
+	// gating it off, per user request.
+	ConfigValue<bool> faro_gi_enabled{false};
+	ConfigValue<sint32> faro_gi_intensity{50};
+	ConfigValue<bool> faro_ssr_enabled{false};
+	ConfigValue<sint32> faro_ssr_intensity{50};
+	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio
 	sint32 audio_api = 0;

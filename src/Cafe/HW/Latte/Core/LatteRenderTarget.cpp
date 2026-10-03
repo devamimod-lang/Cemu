@@ -88,6 +88,71 @@ LatteCachedFBO::LatteCachedFBO(uint64 key) : key(key)
 	calculateEffectiveRenderAreaSize();
 }
 
+namespace
+{
+	// Faro Global Enhancements: see NotifyDepthAttachmentUsed/
+	// FindSceneDepthViewForSize's own doc comment in LatteCachedFBO.h.
+	// Deliberately persistent across frames (not reset per-frame) - not every
+	// game rewrites its depth buffer on literally every single frame, so
+	// requiring a fresh match every frame would miss valid, still-current
+	// depth buffers. Entries are only pruned via NotifyDepthTextureDeleted
+	// (the texture is actually gone), so a stale view can only linger for as
+	// long as Cemu's own texture cache keeps it alive anyway.
+	std::vector<LatteTextureView*> s_sceneDepthCandidates;
+
+	void NotifyDepthTextureDeleted(LatteTexture* texture)
+	{
+		s_sceneDepthCandidates.erase(
+			std::remove_if(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(),
+				[texture](LatteTextureView* view) { return view->baseTexture == texture; }),
+			s_sceneDepthCandidates.end());
+	}
+}
+
+void LatteMRT::NotifyDepthAttachmentUsed(LatteTextureView* view)
+{
+	if (!view)
+		return;
+	// Move to the back on every use (not just the first time) - the list
+	// order must reflect RECENCY OF ACTUAL USE, not "order first seen ever".
+	// A view seen once (e.g. a loading screen's or menu's own depth buffer)
+	// and never touched again used to stay wherever it was first inserted;
+	// if gameplay's own depth view happened to be tracked BEFORE that one-
+	// off menu/loading view but shares the exact same resolution, the stale
+	// menu/loading view would keep winning FindSceneDepthViewForSize's
+	// back-to-front search forever afterward, even during real gameplay -
+	// confirmed via user testing: the AO effect showed during a loading
+	// screen and stuck around from the inventory menu instead of tracking
+	// the actual gameplay scene. Erasing+re-pushing on every genuine use
+	// keeps the list in true most-recently-used order.
+	auto it = std::find(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(), view);
+	if (it != s_sceneDepthCandidates.end())
+		s_sceneDepthCandidates.erase(it);
+	s_sceneDepthCandidates.push_back(view);
+}
+
+LatteTextureView* LatteMRT::FindSceneDepthViewForSize(sint32 width, sint32 height)
+{
+	// Walked back-to-front: NotifyDepthAttachmentUsed now keeps the list in
+	// true most-recently-used order (see its own comment), so the last
+	// same-size match here is the one actually bound most recently - not
+	// just the first one ever seen.
+	for (auto it = s_sceneDepthCandidates.rbegin(); it != s_sceneDepthCandidates.rend(); ++it)
+	{
+		LatteTextureView* view = *it;
+		sint32 viewWidth, viewHeight;
+		view->baseTexture->GetEffectiveSize(viewWidth, viewHeight, view->firstMip);
+		if (viewWidth == width && viewHeight == height)
+			return view;
+	}
+	return nullptr;
+}
+
+bool LatteMRT::IsDepthViewStillTracked(LatteTextureView* view)
+{
+	return std::find(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(), view) != s_sceneDepthCandidates.end();
+}
+
 void LatteMRT::NotifyTextureDeletion(LatteTexture* texture)
 {
 	for (sint32 i = 0; i < Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS; i++)
@@ -97,6 +162,7 @@ void LatteMRT::NotifyTextureDeletion(LatteTexture* texture)
 			sLatteCurrentRendertargets.colorBuffer[i].view = nullptr;
 		}
 	}
+	NotifyDepthTextureDeleted(texture);
 }
 
 LatteCachedFBO* LatteMRT::CreateCachedFBO(uint64 key)
@@ -172,6 +238,7 @@ void LatteMRT::ApplyCurrentState()
 		{
 			fboLookupView = sLatteCurrentRendertargets.depthBuffer.view;
 		}
+		LatteMRT::NotifyDepthAttachmentUsed(sLatteCurrentRendertargets.depthBuffer.view);
 	}
 	// use fboLookupTexture to find cached FBO
 	if (fboLookupView == nullptr)
@@ -926,6 +993,15 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	_currentOutputImageWidth = effectiveWidth;
 	_currentOutputImageHeight = effectiveHeight;
 
+	// Faro Global Enhancements (Phase 0): probe scene depth for later
+	// SSAO/GI/SSR passes. Recording only - see Renderer::CaptureDepthForPostFX.
+	// Needs the output resolution (just computed above) to pick the right
+	// tracked depth view - see FindSceneDepthViewForSize's own comment.
+	if (GetConfig().faro_postfx_enabled)
+	{
+		g_renderer->CaptureDepthForPostFX(effectiveWidth, effectiveHeight);
+	}
+
 	sint32 imageX, imageY;
 	sint32 imageWidth, imageHeight;
 	sint32 fullscreenWidth, fullscreenHeight;
@@ -1047,6 +1123,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 		}
 	}
 	cemu_assert(shader);
+	// TEMP DEBUG (Faro GTAO diagnostic): log once whether the FSR1 dispatch
+	// branch is even taken, and with what resolutions - to determine why
+	// RunFaroGtaoPass is never being reached despite master+SSAO+depth all
+	// confirmed valid.
+	if (GetConfig().faro_postfx_enabled)
+	{
+		static bool s_gtaoDispatchDebugLogged = false;
+		if (!s_gtaoDispatchDebugLogged)
+		{
+			s_gtaoDispatchDebugLogged = true;
+			cemuLog_log(LogType::Force, "Faro GTAO debug: usedFsr1={} downscaling={} imageWH={}x{} effectiveWH={}x{} aaMode={}",
+				usedFsr1, downscaling, imageWidth, imageHeight, effectiveWidth, effectiveHeight, GetConfig().antialiasing_mode.GetValue());
+		}
+	}
 	// FSR1 always needs a 2nd pass (RCAS, see s_fsr1_rcas_shader's doc comment)
 	// on top of the EASU pass selected above. FXAA/SMAA (only offered as
 	// add-ons to FSR1 - see GeneralSettings2.cpp / CemuConfig.h:AntialiasingMode)
@@ -1107,7 +1197,7 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 				filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 		}
 	}
-	else
+	else if (!drewMultiPass)
 	{
 		// Faro: AA without FSR1 - same 3 add-on modes as above, but using
 		// whichever single-pass filter (copy/bicubic/hermite/nearest) was

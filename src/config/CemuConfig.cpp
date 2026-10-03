@@ -154,7 +154,16 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	smaa_quality = graphic.get("SmaaQuality", kSmaaHigh);
 	taa_spatial_aa = graphic.get("TaaSpatialAA", kTaaSpatialFxaa);
 	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
-	shadow_pcf_quality = graphic.get("ShadowPcfQuality", kShadowPcfNative);
+	// Faro Global Enhancements (see CemuConfig.h)
+	faro_postfx_enabled = graphic.get("FaroPostFX", false);
+	faro_ssao_enabled = graphic.get("FaroSSAO", false);
+	faro_ssao_intensity = graphic.get("FaroSSAOIntensity", 60);
+	faro_ssao_quality = graphic.get("FaroSSAOQuality", 1);
+	faro_gi_enabled = graphic.get("FaroGI", false);
+	faro_gi_intensity = graphic.get("FaroGIIntensity", 50);
+	faro_ssr_enabled = graphic.get("FaroSSR", false);
+	faro_ssr_intensity = graphic.get("FaroSSRIntensity", 50);
+	faro_shadow_scale = graphic.get("FaroShadowScale", 1);
 	async_compile = graphic.get("AsyncCompile", async_compile);
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
 #ifdef ENABLE_METAL
@@ -393,7 +402,15 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("SmaaQuality", smaa_quality);
 	graphic.set("TaaSpatialAA", taa_spatial_aa);
 	graphic.set("ForceAnisotropicLevel", force_anisotropic_level);
-	graphic.set("ShadowPcfQuality", shadow_pcf_quality);
+	graphic.set("FaroPostFX", faro_postfx_enabled);
+	graphic.set("FaroSSAO", faro_ssao_enabled);
+	graphic.set("FaroSSAOIntensity", faro_ssao_intensity);
+	graphic.set("FaroSSAOQuality", faro_ssao_quality);
+	graphic.set("FaroGI", faro_gi_enabled);
+	graphic.set("FaroGIIntensity", faro_gi_intensity);
+	graphic.set("FaroSSR", faro_ssr_enabled);
+	graphic.set("FaroSSRIntensity", faro_ssr_intensity);
+	graphic.set("FaroShadowScale", faro_shadow_scale);
 	graphic.set("AsyncCompile", async_compile.GetValue());
 	graphic.set("vkAccurateBarriers", vk_accurate_barriers);
 

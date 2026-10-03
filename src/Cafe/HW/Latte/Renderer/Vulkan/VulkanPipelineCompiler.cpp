@@ -609,6 +609,7 @@ void PipelineCompiler::InitBlendState(const LatteContextRegister& latteRegister,
 		const auto& blendControlReg = latteRegister.CB_BLENDN_CONTROL[i];
 
 		entry.colorWriteMask = (renderTargetMask >> (i * 4)) & 0xF;
+
 		entry.colorBlendOp = GetVkBlendOp(blendControlReg.get_COLOR_COMB_FCN());
 		entry.srcColorBlendFactor = GetVkBlendFactor(blendControlReg.get_COLOR_SRCBLEND());
 		entry.dstColorBlendFactor = GetVkBlendFactor(blendControlReg.get_COLOR_DSTBLEND());
@@ -872,16 +873,16 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
 	// (not just ones using a vertex shader eligible for jitter) since it's
 	// cheap and keeps this code simple - VulkanRendererCore.cpp only actually
 	// calls vkCmdPushConstants for draws using an eligible vertex shader.
-	VkPushConstantRange taaJitterPushConstantRange{};
-	taaJitterPushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-	taaJitterPushConstantRange.offset = 0;
-	taaJitterPushConstantRange.size = sizeof(float) * 2; // vec2 uf_taaJitter
+	VkPushConstantRange pushConstantRanges[1]{};
+	pushConstantRanges[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	pushConstantRanges[0].offset = 0;
+	pushConstantRanges[0].size = sizeof(float) * 2; // vec2 uf_taaJitter
 
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pipelineLayoutInfo.setLayoutCount = descriptorSetLayoutCount;
 	pipelineLayoutInfo.pSetLayouts = descriptorSetLayout;
-	pipelineLayoutInfo.pPushConstantRanges = &taaJitterPushConstantRange;
+	pipelineLayoutInfo.pPushConstantRanges = pushConstantRanges;
 	pipelineLayoutInfo.pushConstantRangeCount = 1;
 
 	VkResult result = vkCreatePipelineLayout(vkRenderer->m_logicalDevice, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);

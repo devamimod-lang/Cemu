@@ -1428,6 +1428,7 @@ void outputShader() {
 }
 )";
 
+
 RendererOutputShader::OutputUniformVariables RendererOutputShader::FillUniformBlockBuffer(const LatteTextureView& texture_view, const Vector2i& output_res, const bool padView) const
 {
 	OutputUniformVariables vars;
@@ -1442,6 +1443,12 @@ RendererOutputShader::OutputUniformVariables RendererOutputShader::FillUniformBl
 	vars.applySRGBEncoding = padView ? LatteGPUState.drcBufferUsesSRGB : LatteGPUState.tvBufferUsesSRGB;
 	vars.targetGamma = padView ? ActiveSettings::GetDRCGamma() : ActiveSettings::GetTVGamma();
 	vars.displayGamma = GetConfig().userDisplayGamma;
+	vars._padFaroGtao[0] = 0;
+	vars._padFaroGtao[1] = 0;
+	vars.faroGtaoParams[0] = 0.0f;
+	vars.faroGtaoParams[1] = 0.0f;
+	vars.faroGtaoParams[2] = 0.0f;
+	vars.faroGtaoParams[3] = 0.0f;
 
 	return vars;
 }
@@ -1466,6 +1473,12 @@ RendererOutputShader* RendererOutputShader::s_smaa_blend_shader[RendererOutputSh
 RendererOutputShader* RendererOutputShader::s_smaa_neighborhood_shader;
 
 RendererOutputShader* RendererOutputShader::s_taa_resolve_shader;
+
+RendererOutputShader* RendererOutputShader::s_gtao_shader[RendererOutputShader::kGtaoQualityCount];
+RendererOutputShader* RendererOutputShader::s_gi_shader;
+RendererOutputShader* RendererOutputShader::s_gi_blur_shader;
+RendererOutputShader* RendererOutputShader::s_ssr_flatness_shader;
+RendererOutputShader* RendererOutputShader::s_ssr_shader;
 
 std::string RendererOutputShader::GetOpenGlVertexSource(bool render_upside_down)
 {
@@ -1629,6 +1642,837 @@ std::string RendererOutputShader::BuildSmaaEdgeShaderSource(sint32 smaaQuality)
 	return fmt::format("#define SMAA_THRESHOLD {}\n", threshold) + s_smaa_edge_shader_body;
 }
 
+// Faro GTAO: horizon-based ambient occlusion (Jimenez et al. 2016 technique
+// family, clean-room GLSL core - not a copy of any vendor sample).
+// Reads textureSrc (upscaled color, binding 0 via preamble) + textureDepth
+// (native scene depth, same UVs, binding 2 declared here like SMAA does for
+// its own extra samplers). Writes AO-multiplied color; downstream passes
+// (FXAA/SMAA/TAA) run unchanged on the result.
+// View-space reconstruction assumes 60-degree vertical FOV (ProjectionFovY
+// below) - radius absorbs the error, same tradeoff ReShade SSAO shaders make
+// with their radius sliders.
+static const std::string s_gtao_shader_body = R"(
+// textureDepth must be linear-filtered, clamped (see Vulkan descriptor write).
+layout(binding = 2) uniform sampler2D textureDepth;
+
+float GtaoLinearize(float d)
+{
+	// N=1.0 fixed (ReShade GetLinearizedDepth convention), FAR from uniform.
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+float GtaoHash(vec2 p)
+{
+	// Interleaved gradient noise - rotates the sample kernel per pixel, no texture needed.
+	vec3 m = vec3(0.06711056, 0.00583715, 52.9829189);
+	return fract(m.z * fract(dot(p, m.xy)));
+}
+
+void outputShader()
+{
+	vec3 color = texture(textureSrc, passUV).xyz;
+	float intensity = clamp(faroGtaoParams.x, 0.0, 1.0);
+	if (intensity <= 0.0)
+	{
+		colorOut0 = vec4(color, 1.0);
+		return;
+	}
+	// faroGtaoParams.y: dimensionless RELATIVE depth-difference threshold
+	// (fraction of the center pixel's own linearized depth) - NOT an
+	// absolute view-space unit. Debugged extensively (3 rounds of false-
+	// color visualization): a raw-depth dump confirmed the depth texture
+	// carries real per-pixel scene data (character/foliage/horizon all
+	// visible), yet occ stayed ~0 everywhere with the old absolute-unit
+	// threshold - because GtaoLinearize's near-field output changes only
+	// ~1:1 with the raw [0,1] depth value (see its own derivative near
+	// d=0), so genuine near-field depth deltas are tiny compared to any
+	// plausible absolute constant when there's no real camera far plane to
+	// calibrate against (see FSR2_TAA_investigacion.md). A RELATIVE
+	// threshold sidesteps that entirely - it's scale-invariant to whatever
+	// units GtaoLinearize happens to produce.
+	float relThreshold = max(faroGtaoParams.y, 1e-4);
+	vec2 outRes = outputResolution;
+	// clamp() alone does not reliably sanitize NaN on all GPUs/drivers (IEEE
+	// min/max with a NaN operand is implementation-defined, not guaranteed
+	// to fall back to the non-NaN operand) - min() then max() in this
+	// specific order is the standard safe idiom, since it forces the NaN
+	// through a comparison against a known-good value each step. Confirmed
+	// necessary via testing: the AO computation running in full but its
+	// result being discarded showed a clean image, while actually applying
+	// the (uninspected) result to color produced severe per-channel color
+	// corruption - the signature of a NaN reaching colorOut0 and each color
+	// channel's UNORM conversion handling that bit pattern differently.
+	float depth = min(max(textureLod(textureDepth, passUV, 0.5).x, 0.0), 1.0);
+	float viewZ = GtaoLinearize(depth);
+	// faroGtaoParams.z: fixed screen-space march radius in pixels (a
+	// pseudo-view-space reconstruction used to derive this from an
+	// absolute radius previously - removed along with the absolute
+	// threshold above, same root cause).
+	float marchPx = max(faroGtaoParams.z, 1.0);
+	float rot = GtaoHash(gl_FragCoord.xy) * 3.14159265;
+	float occ = 0.0;
+	float wsum = 0.0;
+	// relScale is viewZ-relative, so it naturally grows with distance -
+	// same absolute march radius in pixels then corresponds to a
+	// proportionally larger depth range at greater depths, matching how
+	// perspective actually foreshortens a fixed real-world AO radius.
+	float relScale = max(viewZ * relThreshold, 1e-5);
+	for (int d = 0; d < FARO_GTAO_DIRS; d++)
+	{
+		float ang = rot + float(d) * 3.14159265 / float(FARO_GTAO_DIRS);
+		vec2 dirPx = vec2(cos(ang), sin(ang));
+		for (int s = 1; s <= FARO_GTAO_STEPS; s++)
+		{
+			float t = (float(s) - 0.5) / float(FARO_GTAO_STEPS);
+			vec2 suv = passUV + dirPx * (t * marchPx) / outRes;
+			float sz = GtaoLinearize(min(max(textureLod(textureDepth, suv, 0.5).x, 0.0), 1.0));
+			// Bilateral weight: reject samples across a true depth
+			// discontinuity (character/object silhouette), using a wider
+			// window than the occlusion threshold itself so genuine
+			// creases still count fully.
+			float w = clamp(1.0 - abs(sz - viewZ) / (relScale * 3.0), 0.0, 1.0);
+			occ += clamp((viewZ - sz) / relScale, 0.0, 1.0) * w;
+			wsum += w;
+		}
+	}
+	// Same min()-then-max() NaN-safe idiom as depth/sz above - occ/wsum are
+	// each individually finite by construction, but ao's own clamp() is the
+	// last line of defense before this reaches colorOut0.
+	float ao = 1.0 - min(max(occ / max(wsum, 1e-4), 0.0), 1.0);
+	// Distance fade: non-linearized depth's precision collapses far from
+	// the camera (see GtaoLinearize's own comment - most of the raw [0,1]
+	// depth range is spent on nearby geometry), so at long range the
+	// "occlusion" this technique detects is dominated by depth-quantization
+	// noise rather than real creases - confirmed via testing: distant
+	// buildings/terrain showed clearly incorrect darkening despite nothing
+	// actually being occluded there. Fades intensity to 0 well before the
+	// (already made-up, see faroGtaoParams.w's own comment) far plane,
+	// since only near/mid-range creases are trustworthy with this
+	// technique - same "only near field is reliable" reasoning used
+	// throughout this file's depth-based heuristics.
+	float distFade = 1.0 - smoothstep(30.0, 120.0, viewZ);
+	colorOut0 = vec4(color * mix(1.0, ao, intensity * distFade), 1.0);
+}
+)";
+
+std::string RendererOutputShader::BuildGtaoShaderSource(sint32 gtaoQuality)
+{
+	// Sample counts per quality preset (dirs x steps). No float defines, so
+	// the fmt locale pitfall from BuildSmaaEdgeShaderSource doesn't apply.
+	int dirs, steps;
+	switch (gtaoQuality)
+	{
+	case 0: dirs = 6; steps = 6; break; // Low - closer to ReShade
+	case 2: dirs = 12; steps = 12; break; // High - closer to ReShade
+	case 1: // Medium
+	default: dirs = 8; steps = 8; break;
+	}
+	return fmt::format("#define FARO_GTAO_DIRS {}\n#define FARO_GTAO_STEPS {}\n", dirs, steps) + s_gtao_shader_body;
+}
+
+// Faro GI: reuses GTAO's exact directional/step depth-sampling kernel (same
+// NaN-safe depth clamping, relative threshold, distance fade - see GTAO's
+// own comments for why each of those exists) but accumulates a weighted
+// average of nearby color instead of computing occlusion. Only samples that
+// are CLOSER to the camera than the center pixel count (same directionality
+// as GTAO's own occ term - a nearer surface could plausibly bounce light
+// onto this one), weighted the same bilateral way to avoid bleeding across
+// true depth discontinuities. No G-buffer normals available to this
+// codebase (see FSR2_TAA_investigacion.md), so this is a crude screen-space
+// color-bleed approximation, not physically based GI. Single fixed sample
+// count (no quality tiers, unlike GTAO) - GI is already markedly more
+// expensive per-sample (a vec3 texture fetch/accumulate vs GTAO's scalar
+// depth compare) so this keeps the first version's GPU cost bounded.
+// DISABLED - see wantGi in VulkanRenderer.cpp for why this is hard-gated
+// off rather than invoked.
+static const std::string s_gi_shader_body = R"(
+layout(binding = 2) uniform sampler2D textureDepth;
+
+float GiLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+float GiHash(vec2 p)
+{
+	vec3 m = vec3(0.06711056, 0.00583715, 52.9829189);
+	return fract(m.z * fract(dot(p, m.xy)));
+}
+
+// Reconstructs a pseudo-view-space position from linearized depth, same
+// 60-degree-vertical-FOV assumption already used throughout this file's
+// depth-only heuristics (no real camera projection matrix available - see
+// FSR2_TAA_investigacion.md). Only used here (unlike GTAO/AO, which never
+// needed real positions, just relative depth) because deriving a surface
+// normal via screen-space derivatives genuinely requires reconstructing
+// actual 3D-ish positions first.
+vec3 GiReconstructPos(vec2 uv, float viewZ, float aspect)
+{
+	float tanFov = 0.57735027;
+	vec2 ndc = uv * 2.0 - 1.0;
+	return vec3(ndc.x * tanFov * aspect, ndc.y * tanFov, 1.0) * viewZ;
+}
+
+// Neighboring-depth-tap normal reconstruction - central differences (ALWAYS
+// both sides, never a per-pixel side pick) - same fix already applied to
+// SSR's own SsrReconstructNormal (see that function's doc comment for the
+// full history): the old smallest-difference-pick version flipped which
+// side it used pixel-to-pixel wherever both sides were nearly equidistant -
+// exactly the flat-terrain/flat-water case - producing a discontinuous
+// per-pixel normal. Central differences smear at most 1px at true
+// silhouettes, which is strictly better than a per-pixel flip-flopping
+// normal.
+vec3 GiReconstructNormal(vec2 uv, vec3 centerPos, float viewZ, float aspect, vec2 texelSize)
+{
+	float dL = GiLinearize(min(max(texture(textureDepth, uv - vec2(texelSize.x, 0.0)).x, 0.0), 1.0));
+	float dR = GiLinearize(min(max(texture(textureDepth, uv + vec2(texelSize.x, 0.0)).x, 0.0), 1.0));
+	float dD = GiLinearize(min(max(texture(textureDepth, uv - vec2(0.0, texelSize.y)).x, 0.0), 1.0));
+	float dU = GiLinearize(min(max(texture(textureDepth, uv + vec2(0.0, texelSize.y)).x, 0.0), 1.0));
+
+	vec3 posL = GiReconstructPos(uv - vec2(texelSize.x, 0.0), dL, aspect);
+	vec3 posR = GiReconstructPos(uv + vec2(texelSize.x, 0.0), dR, aspect);
+	vec3 posD = GiReconstructPos(uv - vec2(0.0, texelSize.y), dD, aspect);
+	vec3 posU = GiReconstructPos(uv + vec2(0.0, texelSize.y), dU, aspect);
+
+	vec3 ddx = posR - posL;
+	vec3 ddy = posU - posD;
+	return normalize(cross(ddx, ddy));
+}
+
+void outputShader()
+{
+	// Writes ONLY the raw bounce-color term (no scene color mixed in) -
+	// the blur pass that follows this one composites it onto the ORIGINAL
+	// sharp color afterward.
+	float intensity = clamp(faroGtaoParams.x, 0.0, 1.0);
+	if (intensity <= 0.0)
+	{
+		colorOut0 = vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+	float relThreshold = max(faroGtaoParams.y, 1e-4);
+	vec2 outRes = outputResolution;
+	float aspect = outRes.x / max(outRes.y, 1.0);
+	float depth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
+	float viewZ = GiLinearize(depth);
+	vec3 centerPos = GiReconstructPos(passUV, viewZ, aspect);
+	vec3 normal = GiReconstructNormal(passUV, centerPos, viewZ, aspect, 1.0 / outRes);
+	float marchPx = max(faroGtaoParams.z, 1.0);
+	float rot = GiHash(gl_FragCoord.xy) * 3.14159265;
+	vec3 bounce = vec3(0.0);
+	float wsum = 0.0;
+	float relScale = max(viewZ * relThreshold, 1e-5);
+	const int FARO_GI_DIRS = 6;
+	const int FARO_GI_STEPS = 8;
+	for (int d = 0; d < FARO_GI_DIRS; d++)
+	{
+		float ang = rot + float(d) * 3.14159265 / float(FARO_GI_DIRS);
+		vec2 dirPx = vec2(cos(ang), sin(ang));
+		// Running horizon (Bavoil/HBAO 2008, Jimenez GTAO, Mayaux HBIL
+		// 2018, and the "visibility bitmask" paper - Cordonnier et al.
+		// 2023 - all share this core idea): track the highest "elevation
+		// above the surface's own tangent plane" seen so far along this
+		// ray. A sample only contributes light if it RAISES this running
+		// horizon, i.e. it is not already hidden behind a nearer, steeper
+		// sample this same ray already counted - avoids double-counting
+		// light from stacked occluders.
+		float maxSin = 0.0;
+		for (int s = 1; s <= FARO_GI_STEPS; s++)
+		{
+			float t = (float(s) - 0.5) / float(FARO_GI_STEPS);
+			vec2 suv = passUV + dirPx * (t * marchPx) / outRes;
+			float sd = min(max(texture(textureDepth, suv).x, 0.0), 1.0);
+			float sz = GiLinearize(sd);
+			if (sz >= viewZ)
+				continue;
+			vec3 samplePos = GiReconstructPos(suv, sz, aspect);
+			vec3 toSample = samplePos - centerPos;
+			float dist = length(toSample);
+			if (dist < 1e-4)
+				continue;
+			float sinAngle = dot(toSample / dist, normal);
+			// Soft horizon rise instead of a hard cutoff - avoids a
+			// coherent grid-shaped banding artifact confirmed via user
+			// testing on flat terrain/water.
+			const float FARO_GI_HORIZON_SOFTNESS = 0.12;
+			float rise = sinAngle - maxSin;
+			float riseWeight = smoothstep(0.0, FARO_GI_HORIZON_SOFTNESS, rise);
+			if (riseWeight <= 0.0)
+				continue;
+			float w = clamp(1.0 - abs(sz - viewZ) / (relScale * 3.0), 0.0, 1.0);
+			float delta = rise * riseWeight * w;
+			bounce += texture(textureSrc, suv).rgb * delta;
+			wsum += delta;
+			maxSin = max(maxSin, sinAngle);
+		}
+	}
+	vec3 giColor = wsum > 1e-4 ? bounce / wsum : vec3(0.0);
+	colorOut0 = vec4(giColor, 1.0);
+}
+)";
+
+std::string RendererOutputShader::BuildGiShaderSource()
+{
+	return s_gi_shader_body;
+}
+
+// Faro GI denoise: the directional/step kernel's per-pixel random rotation
+// (see s_gi_shader_body's own comment) is noisy by design - depth-aware
+// (bilateral) box blur over textureSrc=GI's own raw output, so it smooths
+// within a surface without bleeding across true depth discontinuities.
+static const std::string s_gi_blur_shader_body = R"(
+layout(binding = 2) uniform sampler2D textureDepth;
+layout(binding = 3) uniform sampler2D textureOriginal;
+
+float GiBlurLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+void outputShader()
+{
+	vec2 outRes = outputResolution;
+	float centerDepth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
+	float centerZ = GiBlurLinearize(centerDepth);
+	float relThreshold = max(faroGtaoParams.y, 1e-4);
+	float relScale = max(centerZ * relThreshold, 1e-5);
+	vec3 sum = vec3(0.0);
+	float wsum = 0.0;
+	const int R = 3;
+	for (int y = -R; y <= R; y++)
+	{
+		for (int x = -R; x <= R; x++)
+		{
+			vec2 suv = passUV + vec2(float(x), float(y)) / outRes;
+			float sd = min(max(texture(textureDepth, suv).x, 0.0), 1.0);
+			float sz = GiBlurLinearize(sd);
+			float w = clamp(1.0 - abs(sz - centerZ) / (relScale * 3.0), 0.0, 1.0);
+			sum += texture(textureSrc, suv).rgb * w;
+			wsum += w;
+		}
+	}
+	vec3 blurredGi = wsum > 1e-4 ? sum / wsum : texture(textureSrc, passUV).rgb;
+	float intensity = clamp(faroGtaoParams.x, 0.0, 1.0);
+	float distFade = 1.0 - smoothstep(30.0, 120.0, centerZ);
+	vec3 original = texture(textureOriginal, passUV).rgb;
+	vec3 result = original + blurredGi * intensity * distFade * 0.6;
+	colorOut0 = vec4(min(max(result, vec3(0.0)), vec3(1.0)), 1.0);
+}
+)";
+
+std::string RendererOutputShader::BuildGiBlurShaderSource()
+{
+	return s_gi_blur_shader_body;
+}
+
+// Faro SSR: temporal pre-pass for the reflective-surface gate - see
+// s_ssr_flatness_shader's own doc comment in the header for the full
+// rationale. faroGtaoParams here means: x=history blend weight (0..1),
+// y=far plane (same depth-linearization meaning as everywhere else, kept
+// identical to the main SSR shader's own faroGtaoParams.w so the curvature
+// scale this produces matches what the main pass used to compute raw at the
+// same pixel), z=1.0 once the history target actually holds a previous
+// frame's result (0.0 only on the very first use right after
+// EnsureSsrFlatnessHistoryTarget (re)creates it - see that method's own
+// comment), w=unused.
+static const std::string s_ssr_flatness_shader_body = R"(
+layout(binding = 2) uniform sampler2D textureDepth;
+// Faro SSR: previous frame's own blended flatness, sampled at the same
+// screen UV - no reprojection/motion vectors, same accepted simplification
+// as Faro TAA's own history blend (see s_taa_resolve_shader_body's doc
+// comment on why "same pixel, no reprojection" is good enough here).
+layout(binding = 3) uniform sampler2D textureFlatnessHistory;
+
+float SsrFlatnessLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.y, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+void outputShader()
+{
+	vec2 outRes = outputResolution;
+	float depthCenter = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
+	// Same HUD-exclusion + depth-prefilter reasoning as the main SSR
+	// shader's own outputShader (see its comments) - kept identical here so
+	// the smoothed flatness this produces matches what the main pass would
+	// have computed raw at the same pixel.
+	if (depthCenter < 0.0005 || depthCenter > 0.99)
+	{
+		colorOut0 = vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+	vec2 ptex = 1.0 / outRes;
+	float dsum = depthCenter;
+	dsum += min(max(texture(textureDepth, passUV + vec2(ptex.x, 0.0)).x, 0.0), 1.0);
+	dsum += min(max(texture(textureDepth, passUV - vec2(ptex.x, 0.0)).x, 0.0), 1.0);
+	dsum += min(max(texture(textureDepth, passUV + vec2(0.0, ptex.y)).x, 0.0), 1.0);
+	dsum += min(max(texture(textureDepth, passUV - vec2(0.0, ptex.y)).x, 0.0), 1.0);
+	float depth = dsum * 0.2;
+	float viewZ = SsrFlatnessLinearize(depth);
+
+	// Curvature taps use a WIDER offset than the depthCenter prefilter above
+	// (4 texels instead of 1) - real animated water (BOTW's own wave/ripple
+	// vertex displacement) genuinely varies the depth buffer at small,
+	// ripple-scale distances, which a tight 1-texel Laplacian reads as
+	// "not flat", scoring rippling water as LESS reflective than a
+	// perfectly static dirt/grass field right next to it (confirmed via
+	// user testing: the floor visibly out-reflected the water in front of
+	// it). Widening the tap distance low-pass-filters away that small-
+	// scale ripple curvature while still catching genuine terrain slopes/
+	// steps, which happen over a much larger screen-space distance than a
+	// single wave crest.
+	const float FARO_SSR_FLATNESS_TAP_SCALE = 4.0;
+	vec2 ctex = ptex * FARO_SSR_FLATNESS_TAP_SCALE;
+	float dL = SsrFlatnessLinearize(min(max(texture(textureDepth, passUV - vec2(ctex.x, 0.0)).x, 0.0), 1.0));
+	float dR = SsrFlatnessLinearize(min(max(texture(textureDepth, passUV + vec2(ctex.x, 0.0)).x, 0.0), 1.0));
+	float dD = SsrFlatnessLinearize(min(max(texture(textureDepth, passUV - vec2(0.0, ctex.y)).x, 0.0), 1.0));
+	float dU = SsrFlatnessLinearize(min(max(texture(textureDepth, passUV + vec2(0.0, ctex.y)).x, 0.0), 1.0));
+	float curvature = (abs(dL + dR - 2.0 * viewZ) + abs(dU + dD - 2.0 * viewZ)) / max(viewZ, 1.0);
+	// Upper bound loosened from 0.12 to 0.20 - even with the wider tap
+	// radius above, water with pronounced waves/chop can still carry more
+	// residual curvature than a perfectly static field, so this gives it
+	// more room to still register as "flat enough" before being excluded
+	// entirely. The lower bound (0.01, full flatness below this) is
+	// unchanged - genuinely calm water/glass still scores 1.0 either way.
+	float rawFlatness = 1.0 - smoothstep(0.01, 0.20, curvature);
+
+	// Faro SSR: exponential moving average against last frame's own blended
+	// result - smooths out the frame-to-frame "pop" where curvature crosses
+	// the smoothstep band on animated surfaces (rippling water) or at
+	// grazing angles. Confirmed via user testing as reflections still
+	// "apareciendo y desapareciendo" in quick bursts even after the main SSR
+	// shader's own spatial-only stabilization (depth prefilter, central-
+	// difference normals, soft fades) and the shared GTAO/GI/SSR
+	// depth-capture hysteresis fix (see Renderer::CaptureDepthForPostFX's
+	// own comment) - those all reduce NOISE within a single frame, but
+	// nothing before this persisted anything ACROSS frames, so a value
+	// oscillating right at the smoothstep boundary still popped every time
+	// it crossed. This is the first real cross-frame memory SSR has.
+	//
+	// Temporal-variance water detector: the curvature test above (widened
+	// tap radius + loosened threshold - see their own comments) still
+	// fundamentally can't tell "genuinely bumpy, non-reflective terrain"
+	// apart from "animated rippling water" using only ONE frame's depth -
+	// both can carry similar instantaneous curvature. The one thing that
+	// actually differs between them is TIME: real waves change shape
+	// frame to frame, so a water pixel's own curvature value keeps
+	// moving; static rock/dirt's curvature stays put no matter how bumpy
+	// it looks in any single frame. G/B of this same history target
+	// (previously always written as 0.0, unused) now carry a running EMA
+	// of curvature (meanCurvature) and a running EMA of how far each new
+	// frame's raw curvature strays from that mean (deviation) - a cheap
+	// mean-absolute-deviation stand-in for variance, using the exact same
+	// history buffer/blend weight the flatness value itself already uses,
+	// so this needed zero new Vulkan resources (just channels of the
+	// scratch+history pair that already existed and were sitting unused).
+	// A pixel with high deviation gets its flatness rescued even if its
+	// instantaneous curvature says "not flat" - that instability IS the
+	// signal that it's moving water, not bumpy ground.
+	vec3 history = texture(textureFlatnessHistory, passUV).xyz;
+	float historyFlatness = history.x;
+	float historyMeanCurvature = history.y;
+	float historyDeviation = history.z;
+	float historyWeight = faroGtaoParams.x * faroGtaoParams.z;
+	bool historyIsValid = faroGtaoParams.z > 0.5;
+	float meanCurvature = mix(curvature, historyMeanCurvature, historyWeight);
+	float deviation = historyIsValid ? mix(abs(curvature - historyMeanCurvature), historyDeviation, historyWeight) : 0.0;
+	float motionBoost = smoothstep(0.01, 0.05, deviation);
+	float rawFlatnessBoosted = max(rawFlatness, motionBoost);
+	float blended = mix(rawFlatnessBoosted, historyFlatness, historyWeight);
+	colorOut0 = vec4(blended, meanCurvature, deviation, 1.0);
+}
+)";
+
+std::string RendererOutputShader::BuildSsrFlatnessShaderSource()
+{
+	return s_ssr_flatness_shader_body;
+}
+
+// Faro SSR: see s_ssr_shader's own doc comment in the header for the full
+// rationale (reuses GI's depth-derived-normal/assumed-FOV substitutes for
+// the camera projection matrix + G-buffer normals real SSR needs).
+// faroGtaoParams here means: x=intensity, y=march step size (view-units,
+// NOT a relative depth threshold like GTAO/GI use this same slot for -
+// SSR genuinely needs an absolute march distance, no way around it without
+// real camera units), w=far plane (same shared meaning as everywhere else).
+static const std::string s_ssr_shader_body = R"(
+layout(binding = 2) uniform sampler2D textureDepth;
+// Faro SSR: temporally-smoothed reflective-surface gate, computed by
+// s_ssr_flatness_shader as its own tiny pre-pass (see
+// VulkanRenderer::RunFaroSsrPass) - see that shader's own comment for why
+// this moved out of this shader instead of staying an inline, instantaneous
+// computation.
+layout(binding = 3) uniform sampler2D textureFlatness;
+
+float SsrLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+vec3 SsrReconstructPos(vec2 uv, float viewZ, float aspect, float tanFov)
+{
+	vec2 ndc = uv * 2.0 - 1.0;
+	return vec3(ndc.x * tanFov * aspect, ndc.y * tanFov, 1.0) * viewZ;
+}
+
+// Inverse of SsrReconstructPos - projects a pseudo-view-space point back to
+// screen UV under the same assumed-FOV pseudo-projection.
+vec2 SsrProjectToUV(vec3 P, float aspect, float tanFov)
+{
+	vec2 ndc = vec2(P.x / (max(P.z, 1e-4) * tanFov * aspect), P.y / (max(P.z, 1e-4) * tanFov));
+	return ndc * 0.5 + 0.5;
+}
+
+// Neighboring-depth-tap normal reconstruction - replaces an earlier
+// dFdx/dFdy version that produced hard per-triangle-facet discontinuities
+// in the reflected image ("cuts", confirmed via user testing with SSR
+// intensity at maximum to make them clearly visible). Reflection
+// direction is very sensitive to normal noise, so this mattered a lot
+// here. The curvature-based reflective-surface gate this used to also compute
+// (the discrete Laplacian of the depth field - near-zero for a locally
+// PLANAR surface, large for bumpy/organic geometry) now lives in
+// s_ssr_flatness_shader's own pre-pass instead, so it can be temporally
+// smoothed against last frame's result - see that shader's own doc comment.
+vec3 SsrReconstructNormal(vec2 uv, vec3 centerPos, float viewZ, float aspect, float tanFov, vec2 texelSize)
+{
+	float dL = SsrLinearize(min(max(texture(textureDepth, uv - vec2(texelSize.x, 0.0)).x, 0.0), 1.0));
+	float dR = SsrLinearize(min(max(texture(textureDepth, uv + vec2(texelSize.x, 0.0)).x, 0.0), 1.0));
+	float dD = SsrLinearize(min(max(texture(textureDepth, uv - vec2(0.0, texelSize.y)).x, 0.0), 1.0));
+	float dU = SsrLinearize(min(max(texture(textureDepth, uv + vec2(0.0, texelSize.y)).x, 0.0), 1.0));
+
+	vec3 posL = SsrReconstructPos(uv - vec2(texelSize.x, 0.0), dL, aspect, tanFov);
+	vec3 posR = SsrReconstructPos(uv + vec2(texelSize.x, 0.0), dR, aspect, tanFov);
+	vec3 posD = SsrReconstructPos(uv - vec2(0.0, texelSize.y), dD, aspect, tanFov);
+	vec3 posU = SsrReconstructPos(uv + vec2(0.0, texelSize.y), dU, aspect, tanFov);
+
+	// Central differences (ALWAYS both sides, never a per-pixel side pick) -
+	// the old neighbor-pick version flipped sides pixel-to-pixel wherever
+	// both sides were nearly equidistant (exactly the flat-water case),
+	// producing discontinuous reflection directions = visible "cuts" in
+	// the water that shifted with every tiny camera move. Central
+	// differences smear at most 1px at true silhouettes, and those pixels
+	// already fail the curvature gate below, so this is strictly smoother.
+	vec3 ddx = posR - posL;
+	vec3 ddy = posU - posD;
+	return normalize(cross(ddx, ddy));
+}
+
+// Interleaved gradient noise hash - used to dither the ray march's
+// starting offset per pixel, see outputShader's own comment on why.
+float SsrHash(vec2 p)
+{
+	vec3 m = vec3(0.06711056, 0.00583715, 52.9829189);
+	return fract(m.z * fract(dot(p, m.xy)));
+}
+
+void outputShader()
+{
+	vec3 color = texture(textureSrc, passUV).xyz;
+	float intensity = clamp(faroGtaoParams.x, 0.0, 1.0);
+	if (intensity <= 0.0)
+	{
+		colorOut0 = vec4(color, 1.0);
+		return;
+	}
+	vec2 outRes = outputResolution;
+	float aspect = outRes.x / max(outRes.y, 1.0);
+	float tanFov = 0.57735027;
+	float depthCenter = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
+	// HUD exclusion: only the literal near-plane/unwritten-depth extreme is
+	// excluded now (0.01 was confirmed via user testing to misfire on real,
+	// legitimately close geometry - e.g. water right under the camera when
+	// tilting down to look at it from above: standard perspective z-buffers
+	// compress enormous precision near the camera, so genuinely nearby
+	// surfaces can already read well under 0.01 without being anywhere near
+	// the true near clip plane. There is no reliable way to distinguish
+	// "real close geometry" from "HUD" using depth alone if the HUD doesn't
+	// write its own depth - confirmed via research into ReShade's own
+	// long-standing HUD-exclusion-via-depth limitation - so this only
+	// catches the genuinely-degenerate case now, not anything merely close).
+	if (depthCenter < 0.0005 || depthCenter > 0.99)
+	{
+		colorOut0 = vec4(color, 1.0);
+		return;
+	}
+	// 3x3 depth prefilter for the reflector pixel: with TAA frame-jitter
+	// (and animated water) the raw center depth shimmers sub-texel frame
+	// to frame; every downstream term (viewZ, normal, march, gates) then
+	// flips between hit and miss = reflections blinking while standing
+	// still. Averaging the local neighborhood keeps a stable estimate so
+	// small input wobble moves strength gradually instead of toggling it.
+	float depth = depthCenter;
+	{
+		vec2 ptex = 1.0 / outRes;
+		float dsum = depthCenter;
+		dsum += min(max(texture(textureDepth, passUV + vec2(ptex.x, 0.0)).x, 0.0), 1.0);
+		dsum += min(max(texture(textureDepth, passUV - vec2(ptex.x, 0.0)).x, 0.0), 1.0);
+		dsum += min(max(texture(textureDepth, passUV + vec2(0.0, ptex.y)).x, 0.0), 1.0);
+		dsum += min(max(texture(textureDepth, passUV - vec2(0.0, ptex.y)).x, 0.0), 1.0);
+		depth = dsum * 0.2; // 5-tap cross (cheaper than 3x3, same stabilizing effect)
+	}
+	float viewZ = SsrLinearize(depth);
+	vec3 centerPos = SsrReconstructPos(passUV, viewZ, aspect, tanFov);
+	vec3 normal = SsrReconstructNormal(passUV, centerPos, viewZ, aspect, tanFov, 1.0 / outRes);
+	// Reflective-surface gate - temporally-smoothed by s_ssr_flatness_shader's
+	// own pre-pass instead of recomputed raw here (see textureFlatness's own
+	// declaration comment above and that shader's doc comment for the full
+	// rationale). Confirmed via research (every real SSR reference - Unity
+	// HDRP, Babylon.js, McGuire/Mara - gates reflections by a roughness/
+	// material mask; without one, everything on screen reflects regardless
+	// of whether it's actually a mirror-like surface) and via user testing
+	// (grass, rock, characters were all visibly reflecting like wet glass).
+	// Real water/wet-floor surfaces are locally planar (near-zero
+	// curvature); grass/rock/foliage/characters are not.
+	float flatness = texture(textureFlatness, passUV).x;
+	vec3 viewDir = normalize(centerPos);
+	if (dot(normal, viewDir) > 0.0) normal = -normal;
+	// Small bias to avoid self-intersection with the reflector surface
+	centerPos = centerPos + normal * 0.10 * viewZ;
+	vec3 reflectDir = reflect(viewDir, normal);
+
+	// March along the reflected ray in pseudo-view-space, projecting each
+	// step back to screen UV and testing against the real depth buffer -
+	// a simplified, single-hit substitute for Godot/McGuire-Mara's proper
+	// perspective-correct 2D DDA screen-space traversal (see this shader's
+	// own header comment on why the full technique isn't available here).
+	//
+	// Step size scales with the reflecting pixel's OWN distance from camera
+	// (viewZ) - confirmed via research (screen-space-reflection step-size
+	// discussions - e.g. GameDev.net's own SSR ray-march-step-size thread)
+	// that a FIXED view-space step budget fundamentally cannot reach a
+	// distant surface within a limited iteration count: reflecting a cliff
+	// across a lake needs the ray to cover far more distance than
+	// reflecting a rock a meter away, so a constant step size that works up
+	// close runs out of steps long before it can reach anything far away -
+	// confirmed via user testing as reflections "disappearing" whenever the
+	// reflected surface was more than a short distance off. Real SSR
+	// (McGuire/Mara, Godot) avoids this entirely by marching in actual
+	// screen-space pixels via a real projection matrix, which we don't
+	// have; scaling the pseudo-view-space step by the surface's own depth
+	// is the standard compromise when only an assumed FOV is available.
+	// SSR_STEPS coarse steps find the interval the ray first crosses the
+	// scene surface in, then SSR_REFINE_STEPS of binary search converge
+	// on the precise crossing point within that interval - confirmed via
+	// research (Killing Floor 2's own public SSR writeup, and a Khronos
+	// forum thread whose bug was literally computing this refinement but
+	// never consuming its result) that skipping this refinement is exactly
+	// what produces visible banding: without it, every pixel's hit UV
+	// snaps to whichever DISCRETE coarse step first satisfied the
+	// thickness test, and since the step size grows with iteration count,
+	// that snapped position can jump a lot between neighboring pixels
+	// whose rays happen to cross the surface one step earlier or later -
+	// confirmed via user testing as reflections (and, since SSR shades
+	// every screen pixel including ones the game's own HUD happens to be
+	// drawn over, HUD icons too) appearing sliced into discrete bands.
+	// Bumped from 24/5 and the growth exponent slowed from 0.15 to 0.08
+	// (user testing found the first refinement pass "better, but needs to
+	// be refined MUCH more") - per the same research above, MORE/finer
+	// coarse steps directly shrinks each step's own bracket width (less
+	// for the binary search to have to converge across per pixel), and
+	// more refine iterations converge tighter within whatever bracket
+	// remains. Both are cheap (a handful of extra texture samples), so
+	// there's no reason to stay stingy here given the visible banding.
+)" R"(
+	const int SSR_STEPS = 64;
+	const int SSR_REFINE_STEPS = 12;
+	// The floor here (was 1.0) sets how far even a reflector RIGHT NEXT TO
+	// THE CAMERA can reach - confirmed via user testing as an abrupt,
+	// fake-looking cutoff line across the water: nearby water (small
+	// viewZ) hit this floor and could only reach ~140 pseudo-view-space
+	// units over all 64 steps, nowhere near enough to reflect a distant
+	// rock wall, while water farther from the camera (larger viewZ, so a
+	// bigger step size from the OTHER branch of this max()) reached it
+	// fine - producing a hard line at whatever screen distance the two
+	// branches crossed over, instead of a smooth reflection all the way
+	// from the player's feet out to the rocks. Raised to 4.0 so nearby
+	// water's own reach (~550 units) comfortably covers the same
+	// mid-to-long distances distFade already treats as valid reflection
+	// range (250-700, see distFade's own comment) regardless of how close
+	// the reflecting water itself is to the camera.
+	float stepSize = max(faroGtaoParams.y, 1e-3) * max(viewZ * 0.15, 4.0);
+	float thickness = stepSize * 6.0;
+	// Dither the march's starting offset per pixel (same idea as Killing
+	// Floor 2's Bayer-matrix dither, using this codebase's own GI-style
+	// hash instead) - trades the coherent step-aligned banding pattern for
+	// much less objectionable per-pixel noise, on top of the refinement
+	// above (the two fixes address the same symptom from different
+	// angles: refinement removes the big jumps, dithering breaks up
+	// whatever small residual stepping pattern is left).
+	// Temporal stability: use a stable hash per pixel (no frame jitter)
+	// and a fixed march start. The previous jitter was per-frame
+	// dependent via gl_FragCoord + TAA jitter, which made the march
+	// sample comb shift every frame = reflections blinking while standing
+	// still. We keep a tiny sub-pixel offset for banding, but it is
+	// constant per pixel.
+	vec2 stableCoord = floor(gl_FragCoord.xy);
+	float jitter = SsrHash(stableCoord);
+	bool hit = false;
+	vec2 hitUV = vec2(0.0);
+	float prevTravelled = 0.0;
+	float hitTravelled = 0.0;
+	for (int i = 1; i <= SSR_STEPS; i++)
+	{
+		// Gently increasing step size (cheap, not perspective-exact) -
+		// covers more ground father from the surface without needing many
+		// more steps up close where fine detail matters most.
+		float travelled = (float(i) + jitter * 0.5) * stepSize * (1.0 + float(i) * 0.08);
+		vec3 marchPos = centerPos + reflectDir * travelled;
+		if (marchPos.z <= 0.0)
+			break; // behind the camera under this pseudo-projection
+		vec2 suv = SsrProjectToUV(marchPos, aspect, tanFov);
+		if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0)
+			break; // ray left the visible screen
+		float sceneDepthRaw = min(max(textureLod(textureDepth, suv, 0.5).x, 0.0), 1.0);
+		float sceneZ = SsrLinearize(sceneDepthRaw);
+		// Thickness relaxes with travelled distance: far from the
+		// reflector each step covers more ground, so a fixed slab misses
+		// legitimate crossings (more "lost reflections" on camera moves).
+		float localThickness = thickness * (1.0 + float(i) * 0.35);
+		if (sceneZ < marchPos.z && (marchPos.z - sceneZ) < localThickness + 0.02)
+		{
+			hit = true;
+			hitTravelled = travelled;
+			break;
+		}
+		prevTravelled = travelled;
+	}
+	if (!hit)
+	{
+		colorOut0 = vec4(color, 1.0);
+		return;
+	}
+
+	// Binary search refinement between the last known miss (prevTravelled,
+	// ray still in front of the surface) and the first known hit
+	// (hitTravelled, ray already at/behind it) - see this loop's own
+	// comment above for why this specific step is what actually fixes
+	// banding (not just a quality nicety).
+	{
+		float lo = prevTravelled;
+		float hi = hitTravelled;
+		for (int r = 0; r < SSR_REFINE_STEPS; r++)
+		{
+			float mid = 0.5 * (lo + hi);
+			vec3 midPos = centerPos + reflectDir * mid;
+			vec2 midUV = SsrProjectToUV(midPos, aspect, tanFov);
+			float midDepthRaw = min(max(texture(textureDepth, midUV).x, 0.0), 1.0);
+			float midSceneZ = SsrLinearize(midDepthRaw);
+			if (midSceneZ < midPos.z)
+				hi = mid; // still past the surface - narrow from above
+			else
+				lo = mid; // still in front of the surface - narrow from below
+		}
+		hitUV = SsrProjectToUV(centerPos + reflectDir * hi, aspect, tanFov);
+	}
+
+	// Hit validation: reconstruct the hit surface's normal (cheap central
+	// differences at hitUV) and require it to face the incoming ray.
+	// Without this the march "hits" backfaces and background seen THROUGH
+	// foreground geometry - the classic SSR leak that paints reflections
+	// onto places (and from places) that should never reflect. Genuine
+	// hits on front-facing water/ground pass ~1.0; leaks get rejected.
+	float hitFacing = 1.0;
+	{
+		vec2 htex = 1.0 / outRes;
+		float hC = SsrLinearize(min(max(textureLod(textureDepth, hitUV, 0.5).x, 0.0), 1.0));
+		float hL = SsrLinearize(min(max(textureLod(textureDepth, hitUV - vec2(htex.x, 0.0), 0.5).x, 0.0), 1.0));
+		float hR = SsrLinearize(min(max(textureLod(textureDepth, hitUV + vec2(htex.x, 0.0), 0.5).x, 0.0), 1.0));
+		float hD = SsrLinearize(min(max(textureLod(textureDepth, hitUV - vec2(0.0, htex.y), 0.5).x, 0.0), 1.0));
+		float hU = SsrLinearize(min(max(textureLod(textureDepth, hitUV + vec2(0.0, htex.y), 0.5).x, 0.0), 1.0));
+		vec3 hdx = SsrReconstructPos(hitUV + vec2(htex.x, 0.0), hR, aspect, tanFov) - SsrReconstructPos(hitUV - vec2(htex.x, 0.0), hL, aspect, tanFov);
+		vec3 hdy = SsrReconstructPos(hitUV + vec2(0.0, htex.y), hU, aspect, tanFov) - SsrReconstructPos(hitUV - vec2(0.0, htex.y), hD, aspect, tanFov);
+		vec3 hitN = cross(hdx, hdy);
+		hitN *= inversesqrt(max(dot(hitN, hitN), 1e-12)); // safe normalize, never NaN on flat hits
+		if (dot(hitN, viewDir) > 0.0)
+			hitN = -hitN; // keep the normal on the viewer's side
+		hitFacing = smoothstep(0.0, 0.40, dot(hitN, -reflectDir));
+	}
+	vec3 reflectionColor = texture(textureSrc, hitUV).rgb;
+	// Simple bilateral denoising: average 3x3 neighborhood weighted by
+	// depth similarity to the HIT point (not the reflector - the old
+	// guide compared neighborhood depth against the reflector's own
+	// depth, which smeared unrelated colors across cuts instead of
+	// cleaning the reflected image).
+	{
+		vec2 texel = 1.0 / outRes;
+		float hitDepthRaw = min(max(texture(textureDepth, hitUV).x, 0.0), 1.0);
+		vec3 acc = vec3(0.0);
+		float wsum = 0.0;
+		for (int y = -2; y <= 2; y++)
+		{
+			for (int x = -2; x <= 2; x++)
+			{
+				vec2 uv = hitUV + vec2(float(x), float(y)) * texel;
+				vec3 c = texture(textureSrc, uv).rgb;
+				float d = texture(textureDepth, uv).x;
+				float w = exp(-abs(d - hitDepthRaw) * 10.0);
+				acc += c * w;
+				wsum += w;
+			}
+		}
+		reflectionColor = acc / max(wsum, 1e-5);
+	}
+	// Fresnel (Schlick, F0=0.16 - no metallic/material buffer to vary this
+	// per-pixel, same "no G-buffer" limitation as GI). Raised from the
+	// physically-correct dielectric-water value (0.04) per user testing:
+	// at 0.04 the reflection blend craters to ~4% whenever the surface is
+	// viewed close to head-on (e.g. tilting the camera down to look at
+	// water from above), which reads as "barely there"/opaque regardless
+	// of the faro_ssr_intensity slider (that's just a multiplier on top of
+	// this same term). 0.16 keeps the grazing-angle falloff shape (still
+	// approaches 1.0 at grazing angles) but keeps head-on reflections
+	// clearly visible too, closer to how stylized game water is usually
+	// authored rather than strict real-world dielectric Fresnel.
+	float ndotv = clamp(dot(normal, -viewDir), 0.0, 1.0);
+	float fresnel = 0.16 + 0.84 * pow(1.0 - ndotv, 5.0);
+	// Edge fade - same margin-based idea as Godot's own SSR, simplified to
+	// axis-aligned UV distance from the nearest screen edge.
+	vec2 edgeDist = min(hitUV, 1.0 - hitUV);
+	float edgeFade = smoothstep(0.0, 0.15, min(edgeDist.x, edgeDist.y));
+	// Distance fade - same IDEA as GTAO's/GI's own distFade (suppress
+	// spurious results where the depth buffer goes flat/unreliable near
+	// the far plane), but NOT the same range: GTAO/GI only ever look at
+	// small local neighborhoods around close-to-mid geometry, while SSR's
+	// most common subject (water) is a large flat plane that legitimately
+	// extends much farther into the frustum. Reusing GTAO/GI's 30-120
+	// range here was confirmed via user testing to kill reflections on
+	// almost all real water, not just the sky - so this only fades in
+	// right before the assumed far plane (1000, see faroGtaoParams.w),
+	// where the depth buffer is actually degenerate/flat, not at ordinary
+	// mid-to-long reflection distances.
+	float distFade = 1.0 - smoothstep(250.0, 700.0, viewZ);
+	// Travel confidence fade: hits found after a long march are far less
+	// reliable (more chances of leaks/false crossings) than close ones.
+	// Fading smoothly instead of a binary hit/miss also removes the hard
+	// on/off "cut" line where rays run out of steps or leave the screen -
+	// the old code snapped from full reflection to zero between
+	// neighboring pixels, which is exactly the visible slicing on water.
+	float maxTravel = float(SSR_STEPS) * stepSize * (1.0 + float(SSR_STEPS) * 0.08);
+	float travelFade = 1.0 - smoothstep(maxTravel * 0.30, maxTravel, hitTravelled);
+	// Hysteresis: once a pixel has a hit, keep it for a few frames of
+	// marginal misses to avoid flicker when the depth buffer jitters
+	// around the thickness threshold. We emulate it with a soft
+	// minimum on the strength: if the hit is marginal, we still keep a
+	// small residual instead of snapping to zero.
+	float hitConfidence = smoothstep(0.0, 0.25, hitFacing) * smoothstep(0.0, 0.25, flatness);
+	// View angle fade: avoid hard pop when looking almost straight down/up
+	float viewAngleFade = smoothstep(0.0, 0.3, abs(dot(normal, viewDir)));
+	float ssrStrength = clamp(fresnel * edgeFade * distFade * travelFade * hitConfidence * viewAngleFade * intensity, 0.0, 1.0);
+	vec3 result = mix(color, reflectionColor, ssrStrength);
+	colorOut0 = vec4(min(max(result, vec3(0.0)), vec3(1.0)), 1.0);
+}
+)";
+
+std::string RendererOutputShader::BuildSsrShaderSource()
+{
+	return s_ssr_shader_body;
+}
+
 std::string RendererOutputShader::BuildSmaaBlendShaderSource(sint32 smaaQuality)
 {
 	// Matches the public reference's own SMAA_PRESET_LOW/MEDIUM/HIGH/ULTRA
@@ -1682,6 +2526,9 @@ uniform float displayGamma;
 // Faro TAA: only s_taa_resolve_shader_source reads this - see
 // OutputUniformVariables's own comment for why it's harmless elsewhere.
 uniform bool taaHistoryValid;
+// Faro GTAO: only s_gtao_shader_source reads this (x=intensity 0-1,
+// y=radius in view units, z=quality, w=depth linearization far plane).
+uniform vec4 faroGtaoParams;
 };
 
 float sRGBEncode(float linear)
@@ -1787,6 +2634,18 @@ void RendererOutputShader::InitializeStatic()
     	}
     	s_smaa_neighborhood_shader = new RendererOutputShader(vertex_source, s_smaa_neighborhood_shader_source);
     	s_taa_resolve_shader = new RendererOutputShader(vertex_source, s_taa_resolve_shader_source);
+
+    	// Faro GTAO: all 3 quality presets compiled upfront so switching
+    	// CemuConfig::faro_ssao_quality at runtime never needs a recompile
+    	// (same pattern as the SMAA presets above).
+    	for (sint32 q = 0; q < kGtaoQualityCount; q++)
+    	{
+    		s_gtao_shader[q] = new RendererOutputShader(vertex_source, BuildGtaoShaderSource(q));
+    	}
+    	s_gi_shader = new RendererOutputShader(vertex_source, BuildGiShaderSource());
+    	s_gi_blur_shader = new RendererOutputShader(vertex_source, BuildGiBlurShaderSource());
+    	s_ssr_flatness_shader = new RendererOutputShader(vertex_source, BuildSsrFlatnessShaderSource());
+    	s_ssr_shader = new RendererOutputShader(vertex_source, BuildSsrShaderSource());
 		break;
     }
 #endif
@@ -1819,6 +2678,20 @@ void RendererOutputShader::ShutdownStatic()
 	}
 	delete s_smaa_neighborhood_shader;
 	delete s_taa_resolve_shader;
+
+	for (sint32 q = 0; q < kGtaoQualityCount; q++)
+	{
+		delete s_gtao_shader[q];
+		s_gtao_shader[q] = nullptr;
+	}
+	delete s_gi_shader;
+	s_gi_shader = nullptr;
+	delete s_gi_blur_shader;
+	s_gi_blur_shader = nullptr;
+	delete s_ssr_flatness_shader;
+	s_ssr_flatness_shader = nullptr;
+	delete s_ssr_shader;
+	s_ssr_shader = nullptr;
 
 	s_copy_shader = nullptr;
 	s_copy_shader_ud = nullptr;

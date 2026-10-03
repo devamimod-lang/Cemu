@@ -14,6 +14,7 @@
 #endif
 
 #include "input/api/Keyboard/KeyboardControllerProvider.h"
+#include "input/api/Mouse/MouseControllerProvider.h"
 #include "input/api/DSU/DSUControllerProvider.h"
 #include "input/api/GameCube/GameCubeControllerProvider.h"
 

@@ -73,6 +73,52 @@ namespace WindowSystem
 			std::for_each(m_keydown.cbegin(), m_keydown.cend(), f);
 		}
 
+		// Faro Mouse motion: raw (relative) mouse movement accumulated between
+		// polls - fed from WM_INPUT on Windows (see MainWindow's own
+		// RegisterRawInputDevices/WM_INPUT handling), drained by
+		// MouseController::raw_state() each input poll and converted into
+		// simulated gyro angular velocity. Deliberately a separate small
+		// accumulator rather than reusing the keycode map - relative deltas
+		// need to be CONSUMED (reset to 0) on read, unlike a key's boolean
+		// down/up state.
+		void add_mouse_delta(sint32 dx, sint32 dy)
+		{
+			const std::lock_guard<std::mutex> lock(mouse_mutex);
+			m_mouse_delta_x += dx;
+			m_mouse_delta_y += dy;
+		}
+
+		void consume_mouse_delta(sint32& dx, sint32& dy)
+		{
+			const std::lock_guard<std::mutex> lock(mouse_mutex);
+			dx = m_mouse_delta_x;
+			dy = m_mouse_delta_y;
+			m_mouse_delta_x = 0;
+			m_mouse_delta_y = 0;
+		}
+
+		void set_mouse_button(uint32 button, bool state)
+		{
+			const std::lock_guard<std::mutex> lock(mouse_mutex);
+			m_mouse_buttons[button] = state;
+		}
+
+		bool get_mouse_button(uint32 button)
+		{
+			const std::lock_guard<std::mutex> lock(mouse_mutex);
+			auto result = m_mouse_buttons.find(button);
+			if (result == m_mouse_buttons.end())
+				return false;
+			return result->second;
+		}
+
+		template<typename fn>
+		void iter_mouse_buttons(fn f)
+		{
+			const std::lock_guard<std::mutex> lock(mouse_mutex);
+			std::for_each(m_mouse_buttons.cbegin(), m_mouse_buttons.cend(), f);
+		}
+
 		WindowHandleInfo window_main;
 		WindowHandleInfo window_pad;
 
@@ -83,6 +129,10 @@ namespace WindowSystem
 	  private:
 		std::mutex keycode_mutex;
 		std::unordered_map<uint32, bool> m_keydown;
+
+		std::mutex mouse_mutex;
+		sint32 m_mouse_delta_x = 0, m_mouse_delta_y = 0;
+		std::unordered_map<uint32, bool> m_mouse_buttons;
 	};
 
 	enum class ErrorCategory

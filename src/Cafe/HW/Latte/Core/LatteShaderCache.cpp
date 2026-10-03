@@ -300,19 +300,32 @@ void LatteShaderCache_finish()
 uint32 LatteShaderCache_getShaderCacheExtraVersion(uint64 titleId)
 {
 	// encode the titleId in the version to prevent users from swapping caches between titles
-	const uint32 cacheFileVersion = 1;
+	// Faro SSR: bumped again 3 -> 4 - the reflect-mask attachment/mask-write
+	// codegen (the conditionally-repurposed passPixelColor7 output and its
+	// matching FaroReflectMaskPushConstants push-constant block) has been
+	// removed entirely - the whole reflect-mask approach was abandoned after
+	// user testing showed it unreliable (the write landed or got silently
+	// dropped per-draw depending on unrelated GX2 register bits) in favor of
+	// a pure depth-derived curvature heuristic (see s_ssr_shader_body's own
+	// comment). Any shader compiled under the older mask-aware codegen must
+	// be treated as stale.
+	const uint32 cacheFileVersion = 4;
 	uint32 extraVersion = ((uint32)(titleId >> 32) + ((uint32)titleId) * 3) + cacheFileVersion + 0xe97af1ad;
-	// Faro: shadow_pcf_quality changes what LatteDecompilerEmitGLSL.cpp emits
-	// for depth-compare texture fetches (see its GPU7_TEX_INST_SAMPLE_C*
-	// codegen) - fold it into the cache key so toggling the setting doesn't
-	// silently keep serving shaders compiled under the old one.
-	extraVersion += (uint32)GetConfig().shadow_pcf_quality.GetValue() * 0x9e3779b1u;
 	return extraVersion;
 }
 
 uint32 LatteShaderCache_getPipelineCacheExtraVersion(uint64 titleId)
 {
-	const uint32 cacheFileVersion = 1;
+	// Faro SSR: bumped again 5 -> 6 - the reflect-mask attachment is gone
+	// entirely now (see LatteShaderCache_getShaderCacheExtraVersion's own
+	// comment) - InitBlendState is back to plain, unconditional
+	// register-derived blend state for every color target (no more slot-7
+	// special case), and the pipeline layout's push-constant range count
+	// dropped back to 1 (just Faro TAA's own jitter - the reflect-mask's
+	// "does this draw have blending enabled" flag push-constant range is
+	// gone too). Any pipeline built under the older mask-aware blend-state/
+	// layout logic must be treated as stale.
+	const uint32 cacheFileVersion = 6;
 	uint32 extraVersion = ((uint32)(titleId >> 32) + ((uint32)titleId) * 3) + cacheFileVersion;
 	return extraVersion;
 }

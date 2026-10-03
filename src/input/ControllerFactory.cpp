@@ -6,6 +6,7 @@
 #include "input/emulated/WiimoteController.h"
 
 #include "input/api/Keyboard/KeyboardController.h"
+#include "input/api/Mouse/MouseController.h"
 #include "input/api/DSU/DSUController.h"
 #include "input/api/GameCube/GameCubeController.h"
 
@@ -30,6 +31,10 @@ ControllerPtr ControllerFactory::CreateController(InputAPI::Type api, std::strin
 #if HAS_KEYBOARD
 	case InputAPI::Keyboard:
 		return std::make_shared<KeyboardController>();
+#endif
+#if HAS_MOUSE
+	case InputAPI::Mouse:
+		return std::make_shared<MouseController>();
 #endif
 #if HAS_DIRECTINPUT
 	case InputAPI::DirectInput:
@@ -139,6 +144,10 @@ ControllerProviderPtr ControllerFactory::CreateControllerProvider(InputAPI::Type
 #if HAS_KEYBOARD
 	case InputAPI::Keyboard:
 		return std::make_shared<KeyboardControllerProvider>();
+#endif
+#if HAS_MOUSE
+	case InputAPI::Mouse:
+		return std::make_shared<MouseControllerProvider>();
 #endif
 #ifdef HAS_SDL
 	case InputAPI::SDLController:

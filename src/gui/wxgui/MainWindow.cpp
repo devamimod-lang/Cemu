@@ -67,6 +67,13 @@
 
 #include "Cafe/HW/Latte/Renderer/Renderer.h" // For renderer API checks
 
+#if BOOST_OS_WINDOWS
+#include <dwmapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "dwmapi")
+#endif
+#endif
+
 extern WindowSystem::WindowInfo g_window_info;
 extern std::shared_mutex g_mutex;
 
@@ -398,6 +405,59 @@ MainWindow::MainWindow()
 #if BOOST_OS_WINDOWS
 	HICON hWindowIcon = (HICON)LoadImageA(NULL, "M_WND_ICON16", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
 	SendMessage(this->GetHWND(), WM_SETICON, ICON_SMALL, (LPARAM)hWindowIcon);
+
+	// Windows 11 system backdrop (Mica/Acrylic/Mica Alt) - see wxCemuConfig.h's
+	// own MSWBackdropOption doc comment for the enum<->DWM value mapping.
+	// DwmSetWindowAttribute silently fails (non-S_OK HRESULT, which we
+	// intentionally ignore) on Windows 10 and on Windows 11 builds before
+	// 22H2 (22621) - that failure IS the fallback we want (falls back to
+	// the normal solid window background), so no separate OS-version check
+	// is needed here.
+	{
+		int backdropSelection = GetWxGUIConfig().msw_backdrop.GetValue();
+		if (backdropSelection != static_cast<int>(MSWBackdropOption::kNone))
+		{
+			// DWM_SYSTEMBACKDROP_TYPE (dwmapi.h, Windows 11 22H2+ SDK):
+			// DWMSBT_NONE=1, DWMSBT_MAINWINDOW=2 (Mica), DWMSBT_TRANSIENTWINDOW=3
+			// (Acrylic), DWMSBT_TABBEDWINDOW=4 (Mica Alt) - offset by +1 from
+			// our own MSWBackdropOption (kMica=1 -> DWMSBT_MAINWINDOW=2, etc.)
+			// so the dropdown's "Off" entry (0) never collides with a real
+			// DWM value.
+			int dwmBackdropType = backdropSelection + 1;
+			::DwmSetWindowAttribute(this->GetHWND(), DWMWA_SYSTEMBACKDROP_TYPE, &dwmBackdropType, sizeof(dwmBackdropType));
+			// DWMWA_SYSTEMBACKDROP_TYPE alone only tells DWM WHICH material
+			// to paint - the window's own client area still fully covers
+			// it, so without this the backdrop stays invisible everywhere
+			// except the native title bar (confirmed via user testing: the
+			// caption showed the backdrop correctly, the entire client area
+			// below it - menu, game list, empty space - stayed solid
+			// black). MARGINS{-1,-1,-1,-1} extends the "glass sheet" DWM
+			// composites across the WHOLE client area (not just a border),
+			// which is what actually lets the material show through
+			// wherever this window's own content doesn't opaquely paint
+			// over it (see m_main_panel's own SetBackgroundStyle/empty-
+			// paint-handler setup in CreateGameListAndStatusBar, and the
+			// accent-tinted row colors in wxGameList::UpdateItemColors for
+			// the two areas that still paint something on top of it).
+			MARGINS backdropMargins = { -1, -1, -1, -1 };
+			::DwmExtendFrameIntoClientArea(this->GetHWND(), &backdropMargins);
+		}
+	}
+
+	// Faro Mouse motion: register for raw (relative) mouse input on this
+	// window - see MSWWindowProc's own WM_INPUT handling for where the
+	// actual deltas get consumed. RIDEV_INPUTSINK is NOT set, so this only
+	// delivers input while THIS window (or a child of it) has focus -
+	// deliberate, so mouse-look doesn't fire while alt-tabbed away or
+	// while a different window is focused.
+	{
+		RAWINPUTDEVICE rid{};
+		rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
+		rid.usUsage = 0x02; // HID_USAGE_GENERIC_MOUSE
+		rid.dwFlags = 0;
+		rid.hwndTarget = this->GetHWND();
+		::RegisterRawInputDevices(&rid, 1, sizeof(rid));
+	}
 #endif
 
 	auto* main_sizer = new wxBoxSizer(wxVERTICAL);
@@ -482,6 +542,27 @@ void MainWindow::CreateGameListAndStatusBar()
     if(m_main_panel)
         return; // already displayed
     m_main_panel = new wxPanel(this);
+#if BOOST_OS_WINDOWS
+	bool mswBackdropActive = GetWxGUIConfig().msw_backdrop.GetValue() != static_cast<int>(MSWBackdropOption::kNone);
+#endif
+#if BOOST_OS_WINDOWS
+	// Let the Windows 11 backdrop (see this file's own DwmSetWindowAttribute
+	// call above) show through this panel's own background instead of wx's
+	// normal opaque fill. SetBackgroundStyle(wxBG_STYLE_PAINT) tells wx NOT
+	// to auto-erase the background before painting; binding an empty
+	// wxEVT_PAINT handler means nothing ever actually draws over this
+	// panel's own pixels, so the DWM-composited material underneath stays
+	// visible. Harmless no-op when msw_backdrop is Off (kNone) - the panel
+	// just paints nothing either way in that case too, but wxPanel's
+	// DEFAULT background (the normal opaque system face color) is restored
+	// below via SetBackgroundColour so "Off" still looks exactly like it
+	// did before this feature existed.
+	if (mswBackdropActive)
+	{
+		m_main_panel->SetBackgroundStyle(wxBG_STYLE_PAINT);
+		m_main_panel->Bind(wxEVT_PAINT, [](wxPaintEvent& event) { wxPaintDC dc((wxWindow*)event.GetEventObject()); });
+	}
+#endif
     auto* sizer = new wxBoxSizer(wxVERTICAL);
     // game list
     m_game_list = new wxGameList(m_main_panel, MAINFRAME_GAMELIST_ID);
@@ -916,6 +997,55 @@ WXLRESULT MainWindow::MSWWindowProc(WXUINT nMsg, WXWPARAM wParam, WXLPARAM lPara
 		if (wParam == DBT_DEVNODES_CHANGED)
 		{
 			InputManager::instance().on_device_changed();
+		}
+	}
+	else if (nMsg == WM_INPUT)
+	{
+		// Faro Mouse motion: raw (relative, not cursor-position) mouse
+		// movement, fed to MouseController (see input/api/Mouse) which
+		// converts it into simulated gyro angular velocity - the same
+		// approach as Xapfish (a Cemu fork that maps mouse look to Wii U
+		// motion controls for games like Splatoon). Raw Input is used
+		// instead of tracking cursor position deltas because it reports
+		// true relative movement directly from the device, unaffected by
+		// the cursor hitting a screen edge or any OS pointer-acceleration
+		// curve applied to absolute position - exactly what a real gyro
+		// sensor's own angular velocity reporting is analogous to.
+		// Two-call pattern (query real size, THEN fetch) - a mouse RAWINPUT's
+		// actual copied size is smaller than sizeof(RAWINPUT) itself (that
+		// constant is sized for the LARGEST variant of the data union,
+		// including HID's variable-length payload), so comparing the
+		// fetch's return value against a fixed sizeof(RAWINPUT) guess
+		// silently failed on every single real mouse event - confirmed via
+		// user testing as "detected but does nothing": the device showed
+		// up and could be added/enabled, but raw_state() never actually
+		// saw any accumulated delta because this check always came back
+		// false.
+		UINT dwSize = 0;
+		GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
+		static BYTE lpb[sizeof(RAWINPUT)];
+		if (dwSize > 0 && dwSize <= sizeof(RAWINPUT) &&
+			GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) == dwSize)
+		{
+			RAWINPUT* raw = (RAWINPUT*)lpb;
+			if (raw->header.dwType == RIM_TYPEMOUSE)
+			{
+				const RAWMOUSE& mouse = raw->data.mouse;
+				if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0)
+					g_window_info.add_mouse_delta(mouse.lLastX, mouse.lLastY);
+				// Button IDs (0=left, 1=right, 2=middle, 3/4=side buttons)
+				// match MouseController::get_button_name's own mapping.
+				if (mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) g_window_info.set_mouse_button(0, true);
+				if (mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) g_window_info.set_mouse_button(0, false);
+				if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) g_window_info.set_mouse_button(1, true);
+				if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) g_window_info.set_mouse_button(1, false);
+				if (mouse.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) g_window_info.set_mouse_button(2, true);
+				if (mouse.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP) g_window_info.set_mouse_button(2, false);
+				if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN) g_window_info.set_mouse_button(3, true);
+				if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_UP) g_window_info.set_mouse_button(3, false);
+				if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) g_window_info.set_mouse_button(4, true);
+				if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_UP) g_window_info.set_mouse_button(4, false);
+			}
 		}
 	}
 

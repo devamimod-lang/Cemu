@@ -24,6 +24,13 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/tokenizer.hpp>
 
+#if BOOST_OS_WINDOWS
+#include <dwmapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "dwmapi")
+#endif
+#endif
+
 #include "config/ActiveSettings.h"
 #include "config/LaunchSettings.h"
 #include "Cafe/TitleList/GameInfo.h"
@@ -456,6 +463,39 @@ void wxGameList::UpdateItemColors(sint32 startIndex)
 {
     wxWindowUpdateLocker lock(this);
 
+	wxColour primaryColor = kPrimaryColor;
+	wxColour alternateColor = kAlternateColor;
+#if BOOST_OS_WINDOWS
+	// Windows 11 backdrop active: true pixel-level transparency through a
+	// native SysListView32's own rows turned out not to be achievable -
+	// LVS_EX_TRANSPARENTBKGND/WM_PRINTCLIENT is a pre-DWM-era (Windows XP)
+	// mechanism meant for the PARENT to actively paint a custom watermark
+	// into the buffer the control provides, not a "let DWM's own Mica/
+	// Acrylic compositing show through" hook - returning without painting
+	// anything there just leaves that buffer black, confirmed via user
+	// testing. Next best thing: tint the alternating-row stripe colors
+	// with the real current Windows accent/colorization color
+	// (DwmGetColorizationColor) instead of leaving them flat system gray,
+	// so the list reads as "belonging to" the Mica/Acrylic surface around
+	// it even though it isn't literally see-through.
+	if (GetWxGUIConfig().msw_backdrop.GetValue() != static_cast<int>(MSWBackdropOption::kNone))
+	{
+		DWORD colorizationColor = 0;
+		BOOL opaqueBlend = FALSE;
+		if (SUCCEEDED(::DwmGetColorizationColor(&colorizationColor, &opaqueBlend)))
+		{
+			wxColour accent((colorizationColor >> 16) & 0xFF, (colorizationColor >> 8) & 0xFF, colorizationColor & 0xFF);
+			wxColour base = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW);
+			const double accentWeight = 0.12;
+			primaryColor = wxColour(
+				(unsigned char)(base.Red() * (1.0 - accentWeight) + accent.Red() * accentWeight),
+				(unsigned char)(base.Green() * (1.0 - accentWeight) + accent.Green() * accentWeight),
+				(unsigned char)(base.Blue() * (1.0 - accentWeight) + accent.Blue() * accentWeight));
+			alternateColor = wxHelper::CalculateAccentColour(primaryColor);
+		}
+	}
+#endif
+
     for (int i = startIndex; i < GetItemCount(); ++i)
     {
         const uint64 titleId = GetItemData(i);
@@ -466,12 +506,12 @@ void wxGameList::UpdateItemColors(sint32 startIndex)
 		}
 		else if ((i % 2) != 0)
 		{
-            SetItemBackgroundColour(i, kPrimaryColor);
+            SetItemBackgroundColour(i, primaryColor);
             SetItemTextColour(i, wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
 		}
 		else
 		{
-            SetItemBackgroundColour(i, kAlternateColor);
+            SetItemBackgroundColour(i, alternateColor);
             SetItemTextColour(i, wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
 		}
 	}

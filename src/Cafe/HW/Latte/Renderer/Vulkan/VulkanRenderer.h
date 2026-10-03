@@ -354,10 +354,85 @@ public:
 												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
 												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
 	bool DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
-												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
-												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
-												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
-												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+											RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+											RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+											bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+											sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+	// Faro GTAO (Phase 1): horizon-based AO between RCAS and the AA stage.
+	// Reads m_fxaaIntermediateView (post-RCAS color) + captured scene depth,
+	// writes AO-multiplied color to m_fsr1EasuIntermediate (ping-pong reuse,
+	// both output-sized), so the downstream AA pass only swaps which
+	// intermediate descriptor set it binds. Returns false (caller proceeds
+	// without AO, current behavior) when disabled, depth-invalid, or on any
+	// resource failure. Vulkan-only dispatch, same house precedent as the AA
+	// multi-pass paths.
+	// colorInputView/Sampler is the pass's own color source (RCAS output at
+	// output-res for the FSR1 paths, or m_taaNativeResolveView at native res
+	// for the non-FSR1 TAA path - see each call site's own comment on why);
+	// outputRenderPass/Framebuffer/Extent is whichever existing intermediate
+	// this call's caller has already finished reading from THIS frame and can
+	// safely repurpose as GTAO's own output buffer (ping-pong reuse, no new
+	// targets). Generalized from an earlier FSR1-only version once it became
+	// clear GTAO also needs to run in the non-FSR1 TAA dispatch path (see
+	// DrawBackbufferQuadTaa) - downscaling configs never engage FSR1's EASU,
+	// so a GTAO wired only into the FSR1 paths silently never runs whenever
+	// the internal render resolution exceeds the display's output area.
+	bool RunFaroGtaoPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+		VkImageView colorInputView, VkSampler colorInputSampler,
+		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent);
+	void DestroyGtaoTargets();
+	// Faro GI: same shape/parameters/ping-pong-reuse contract as
+	// RunFaroGtaoPass above - separate descriptor set/sampler so GI and
+	// GTAO stay independently toggleable. DISABLED (see wantGi in
+	// VulkanRenderer.cpp) - implicated in a hang/crash under a
+	// downscaling+TAA combo. Kept implemented but hard-gated off rather
+	// than removed (removing it once already caused its own build
+	// breakage - an unrelated function got deleted by accident along with
+	// it - so restoring the implementation and gating it off in code is
+	// the safer path).
+	// scratchFormat is the caller's own swapchain color format (matches
+	// colorInputView/outputFramebuffer's own format) - needed to (re)create
+	// m_giScratchImage at that same format/resolution for the internal
+	// blur pass.
+	bool RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+		VkImageView colorInputView, VkSampler colorInputSampler,
+		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent,
+		VkFormat scratchFormat);
+	void DestroyGiTargets();
+	// (Re)creates m_giScratchImage - GI's own internal raw-output buffer:
+	// the directional/step sampling kernel's per-pixel random rotation is
+	// noisy by design - same reason XeGTAO and every other real-time
+	// SSAO/SSGI implementation requires a denoise pass - so GI runs TWO
+	// internal draws: raw compute -> m_giScratchImage, then a depth-aware
+	// bilateral blur reading that scratch buffer -> the caller's actual
+	// output target.
+	bool EnsureGiScratchTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyGiScratchTarget();
+	// Faro SSR: two internal passes now (see s_ssr_flatness_shader's own doc
+	// comment) - a tiny pre-pass computes+temporally-blends the reflective-
+	// surface gate into m_ssrFlatnessScratchImage, then the main ssrShader
+	// pass reads that instead of computing curvature raw. Same
+	// shape/parameters/ping-pong-reuse contract as RunFaroGtaoPass.
+	bool RunFaroSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+		VkImageView colorInputView, VkSampler colorInputSampler,
+		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent);
+	void DestroySsrTargets();
+	// (Re)creates m_ssrFlatnessScratchImage - this frame's freshly computed +
+	// blended flatness value (see RunFaroSsrPass's own comment) - own
+	// render pass/framebuffer, rendered into every call, R8_UNORM - single
+	// channel is enough, this only ever holds a 0..1 gate value.
+	bool EnsureSsrFlatnessScratchTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroySsrFlatnessScratchTarget();
+	// (Re)creates m_ssrFlatnessHistoryImage - last frame's copy of the
+	// scratch target above, read (never rendered into) by the NEXT frame's
+	// flatness pre-pass as its blend input. Mirrors EnsureTaaHistoryTarget
+	// exactly (WITHOUT resetting validity unless size/format actually
+	// changed - the whole point is for this to survive across frames -
+	// updated via vkCmdCopyImage at the end of RunFaroSsrPass, same
+	// "compute into scratch, copy to history" shape as Faro TAA's own
+	// m_taaNativeResolve -> m_taaHistoryImage step).
+	bool EnsureSsrFlatnessHistoryTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroySsrFlatnessHistoryTarget();
 	// (Re)creates m_taaHistory* to match the requested size/format, WITHOUT
 	// resetting m_taaHistoryValid unless the size/format actually changed (the
 	// whole point of this target is to survive across frames - unlike every
@@ -798,6 +873,79 @@ private:
 	// static search texture as unused filler).
 	VkDescriptorSet m_smaaNeighborhoodDescriptorSet = VK_NULL_HANDLE;
 
+	// Faro GTAO (Phase 1): no dedicated color target (ping-pongs
+	// m_fxaaIntermediate*/m_fsr1EasuIntermediate*). Only the depth-side
+	// resources below are new. The depth VkImageView itself is cache-owned
+	// (LatteTextureViewVk::GetViewRGBA) and must NOT be destroyed here -
+	// it is re-resolved from the F0.4 probe every GTAO run, so no
+	// cross-frame staleness is possible (capture and use happen in the same
+	// output call, same thread, with no cache ops in between).
+	VkDescriptorSet m_gtaoDescriptorSet = VK_NULL_HANDLE;
+	VkSampler m_gtaoDepthSampler = VK_NULL_HANDLE;
+
+	// Faro GI: same shape as the GTAO resources above (own descriptor set +
+	// depth sampler, no dedicated color target - ping-pongs whichever
+	// existing intermediates the caller passes in). Unlike GTAO, GI DOES
+	// need one dedicated scratch target - see EnsureGiScratchTarget's own
+	// comment - to hold its noisy raw output before the blur pass smooths
+	// it into the caller's actual (ping-ponged) output target. DISABLED
+	// (see wantGi in VulkanRenderer.cpp) but kept implemented - see that
+	// declaration's own comment.
+	VkDescriptorSet m_giDescriptorSet = VK_NULL_HANDLE;
+	VkSampler m_giDepthSampler = VK_NULL_HANDLE;
+	VkImage m_giScratchImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_giScratchAllocation = nullptr;
+	VkImageView m_giScratchView = VK_NULL_HANDLE;
+	VkSampler m_giScratchSampler = VK_NULL_HANDLE;
+	VkRenderPass m_giScratchRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_giScratchFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_giScratchExtent{};
+	VkFormat m_giScratchFormat = VK_FORMAT_UNDEFINED;
+	// Blur pass descriptor set - binding 0 (m_giScratchView, the raw GI
+	// output) and binding 2 (scene depth) both rewritten every draw, same
+	// reasoning as m_giDescriptorSet's own bindings.
+	VkDescriptorSet m_giBlurDescriptorSet = VK_NULL_HANDLE;
+
+	// Faro SSR: main pass descriptor set/depth sampler - see RunFaroSsrPass's
+	// own comment for the two-pass (flatness pre-pass + main pass) shape.
+	VkDescriptorSet m_ssrDescriptorSet = VK_NULL_HANDLE;
+	VkSampler m_ssrDepthSampler = VK_NULL_HANDLE;
+
+	// Faro SSR: flatness pre-pass descriptor set + its own sampler for
+	// sampling m_ssrFlatnessHistoryView/m_ssrFlatnessScratchView (linear/
+	// clamp, same simple params as every other Faro-owned sampler here -
+	// shared between reading history in the pre-pass and reading the fresh
+	// scratch result in the main pass, since both are plain single-channel
+	// 0..1 gate values with identical filtering needs).
+	VkDescriptorSet m_ssrFlatnessDescriptorSet = VK_NULL_HANDLE;
+	VkSampler m_ssrFlatnessSampler = VK_NULL_HANDLE;
+	// This frame's freshly computed+blended flatness (see
+	// EnsureSsrFlatnessScratchTarget's own comment) - rendered into via its
+	// own dedicated render pass/framebuffer.
+	// Only the R channel is ever meaningful, but created at the SAME format
+	// as the swapchain surface (see RunFaroSsrPass's own comment) rather
+	// than a single-channel format - needed so backbufferBlit_
+	// createGraphicsPipeline's cached pipeline (built against
+	// chainInfo.m_swapchainRenderPass) stays render-pass-compatible per
+	// Vulkan's compatibility rules (same idea as EnsureFxaaIntermediateTarget's
+	// own doc comment).
+	VkImage m_ssrFlatnessScratchImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_ssrFlatnessScratchAllocation = nullptr;
+	VkImageView m_ssrFlatnessScratchView = VK_NULL_HANDLE;
+	VkRenderPass m_ssrFlatnessScratchRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_ssrFlatnessScratchFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_ssrFlatnessScratchExtent{};
+	VkFormat m_ssrFlatnessScratchFormat = VK_FORMAT_UNDEFINED;
+	// Last frame's copy of the scratch image above (see
+	// EnsureSsrFlatnessHistoryTarget's own comment) - never rendered into,
+	// only vkCmdCopyImage'd into and sampled, same shape as m_taaHistory*.
+	VkImage m_ssrFlatnessHistoryImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_ssrFlatnessHistoryAllocation = nullptr;
+	VkImageView m_ssrFlatnessHistoryView = VK_NULL_HANDLE;
+	VkExtent2D m_ssrFlatnessHistoryExtent{};
+	VkFormat m_ssrFlatnessHistoryFormat = VK_FORMAT_UNDEFINED;
+	bool m_ssrFlatnessHistoryValid = false;
+
 	// Faro TAA: history texture (previous frame's resolved TAA output, at
 	// native/source resolution - see DrawBackbufferQuadFsr1Taa's own comment
 	// on why TAA now resolves before FSR1's upscale). Unlike every target
@@ -869,6 +1017,14 @@ private:
 	VkFramebuffer m_taaFxaaFramebuffer = VK_NULL_HANDLE;
 	VkExtent2D m_taaFxaaExtent{};
 	VkFormat m_taaFxaaFormat = VK_FORMAT_UNDEFINED;
+	// Faro GTAO (non-FSR1 TAA path only): static read descriptor set for
+	// m_taaFxaaView, created once alongside the target above - lets
+	// DrawBackbufferQuadTaa's final upscale pass read GTAO's output after
+	// GTAO repurposes m_taaFxaaImage as its own native-res output buffer
+	// (that image's original per-frame contents are already consumed by
+	// pass 0/resolve by the time GTAO would write into it - see
+	// DrawBackbufferQuadTaa's own comment on this reuse).
+	VkDescriptorSet m_taaFxaaReadDescriptorSet = VK_NULL_HANDLE;
 
 	// Faro TAA: SMAA's own native-res intermediates when taa_spatial_aa ==
 	// kTaaSpatialSmaa (see m_taaFxaaImage's own comment) - edges from pass 1,

@@ -27,6 +27,20 @@ enum class MSWThemeOption : int
 };
 ENABLE_ENUM_ITERATORS(MSWThemeOption, MSWThemeOption::kAuto, MSWThemeOption::kDark);
 
+// Windows 11 system backdrop material (DWMWA_SYSTEMBACKDROP_TYPE) - values
+// match DWM_SYSTEMBACKDROP_TYPE's own ordering (kNone=DWMSBT_NONE=1 is
+// skipped here since "off" is represented by not calling the API at all,
+// see CemuApp.cpp's own use of this enum) so the dropdown index and the
+// win32 enum stay easy to reason about together.
+enum class MSWBackdropOption : int
+{
+	kNone = 0,
+	kMica = 1,
+	kAcrylic = 2,
+	kMicaAlt = 3,
+};
+ENABLE_ENUM_ITERATORS(MSWBackdropOption, MSWBackdropOption::kNone, MSWBackdropOption::kMicaAlt);
+
 typedef union
 {
 	struct
@@ -75,6 +89,7 @@ struct wxCemuConfig
 {
 	ConfigValue<sint32> language{wxLANGUAGE_DEFAULT};
 	ConfigValue<int> msw_theme { static_cast<int>(MSWThemeOption::kAuto) };
+	ConfigValue<int> msw_backdrop { static_cast<int>(MSWBackdropOption::kNone) };
 	ConfigValue<bool> use_discord_presence{true};
 	ConfigValue<bool> fullscreen{ false };
 	ConfigValue<bool> fullscreen_menubar{false};

@@ -176,6 +176,19 @@ wxPanel* GeneralSettings2::AddGeneralPage(wxNotebook* notebook)
 
 			second_row->Add(m_msw_theme, 0, wxALL, 5);
 
+			second_row->Add(new wxStaticText(box, wxID_ANY, _("Window backdrop")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+
+			m_msw_backdrop = new wxChoice(box, wxID_ANY);
+			m_msw_backdrop->SetToolTip(_("Windows 11 translucent window material (Mica/Acrylic), the same effect used by Windows' own apps\nRequires Windows 11 22H2 or later - has no effect on older versions\nA restart will be required for any changes to take effect"));
+
+			m_msw_backdrop->AppendString(_("Off (solid background)"));
+			m_msw_backdrop->AppendString(_("Mica"));
+			m_msw_backdrop->AppendString(_("Acrylic"));
+			m_msw_backdrop->AppendString(_("Mica Alt"));
+			m_msw_backdrop->SetSelection(0);
+
+			second_row->Add(m_msw_backdrop, 0, wxALL, 5);
+
 			box_sizer->Add(second_row, 0, wxEXPAND, 5);
 		}
 #endif
@@ -562,18 +575,79 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			GetConfig().force_anisotropic_level = event.GetSelection();
 		});
 		graphics_panel_sizer->Add(m_force_anisotropic_level, 0, wxALL | wxEXPAND, 5);
+	}
 
-		// Faro: wider PCF kernel for shadow map samples (see
-		// CemuConfig::ShadowPcfQuality's own comment). Structural - applies to
-		// any shader sampling a depth-compare texture, not tied to a specific
-		// game. Own titled box, same reasoning as above.
-		wxString shadow_pcf_choices[] = { _("Native"), _("3x3"), _("5x5") };
-		m_shadow_pcf_quality = new wxRadioBox(graphics_panel, wxID_ANY, _("Shadow Filtering (PCF)"), wxDefaultPosition, wxDefaultSize, std::size(shadow_pcf_choices), shadow_pcf_choices, 3, wxRA_SPECIFY_COLS);
-		m_shadow_pcf_quality->SetToolTip(_("Widens the shadow map filtering kernel for softer shadow edges. Native is whatever the game's own hardware PCF does (usually a single 2x2 tap); 3x3/5x5 sample more taps around each shadow lookup."));
-		m_shadow_pcf_quality->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
-			GetConfig().shadow_pcf_quality = event.GetSelection();
+	{
+		// Faro Global Enhancements: master switch plus per-effect toggles that
+		// apply to every game without per-title graphic packs (see
+		// CemuConfig.h). Render support lands in phases (SSAO/SSR); until
+		// then these only persist the settings.
+		auto box = new wxStaticBox(graphics_panel, wxID_ANY, _("Faro Global Enhancements"));
+		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
+
+		auto updateFaroEnables = [this]() {
+			const bool on = GetConfig().faro_postfx_enabled;
+			m_faro_ssao->Enable(on);
+			m_faro_ssao_intensity->Enable(on && GetConfig().faro_ssao_enabled);
+			m_faro_ssao_quality->Enable(on && GetConfig().faro_ssao_enabled);
+			m_faro_ssr->Enable(on);
+			m_faro_ssr_intensity->Enable(on && GetConfig().faro_ssr_enabled);
+		};
+
+		m_faro_postfx = new wxCheckBox(graphics_panel, wxID_ANY, _("Enable global post-processing (SSAO/SSR)"));
+		m_faro_postfx->SetToolTip(_("Master switch for Faro's global enhancements. Applies to every game without per-title graphic packs."));
+		m_faro_postfx->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_postfx_enabled = event.IsChecked();
+			updateFaroEnables();
 		});
-		graphics_panel_sizer->Add(m_shadow_pcf_quality, 0, wxALL | wxEXPAND, 5);
+		box_sizer->Add(m_faro_postfx, 0, wxALL, 5);
+
+		m_faro_ssao = new wxCheckBox(graphics_panel, wxID_ANY, _("SSAO (screen-space ambient occlusion)"));
+		m_faro_ssao->SetToolTip(_("Contact shadows and crevice darkening from the depth buffer (XeGTAO)."));
+		m_faro_ssao->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_ssao_enabled = event.IsChecked();
+			updateFaroEnables();
+		});
+		box_sizer->Add(m_faro_ssao, 0, wxALL, 5);
+
+		auto ssaoRow = new wxBoxSizer(wxHORIZONTAL);
+		ssaoRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("SSAO intensity  ")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_ssao_intensity = new wxSlider(graphics_panel, wxID_ANY, 60, 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_ssao_intensity->SetToolTip(_("SSAO strength 0-100."));
+		m_faro_ssao_intensity->Bind(wxEVT_SLIDER, [](wxCommandEvent& event) {
+			GetConfig().faro_ssao_intensity = event.GetInt();
+		});
+		ssaoRow->Add(m_faro_ssao_intensity, 1, wxEXPAND | wxRIGHT, 5);
+		box_sizer->Add(ssaoRow, 0, wxEXPAND | wxALL, 5);
+
+		wxString faro_ssao_quality_choices[] = { _("Low"), _("Medium"), _("High") };
+		m_faro_ssao_quality = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(faro_ssao_quality_choices), faro_ssao_quality_choices);
+		m_faro_ssao_quality->SetToolTip(_("SSAO quality preset. Higher costs more GPU time."));
+		m_faro_ssao_quality->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+			GetConfig().faro_ssao_quality = event.GetSelection();
+		});
+		box_sizer->Add(m_faro_ssao_quality, 0, wxALL | wxLEFT, 20);
+
+		m_faro_ssr = new wxCheckBox(graphics_panel, wxID_ANY, _("SSR (screen-space reflections)"));
+		m_faro_ssr->SetToolTip(_("Raymarched reflections. Reflects everything visible (no material info); can artifact on some titles - disable per game if so."));
+		m_faro_ssr->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_ssr_enabled = event.IsChecked();
+			updateFaroEnables();
+		});
+		box_sizer->Add(m_faro_ssr, 0, wxALL, 5);
+
+		auto ssrRow = new wxBoxSizer(wxHORIZONTAL);
+		ssrRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("SSR intensity  ")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_ssr_intensity = new wxSlider(graphics_panel, wxID_ANY, 50, 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_ssr_intensity->SetToolTip(_("Reflection strength 0-100."));
+		m_faro_ssr_intensity->Bind(wxEVT_SLIDER, [](wxCommandEvent& event) {
+			GetConfig().faro_ssr_intensity = event.GetInt();
+		});
+		ssrRow->Add(m_faro_ssr_intensity, 1, wxEXPAND | wxRIGHT, 5);
+		box_sizer->Add(ssrRow, 0, wxEXPAND | wxALL, 5);
+
+		graphics_panel_sizer->Add(box_sizer, 0, wxALL | wxEXPAND, 5);
+		updateFaroEnables();
 	}
 
 	{
@@ -1213,6 +1287,7 @@ void GeneralSettings2::StoreConfig()
 #endif
 #if BOOST_OS_WINDOWS
 	wxGuiConfig.msw_theme = m_msw_theme->GetSelection();
+	wxGuiConfig.msw_backdrop = m_msw_backdrop->GetSelection();
 #endif
 	config.play_boot_sound = m_play_boot_sound->IsChecked();
 	config.disable_screensaver = m_disable_screensaver->IsChecked();
@@ -1977,6 +2052,7 @@ void GeneralSettings2::ApplyConfig()
 	m_play_boot_sound->SetValue(config.play_boot_sound);
 #if BOOST_OS_WINDOWS
 	m_msw_theme->SetSelection(wxGUIconfig.msw_theme);
+	m_msw_backdrop->SetSelection(wxGUIconfig.msw_backdrop);
 #endif
 #if BOOST_OS_LINUX && defined(ENABLE_FERAL_GAMEMODE)
     	m_feral_gamemode->SetValue(wxGUIconfig.feral_gamemode);
@@ -2053,11 +2129,27 @@ void GeneralSettings2::ApplyConfig()
 		if (forceAniso < CemuConfig::kForceAnisoOff || forceAniso > CemuConfig::kForceAniso16x)
 			forceAniso = CemuConfig::kForceAnisoOff;
 		m_force_anisotropic_level->SetSelection(forceAniso);
+	}
 
-		sint32 shadowPcf = config.shadow_pcf_quality;
-		if (shadowPcf < CemuConfig::kShadowPcfNative || shadowPcf > CemuConfig::kShadowPcf5x5)
-			shadowPcf = CemuConfig::kShadowPcfNative;
-		m_shadow_pcf_quality->SetSelection(shadowPcf);
+	// Faro Global Enhancements (see construction above)
+	m_faro_postfx->SetValue(config.faro_postfx_enabled);
+	m_faro_ssao->SetValue(config.faro_ssao_enabled);
+	m_faro_ssao_intensity->SetValue(config.faro_ssao_intensity);
+	{
+		sint32 q = config.faro_ssao_quality;
+		if (q < 0 || q > 2)
+			q = 1;
+		m_faro_ssao_quality->SetSelection(q);
+	}
+	m_faro_ssr->SetValue(config.faro_ssr_enabled);
+	m_faro_ssr_intensity->SetValue(config.faro_ssr_intensity);
+	{
+		const bool on = config.faro_postfx_enabled;
+		m_faro_ssao->Enable(on);
+		m_faro_ssao_intensity->Enable(on && config.faro_ssao_enabled);
+		m_faro_ssao_quality->Enable(on && config.faro_ssao_enabled);
+		m_faro_ssr->Enable(on);
+		m_faro_ssr_intensity->Enable(on && config.faro_ssr_enabled);
 	}
 
 	m_fullscreen_scaling->SetSelection(config.fullscreen_scaling);

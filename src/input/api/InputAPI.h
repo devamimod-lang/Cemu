@@ -13,6 +13,7 @@ namespace InputAPI
 		DSUClient,
 		GameCube,
 		Wiimote,
+		Mouse,
 
 		WGIGamepad,
 		WGIRawController,
@@ -26,6 +27,8 @@ namespace InputAPI
 		{
 		case Keyboard:
 			return "Keyboard";
+		case Mouse:
+			return "Mouse";
 		case DirectInput:
 			return "DirectInput";
 		case XInput:
@@ -53,6 +56,8 @@ namespace InputAPI
 	{
 		if (str == to_string(Keyboard))
 			return Keyboard;
+		else if (str == to_string(Mouse))
+			return Mouse;
 		else if (str == to_string(DirectInput))
 			return DirectInput;
 		else if (str == to_string(XInput))

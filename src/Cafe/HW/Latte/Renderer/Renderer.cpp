@@ -3,6 +3,7 @@
 
 #include "config/CemuConfig.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
+#include "Cemu/Logging/CemuLogging.h"
 
 #include <imgui.h>
 #include "imgui/imgui_extension.h"
@@ -59,6 +60,68 @@ void Renderer::Shutdown()
 	ImGui::DestroyContext(imguiPadContext);
     ImGui_ClearFonts();
 	delete imguiFontAtlas;
+}
+
+void Renderer::CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight)
+{
+	// Faro Global Enhancements: hysteresis against single-frame "misses" -
+	// FindSceneDepthViewForSize resolves by "most recently touched view of
+	// this exact size", and ApplyCurrentState touches many depth views per
+	// frame (shadow maps, minimaps, UI...). If any OTHER pass happens to
+	// share the scene's own output size and gets bound AFTER the real scene
+	// within the same frame, it briefly wins that race and this search comes
+	// up empty (or matches the wrong view) for exactly one frame - even
+	// though the real scene depth is still alive and about to win again next
+	// frame. Without this, GTAO/GI/SSR (all gated on HasCapturedDepth(), with
+	// zero smoothing of their own) all simultaneously blink off for that one
+	// frame - confirmed via user testing as reflections/SSAO/GI "apareciendo
+	// y desapareciendo" in fast, repeated bursts. Bridging a short streak of
+	// misses with the last confirmed view (kept alive only while it's still
+	// genuinely tracked - see IsDepthViewStillTracked) smooths this over
+	// without touching the underlying MRU search at all.
+	constexpr uint32 kDepthCaptureGraceFrames = 4;
+
+	LatteTextureView* depthView = LatteMRT::FindSceneDepthViewForSize(outputWidth, outputHeight);
+	bool freshMatch = false;
+	uint32 w = 0, h = 0;
+	if (depthView && depthView->baseTexture)
+	{
+		w = (uint32)depthView->baseTexture->width;
+		h = (uint32)depthView->baseTexture->height;
+		freshMatch = (w > 0 && h > 0);
+	}
+
+	bool valid;
+	if (freshMatch)
+	{
+		m_depthCaptureView = depthView;
+		m_depthCaptureWidth = w;
+		m_depthCaptureHeight = h;
+		m_depthCaptureMissStreak = 0;
+		valid = true;
+	}
+	else
+	{
+		m_depthCaptureMissStreak++;
+		bool stillAlive = m_depthCaptureView && LatteMRT::IsDepthViewStillTracked(m_depthCaptureView);
+		valid = stillAlive && m_depthCaptureMissStreak <= kDepthCaptureGraceFrames;
+		if (!valid)
+		{
+			m_depthCaptureView = nullptr;
+			m_depthCaptureWidth = 0;
+			m_depthCaptureHeight = 0;
+		}
+	}
+	m_depthCaptureValid = valid;
+	// log transitions only, never per-frame
+	if (valid != m_depthCaptureLoggedValid)
+	{
+		m_depthCaptureLoggedValid = valid;
+		if (valid)
+			cemuLog_log(LogType::Force, "Faro depth capture: valid depth {}x{} for post FX", m_depthCaptureWidth, m_depthCaptureHeight);
+		else
+			cemuLog_log(LogType::Force, "Faro depth capture: no depth attachment at output time, post FX depth passes will fall back");
+	}
 }
 
 bool Renderer::ImguiBegin(bool mainWindow)

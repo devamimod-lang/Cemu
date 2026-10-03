@@ -145,6 +145,30 @@ public:
 	static void GetCurrentTaaJitter(float* jitter);
 	static void GetVirtualViewportDimensions(sint32& width, sint32& height); // returns the width and height of the current GPU viewport (unaffected by graphic pack rules)
 
+	// Faro Global Enhancements: Renderer::CaptureDepthForPostFX (called once
+	// per frame, at backbuffer-copy time) originally read GetDepthAttachment()
+	// directly - but by the time the scene reaches the final backbuffer copy,
+	// the "currently bound" depth attachment is whatever was LAST bound (often
+	// null, since UI/HUD compositing draws typically don't use a depth
+	// buffer), essentially never the main 3D scene's own depth. Confirmed via
+	// testing: zero "Faro depth capture: valid depth" log lines ever appeared
+	// with the feature enabled. Fixed the same way as an earlier, since-removed
+	// SSAO experiment in this codebase: remember every DISTINCT depth view
+	// ever bound (persistent across frames, pruned only via
+	// NotifyTextureDeletion when the texture is actually evicted), and at
+	// capture time hand back whichever one matches the final output
+	// resolution exactly (a shadow map or UI depth buffer essentially never
+	// matches the main scene's render resolution).
+	static void NotifyDepthAttachmentUsed(LatteTextureView* view);
+	static LatteTextureView* FindSceneDepthViewForSize(sint32 width, sint32 height);
+	// Faro Global Enhancements: lets Renderer::CaptureDepthForPostFX safely
+	// extend a stale-but-still-alive depth view's validity across a brief
+	// miss streak (see that method's own comment) without ever risking a
+	// dangling pointer - returns false once the view has actually been
+	// pruned (NotifyTextureDeletion), true otherwise, including in frames
+	// where it simply didn't win FindSceneDepthViewForSize's MRU race.
+	static bool IsDepthViewStillTracked(LatteTextureView* view);
+
 	// todo - move this into FBO destructor (?)
 	static void DeleteCachedFBO(LatteCachedFBO* cfbo);
 

@@ -149,10 +149,26 @@ public:
 												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
 												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
 	virtual bool DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOutputShader* upscaleShader,
-												RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
-												RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
-												bool useLinearTexFilter, sint32 imageX, sint32 imageY,
-												sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+											RendererOutputShader* resolveShader, RendererOutputShader* fxaaShader,
+											RendererOutputShader* smaaEdgeShader, RendererOutputShader* smaaBlendShader, RendererOutputShader* smaaNeighborhoodShader,
+											bool useLinearTexFilter, sint32 imageX, sint32 imageY,
+											sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) { return false; }
+
+	// Faro Global Enhancements (Phase 0): depth probe for SSAO/GI/SSR.
+	// outputWidth/outputHeight are the final backbuffer copy's own resolution
+	// (see LatteRenderTarget_copyToBackbuffer's call site) - used to pick the
+	// tracked depth view matching the main scene's own render resolution (see
+	// LatteMRT::FindSceneDepthViewForSize's doc comment for why reading
+	// "whatever's currently bound" at this point in the frame doesn't work:
+	// by backbuffer-copy time the depth attachment is typically already
+	// unbound or belongs to an unrelated UI/shadow-map pass). Recording only -
+	// creates no views/barriers and touches no GPU state, so it cannot change
+	// rendering. Best-effort: no matching tracked view yields invalid, and
+	// consumers must fall back gracefully (current behavior).
+	void CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight);
+	LatteTextureView* GetCapturedDepthView() const { return m_depthCaptureView; }
+	bool HasCapturedDepth() const { return m_depthCaptureValid; }
+	void GetCapturedDepthSize(uint32& w, uint32& h) const { w = m_depthCaptureWidth; h = m_depthCaptureHeight; }
 
 	virtual bool BeginFrame(bool mainWindow) = 0;
 
@@ -265,6 +281,21 @@ protected:
 	ImFontAtlas* imguiFontAtlas{};
 	ImGuiContext* imguiTVContext{};
 	ImGuiContext* imguiPadContext{};
+
+	// Faro depth probe state (see CaptureDepthForPostFX above)
+	LatteTextureView* m_depthCaptureView = nullptr;
+	uint32 m_depthCaptureWidth = 0;
+	uint32 m_depthCaptureHeight = 0;
+	bool m_depthCaptureValid = false;
+	bool m_depthCaptureLoggedValid = false;
+	// Faro Global Enhancements: hysteresis counter against single-frame
+	// "misses" from LatteMRT::FindSceneDepthViewForSize - see
+	// CaptureDepthForPostFX's own comment for why a miss doesn't always mean
+	// the scene's depth is genuinely gone (another same-size pass can
+	// briefly steal the most-recently-used slot for one frame). Counts
+	// consecutive misses since the last confirmed match; reset to 0 on any
+	// fresh match.
+	uint32 m_depthCaptureMissStreak = 0;
 
 #if BOOST_OS_WINDOWS
 	std::unique_ptr<DXGIWrapper> m_dxgi_wrapper{};

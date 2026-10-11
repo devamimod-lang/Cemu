@@ -588,7 +588,10 @@ struct CemuConfig
 		kFaroDebugConfidence = 3,
 		kFaroDebugMarchRadius = 4,
 		kFaroDebugDenoisedAo = 5,
-		kFaroDebugMotionField = 6,
+		// Fraction of RCAS's maximum sharpening lobe actually in play. Black
+		// means RCAS found no local contrast to sharpen, so the sharpness
+		// slider cannot do anything no matter where it is set.
+		kFaroDebugRcasLobe = 6,
 	};
 	ConfigValue<sint32> faro_debug_view{kFaroDebugOff};
 

@@ -84,7 +84,14 @@ private:
 	// Faro FSR1: RCAS controls - only enabled while FSR 1.0 is the active
 	// upscale filter (RCAS is FSR1's own second pass).
 	wxSlider* m_fsr_rcas_sharpness;
+	// A member, not a local captured by the slider's handler: the settings
+	// reload path has to refresh this label too, or the figure goes stale.
+	wxStaticText* m_fsr_rcas_sharpness_text;
 	wxCheckBox* m_fsr_rcas_denoise;
+	// AMD's stored scale counts stops of sharpness REDUCTION, so it runs
+	// backwards from how the control reads. This renders it as a sharpness
+	// percentage that rises with the slider.
+	static wxString FormatRcasSharpness(sint32 stops);
 	wxRadioBox* m_force_anisotropic_level;
 	wxCheckBox *m_faro_postfx, *m_faro_ssao;
 	wxCheckBox* m_faro_depth_snapshot;

@@ -521,6 +521,27 @@ R"( // FSR1 RCAS (Robust Contrast-Adaptive Sharpening) - pass 2 of 2. Faithful
      // Apply noise removal (FSR_RCAS_DENOISE).
      if (faroFsrParams.y > 0.5)
          lobe *= nz;
+
+     // Debug view: how much of RCAS's maximum sharpening lobe is actually in
+     // play, as a fraction. Built because the sharpness slider was reported as
+     // making no visible difference between its extremes, and the plumbing
+     // checked out - the uniform reaches this shader and the maths matches
+     // AMD's ffx_fsr1.h. That leaves "there is nothing here to sharpen" as the
+     // hypothesis, and this is the only way to see it rather than argue it.
+     //
+     // Black means the 5-tap cross found no local contrast, so scaling the
+     // lobe by the slider scales zero and the control genuinely cannot do
+     // anything. Bright means RCAS has signal and the slider must have an
+     // effect, which would point the search somewhere else entirely.
+     //
+     // Read it with SSAO off: the GTAO pass runs after RCAS and folds
+     // occlusion into whatever colour this pass produced, including this view.
+     if (int(faroDebugParams.x + 0.5) == 6)
+     {
+         float lobeFraction = clamp(-lobe / FSR_RCAS_LIMIT, 0.0, 1.0);
+         colorOut0 = vec4(vec3(lobeFraction), 1.0);
+         return;
+     }
      // Resolve, which needs the medium precision rcp approximation to avoid
      // visible tonality changes.
      float rcpL = APrxMedRcpF1(4.0 * lobe + 1.0);

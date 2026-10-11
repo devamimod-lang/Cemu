@@ -563,10 +563,17 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		{
 			auto* rcasSizer = new wxBoxSizer(wxHORIZONTAL);
 			rcasSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("FSR sharpness")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			// Slider runs "sharpest on the right": AMD's scale counts stops of
-			// REDUCTION, so it reads backwards as a sharpness control. The
-			// value shown and stored stays AMD's own, the slider is just
-			// inverted for presentation.
+			// Slider runs "sharpest on the right". AMD's stored scale counts
+			// stops of REDUCTION (0.00 = sharpest, and every whole number
+			// HALVES the sharpening), so it reads backwards as a sharpness
+			// control and the slider is inverted against it.
+			//
+			// The number beside it is a sharpness PERCENTAGE, not AMD's stops.
+			// It used to show the stored value, which meant it read 2.00 at the
+			// soft end and 0.00 at the sharp end - the figure went DOWN as the
+			// slider went towards "sharper", directly contradicting this
+			// control's own tooltip. That is how this setting ended up parked
+			// at its softest value with the sharpening effectively off.
 			m_fsr_rcas_sharpness = new wxSlider(graphics_panel, wxID_ANY,
 				CemuConfig::kFsrRcasSharpnessMax - GetConfig().fsr_rcas_sharpness.GetValue(),
 				CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax);
@@ -574,12 +581,13 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			m_fsr_rcas_sharpness->Enable(GetConfig().upscale_filter == kFsr1Filter);
 			rcasSizer->Add(m_fsr_rcas_sharpness, 1, wxALL | wxEXPAND, 5);
 
-			auto* rcasText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%.2f", GetConfig().fsr_rcas_sharpness.GetValue() / 100.0f));
-			rcasSizer->Add(rcasText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			m_fsr_rcas_sharpness->Bind(wxEVT_SLIDER, [rcasText](wxCommandEvent& event) {
+			m_fsr_rcas_sharpness_text = new wxStaticText(graphics_panel, wxID_ANY,
+				FormatRcasSharpness(GetConfig().fsr_rcas_sharpness.GetValue()));
+			rcasSizer->Add(m_fsr_rcas_sharpness_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_fsr_rcas_sharpness->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
 				const sint32 stops = CemuConfig::kFsrRcasSharpnessMax - event.GetInt();
 				GetConfig().fsr_rcas_sharpness = stops;
-				rcasText->SetLabel(wxString::Format("%.2f", stops / 100.0f));
+				m_fsr_rcas_sharpness_text->SetLabel(FormatRcasSharpness(stops));
 			});
 
 			graphics_panel_sizer->Add(rcasSizer, 0, wxEXPAND);
@@ -692,7 +700,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		{
 			auto* dbgSizer = new wxBoxSizer(wxHORIZONTAL);
 			dbgSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Debug view")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter") };
+			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter"), _("FSR1 sharpening lobe") };
 			m_faro_debug_view = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(dbgChoices), dbgChoices);
 			m_faro_debug_view->SetToolTip(_("Shows an intermediate buffer of the ambient-occlusion chain instead of the game image, to see which stage is unstable. 'Raw depth' is remapped so distant geometry is visible."));
 			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, 6));
@@ -1282,6 +1290,17 @@ wxPanel* GeneralSettings2::AddDebugPage(wxNotebook* notebook)
 	panel->SetSizerAndFit(debug_panel_sizer);
 
 	return panel;
+}
+
+// AMD's RCAS scale is "stops of reduction": 0.00 is sharpest and every whole
+// number halves the sharpening. Shown as a percentage that rises with the
+// slider, because showing the stored figure made the number fall as the
+// control moved towards "sharper".
+wxString GeneralSettings2::FormatRcasSharpness(sint32 stops)
+{
+	const sint32 clamped = std::clamp<sint32>(stops, CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax);
+	const sint32 percent = ((CemuConfig::kFsrRcasSharpnessMax - clamped) * 100) / CemuConfig::kFsrRcasSharpnessMax;
+	return wxString::Format("%d%%", percent);
 }
 
 GeneralSettings2::GeneralSettings2(wxWindow* parent, bool game_launched)
@@ -2186,6 +2205,10 @@ void GeneralSettings2::ApplyConfig()
 	{
 		const sint32 stops = std::clamp<sint32>(config.fsr_rcas_sharpness, CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax);
 		m_fsr_rcas_sharpness->SetValue(CemuConfig::kFsrRcasSharpnessMax - stops);
+		// The label has to be refreshed here too. It used to be a local the
+		// slider's own handler captured, so this path moved the slider and left
+		// the figure beside it showing whatever the previous config had.
+		m_fsr_rcas_sharpness_text->SetLabel(FormatRcasSharpness(stops));
 		m_fsr_rcas_denoise->SetValue(config.fsr_rcas_denoise);
 		const bool fsrActive = config.upscale_filter == kFsr1Filter;
 		m_fsr_rcas_sharpness->Enable(fsrActive);

@@ -41,6 +41,9 @@
 #include "util/helpers/SystemException.h"
 #include "util/helpers/helpers.h"
 #include <wx/mstream.h>
+#include <wx/toolbar.h>
+#include <wx/graphics.h>
+#include <wx/settings.h>
 #include "Cafe/HW/Latte/Renderer/Vulkan/VsyncDriver.h"
 #if BOOST_OS_LINUX && defined(ENABLE_FERAL_GAMEMODE)
 #include <gamemode_client.h>
@@ -2042,6 +2045,12 @@ void MainWindow::SetFullScreen(bool state)
 		m_menu_visible = false; // menu gets always disabled by wxFULLSCREEN_NOMENUBAR
 	else
 		SetMenuVisible(true);
+
+	// Faro: the icon bar is a separate window from the menu, so
+	// wxFULLSCREEN_NOMENUBAR does not touch it - without this it stayed drawn
+	// across the top of a fullscreen game.
+	if (m_toolBar)
+		m_toolBar->Show(!state);
 }
 
 void MainWindow::EndEmulation() // unfinished - memory leaks and crashes after repeated use (after 3x usually)
@@ -2420,6 +2429,155 @@ void MainWindow::OnHelpUpdate(wxCommandEvent& event)
 	test.ShowModal();
 }
 
+// Prefers one of the project's own embedded icons when there is a sensible
+// match, and falls back to wxArtProvider's native stock art otherwise. The
+// point is to add no new image assets: the embedded set has no "stop" or "open"
+// glyph, and inventing one would look worse next to the platform's own icons
+// than simply using them.
+wxBitmap MainWindow::MakeToolIcon(ToolGlyph glyph) const
+{
+	// Everything below is expressed in a 0..1 box and multiplied by the final
+	// size, so the same code produces a crisp icon at 100% and at 200% scaling
+	// instead of a resampled one.
+	const int size = FromDIP(22);
+	const double s = (double)size;
+	const double stroke = std::max(1.5, s / 11.0);
+
+	wxBitmap bmp(size, size, 32);
+	bmp.UseAlpha();
+	{
+		wxMemoryDC dc(bmp);
+		dc.SetBackground(*wxTRANSPARENT_BRUSH);
+		dc.Clear();
+
+		std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
+		if (!gc)
+			return bmp;
+		gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
+
+		// Follows the theme rather than being hardcoded, so the glyphs stay
+		// legible under a dark Windows theme instead of turning into black on
+		// near-black. Stop is the one exception: it is the only destructive
+		// action on the bar and reads faster with its own colour.
+		const wxColour ink = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
+		const wxColour accent(214, 69, 69);
+		const wxColour colour = (glyph == ToolGlyph::Stop) ? accent : ink;
+
+		wxGraphicsPen pen = gc->CreatePen(wxGraphicsPenInfo(colour, stroke)
+			.Cap(wxCAP_ROUND).Join(wxJOIN_ROUND));
+		gc->SetPen(pen);
+		gc->SetBrush(*wxTRANSPARENT_BRUSH);
+
+		auto line = [&](double x1, double y1, double x2, double y2) {
+			gc->StrokeLine(x1 * s, y1 * s, x2 * s, y2 * s);
+		};
+		auto dot = [&](double cx, double cy, double r) {
+			gc->SetBrush(gc->CreateBrush(wxBrush(colour)));
+			gc->DrawEllipse((cx - r) * s, (cy - r) * s, 2 * r * s, 2 * r * s);
+			gc->SetBrush(*wxTRANSPARENT_BRUSH);
+		};
+
+		switch (glyph)
+		{
+		case ToolGlyph::Stop:
+			// Filled rounded square - the universal stop shape.
+			gc->SetBrush(gc->CreateBrush(wxBrush(colour)));
+			gc->DrawRoundedRectangle(0.28 * s, 0.28 * s, 0.44 * s, 0.44 * s, 0.07 * s);
+			break;
+		case ToolGlyph::Load:
+			// Arrow descending into a tray: "bring something in".
+			line(0.5, 0.20, 0.5, 0.58);
+			line(0.35, 0.44, 0.5, 0.59);
+			line(0.65, 0.44, 0.5, 0.59);
+			line(0.20, 0.68, 0.20, 0.80);
+			line(0.20, 0.80, 0.80, 0.80);
+			line(0.80, 0.80, 0.80, 0.68);
+			break;
+		case ToolGlyph::Install:
+			// Plus. Reads as "add" without competing with the Load arrow.
+			line(0.5, 0.24, 0.5, 0.76);
+			line(0.24, 0.5, 0.76, 0.5);
+			break;
+		case ToolGlyph::Packs:
+			// Stacked layers.
+			line(0.5, 0.20, 0.82, 0.37);
+			line(0.82, 0.37, 0.5, 0.54);
+			line(0.5, 0.54, 0.18, 0.37);
+			line(0.18, 0.37, 0.5, 0.20);
+			line(0.18, 0.58, 0.5, 0.75);
+			line(0.5, 0.75, 0.82, 0.58);
+			break;
+		case ToolGlyph::Settings:
+			// Sliders, which is what this actually opens - a cogwheel would
+			// imply system configuration.
+			line(0.18, 0.36, 0.82, 0.36);
+			line(0.18, 0.64, 0.82, 0.64);
+			dot(0.64, 0.36, 0.095);
+			dot(0.36, 0.64, 0.095);
+			break;
+		case ToolGlyph::Input:
+			// Controller body with two sticks.
+			gc->DrawRoundedRectangle(0.14 * s, 0.33 * s, 0.72 * s, 0.34 * s, 0.17 * s);
+			dot(0.34, 0.50, 0.075);
+			dot(0.66, 0.50, 0.075);
+			break;
+		case ToolGlyph::Titles:
+			// Grid, for a library.
+			gc->DrawRoundedRectangle(0.20 * s, 0.20 * s, 0.26 * s, 0.26 * s, 0.05 * s);
+			gc->DrawRoundedRectangle(0.54 * s, 0.20 * s, 0.26 * s, 0.26 * s, 0.05 * s);
+			gc->DrawRoundedRectangle(0.20 * s, 0.54 * s, 0.26 * s, 0.26 * s, 0.05 * s);
+			gc->DrawRoundedRectangle(0.54 * s, 0.54 * s, 0.26 * s, 0.26 * s, 0.05 * s);
+			break;
+		}
+	}
+	return bmp;
+}
+
+void MainWindow::RecreateToolBar()
+{
+	// Tools reuse the MENU ids on purpose. wxEVT_TOOL is an alias of
+	// wxEVT_MENU, so every tool below is dispatched by the handlers the menu
+	// items already use - no second code path to keep in sync, and the
+	// keyboard shortcuts keep working unchanged.
+	if (m_toolBar)
+	{
+		SetToolBar(nullptr); // detaches, then deletes the old bar
+		m_toolBar = nullptr;
+	}
+
+	m_toolBar = CreateToolBar(wxTB_HORIZONTAL | wxTB_TEXT | wxTB_FLAT | wxTB_NODIVIDER);
+	m_toolBar->SetToolBitmapSize(FromDIP(wxSize(22, 22)));
+
+	if (m_game_launched)
+	{
+		// Stop first and on its own: while a game is running it is the action
+		// being looked for, and the whole reason this bar exists is to not have
+		// to quit Cemu to switch titles.
+		m_toolBar->AddTool(MAINFRAME_MENU_ID_FILE_END_EMULATION, _("Stop"),
+			MakeToolIcon(ToolGlyph::Stop), _("Stop emulation and return to the game list"));
+	}
+	else
+	{
+		m_toolBar->AddTool(MAINFRAME_MENU_ID_FILE_LOAD, _("Load"),
+			MakeToolIcon(ToolGlyph::Load), _("Load a game from a file"));
+		m_toolBar->AddTool(MAINFRAME_MENU_ID_FILE_INSTALL_UPDATE, _("Install"),
+			MakeToolIcon(ToolGlyph::Install), _("Install a game title, update or DLC"));
+	}
+
+	m_toolBar->AddSeparator();
+	m_toolBar->AddTool(MAINFRAME_MENU_ID_OPTIONS_GRAPHIC_PACKS2, _("Graphic packs"),
+		MakeToolIcon(ToolGlyph::Packs), _("Open the graphic pack manager"));
+	m_toolBar->AddTool(MAINFRAME_MENU_ID_OPTIONS_GENERAL2, _("Settings"),
+		MakeToolIcon(ToolGlyph::Settings), _("Open the general settings"));
+	m_toolBar->AddTool(MAINFRAME_MENU_ID_OPTIONS_INPUT, _("Input"),
+		MakeToolIcon(ToolGlyph::Input), _("Open the input settings"));
+	m_toolBar->AddSeparator();
+	m_toolBar->AddTool(MAINFRAME_MENU_ID_TOOLS_TITLE_MANAGER, _("Titles"),
+		MakeToolIcon(ToolGlyph::Titles), _("Open the title manager"));
+
+	m_toolBar->Realize();
+}
+
 void MainWindow::RecreateMenu()
 {
 	if (m_menuBar)
@@ -2694,9 +2852,21 @@ void MainWindow::RecreateMenu()
 		UpdateNFCMenu();
 	}
 
+	// Faro: rebuilt from here rather than from each of RecreateMenu's seven
+	// call sites. The bar depends on exactly the same state the menu does
+	// (whether a game is running), so tying them together is what keeps them
+	// from drifting apart when a new call site is added.
+	RecreateToolBar();
+
 	// hide new menu in fullscreen
 	if (IsFullScreen())
+	{
 		SetMenuVisible(false);
+		// The bar has to go too. It is not part of the menu, so hiding the menu
+		// left a strip of buttons across the top of a fullscreen game.
+		if (m_toolBar)
+			m_toolBar->Show(false);
+	}
 }
 
 void MainWindow::UpdateChildWindowTitleRunningState()

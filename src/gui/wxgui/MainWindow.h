@@ -173,6 +173,29 @@ public:
 private:
 	bool FullscreenEnabled() const;
 	void RecreateMenu();
+	// Faro: the icon bar under the menu. Rebuilt alongside the menu because it
+	// is state-aware in the same way - which actions exist depends on whether a
+	// game is running.
+	void RecreateToolBar();
+	// Faro: the toolbar's icons are drawn rather than loaded. The platform's
+	// stock art and this project's own .ico set are both dated, FontAwesome is
+	// embedded but only reachable from ImGui (it is handed over as an in-memory
+	// TTF, and getting it into a wxFont needs AddFontMemResourceEx on Windows
+	// and a different path elsewhere), and shipping a new icon set means new
+	// binary assets. Drawing a handful of geometric glyphs with
+	// wxGraphicsContext costs none of that, stays crisp at any DPI, and follows
+	// the system theme's own colours.
+	enum class ToolGlyph
+	{
+		Stop,
+		Load,
+		Install,
+		Packs,
+		Settings,
+		Input,
+		Titles,
+	};
+	wxBitmap MakeToolIcon(ToolGlyph glyph) const;
 	void UpdateChildWindowTitleRunningState();
 	static wxString GetInitialWindowTitle();
 
@@ -247,6 +270,9 @@ private:
 
 	// menu
 	wxMenuBar* m_menuBar{};
+	// Faro: owned by the frame (wxFrame::CreateToolBar docks and deletes it),
+	// so this is a borrowed pointer kept only to rebuild it.
+	wxToolBar* m_toolBar{};
 
 	// file
 	wxMenu* m_fileMenu{};

@@ -103,6 +103,54 @@ T get_prev_sibling(const T element)
 
 void update_slider_text(wxCommandEvent& event, const wxFormatString& format = "%d%%");
 
+// Faro: minimal line-art icons drawn with wxGraphicsContext instead of loaded
+// from image files.
+//
+// The platform's stock art and this project's own .ico set both look dated;
+// FontAwesome is embedded but only reachable from ImGui, which takes it as an
+// in-memory TTF (getting that into a wxFont needs AddFontMemResourceEx on
+// Windows and a different path elsewhere); and shipping a new icon set means
+// new binary assets to carry. Drawing them costs none of that: each glyph is
+// expressed in a 0..1 box and multiplied by the requested size, so it is crisp
+// at any display scaling rather than resampled, and the colour is passed in so
+// the caller can follow the system theme.
+enum class FaroGlyph
+{
+	// Main window toolbar
+	Stop,
+	Load,
+	Install,
+	Packs,
+	Settings,
+	Input,
+	Titles,
+	// Settings dialog tabs
+	TabGeneral,
+	TabGraphics,
+	TabAudio,
+	TabOverlay,
+	TabAccount,
+	TabDebug,
+};
+
+wxBitmap FaroDrawGlyph(FaroGlyph glyph, int sizePx, const wxColour& colour);
+// The theme's own foreground, so the glyphs stay legible under a dark theme
+// instead of coming out black on near-black.
+wxColour FaroGlyphInkColour();
+
+// Faro: asks DWM to round this window's corners.
+//
+// Windows 11 already rounds top-level windows by default, so this mainly makes
+// the choice explicit and forces the full radius instead of letting DWM pick.
+// It only affects TOP-LEVEL windows: DWM does not round child controls, so the
+// group boxes and panels inside a dialog are unaffected and would have to be
+// custom-drawn to look rounded.
+//
+// A no-op on Windows 10 and on Windows 11 before build 22000, where
+// DwmSetWindowAttribute returns a non-S_OK HRESULT that is deliberately
+// ignored - that failure is itself the fallback (square corners, as before).
+void FaroApplyRoundedCorners(wxWindow* window);
+
 uint32 fix_raw_keycode(uint32 keycode, uint32 raw_flags);
 
 WindowSystem::WindowHandleInfo initHandleContextFromWxWidgetsWindow(wxWindow* wxw);

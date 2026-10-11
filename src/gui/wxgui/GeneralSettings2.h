@@ -8,7 +8,7 @@ class wxCheckBox;
 class wxChoice;
 class wxColourPickerCtrl;
 class wxListBox;
-class wxNotebook;
+class wxBookCtrlBase;
 class wxRadioBox;
 class wxSlider;
 class wxSpinCtrl;
@@ -40,12 +40,12 @@ private:
 	std::vector<GraphicAPI> m_api_map; // map from dropdown index to GraphicsAPISetting, used in HandleGraphicsApiSelection
 
 
-	wxPanel* AddGeneralPage(wxNotebook* notebook);
-	wxPanel* AddGraphicsPage(wxNotebook* notebook);
-	wxPanel* AddAudioPage(wxNotebook* notebook);
-	wxPanel* AddOverlayPage(wxNotebook* notebook);
-	wxPanel* AddAccountPage(wxNotebook* notebook);
-	wxPanel* AddDebugPage(wxNotebook* notebook);
+	wxPanel* AddGeneralPage(wxBookCtrlBase* notebook);
+	wxPanel* AddGraphicsPage(wxBookCtrlBase* notebook);
+	wxPanel* AddAudioPage(wxBookCtrlBase* notebook);
+	wxPanel* AddOverlayPage(wxBookCtrlBase* notebook);
+	wxPanel* AddAccountPage(wxBookCtrlBase* notebook);
+	wxPanel* AddDebugPage(wxBookCtrlBase* notebook);
 
 	// General
 	wxChoice * m_language;
@@ -92,11 +92,14 @@ private:
 	// backwards from how the control reads. This renders it as a sharpness
 	// percentage that rises with the slider.
 	static wxString FormatRcasSharpness(sint32 stops);
+	// Faro: keeps a slider's numeric readout from resizing as the value changes.
+	void SetSliderValueWidth(wxStaticText* text) const;
 	wxRadioBox* m_force_anisotropic_level;
 	wxCheckBox *m_faro_postfx, *m_faro_ssao;
 	wxCheckBox* m_faro_depth_snapshot;
 	wxChoice* m_faro_debug_view;
 	wxSlider *m_faro_ssao_intensity;
+	wxStaticText* m_faro_ssao_intensity_text;
 	wxChoice* m_faro_ssao_quality;
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;

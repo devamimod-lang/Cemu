@@ -409,6 +409,8 @@ MainWindow::MainWindow()
 	HICON hWindowIcon = (HICON)LoadImageA(NULL, "M_WND_ICON16", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
 	SendMessage(this->GetHWND(), WM_SETICON, ICON_SMALL, (LPARAM)hWindowIcon);
 
+	FaroApplyRoundedCorners(this);
+
 	// Windows 11 system backdrop (Mica/Acrylic/Mica Alt) - see wxCemuConfig.h's
 	// own MSWBackdropOption doc comment for the enum<->DWM value mapping.
 	// DwmSetWindowAttribute silently fails (non-S_OK HRESULT, which we
@@ -2436,101 +2438,24 @@ void MainWindow::OnHelpUpdate(wxCommandEvent& event)
 // than simply using them.
 wxBitmap MainWindow::MakeToolIcon(ToolGlyph glyph) const
 {
-	// Everything below is expressed in a 0..1 box and multiplied by the final
-	// size, so the same code produces a crisp icon at 100% and at 200% scaling
-	// instead of a resampled one.
-	const int size = FromDIP(22);
-	const double s = (double)size;
-	const double stroke = std::max(1.5, s / 11.0);
-
-	wxBitmap bmp(size, size, 32);
-	bmp.UseAlpha();
+	// The drawing itself lives in wxHelpers so the settings dialog's tab icons
+	// come out of the same painter - see FaroDrawGlyph for why these are drawn
+	// rather than loaded.
+	FaroGlyph g = FaroGlyph::Stop;
+	switch (glyph)
 	{
-		wxMemoryDC dc(bmp);
-		dc.SetBackground(*wxTRANSPARENT_BRUSH);
-		dc.Clear();
-
-		std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
-		if (!gc)
-			return bmp;
-		gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-
-		// Follows the theme rather than being hardcoded, so the glyphs stay
-		// legible under a dark Windows theme instead of turning into black on
-		// near-black. Stop is the one exception: it is the only destructive
-		// action on the bar and reads faster with its own colour.
-		const wxColour ink = wxSystemSettings::GetColour(wxSYS_COLOUR_BTNTEXT);
-		const wxColour accent(214, 69, 69);
-		const wxColour colour = (glyph == ToolGlyph::Stop) ? accent : ink;
-
-		wxGraphicsPen pen = gc->CreatePen(wxGraphicsPenInfo(colour, stroke)
-			.Cap(wxCAP_ROUND).Join(wxJOIN_ROUND));
-		gc->SetPen(pen);
-		gc->SetBrush(*wxTRANSPARENT_BRUSH);
-
-		auto line = [&](double x1, double y1, double x2, double y2) {
-			gc->StrokeLine(x1 * s, y1 * s, x2 * s, y2 * s);
-		};
-		auto dot = [&](double cx, double cy, double r) {
-			gc->SetBrush(gc->CreateBrush(wxBrush(colour)));
-			gc->DrawEllipse((cx - r) * s, (cy - r) * s, 2 * r * s, 2 * r * s);
-			gc->SetBrush(*wxTRANSPARENT_BRUSH);
-		};
-
-		switch (glyph)
-		{
-		case ToolGlyph::Stop:
-			// Filled rounded square - the universal stop shape.
-			gc->SetBrush(gc->CreateBrush(wxBrush(colour)));
-			gc->DrawRoundedRectangle(0.28 * s, 0.28 * s, 0.44 * s, 0.44 * s, 0.07 * s);
-			break;
-		case ToolGlyph::Load:
-			// Arrow descending into a tray: "bring something in".
-			line(0.5, 0.20, 0.5, 0.58);
-			line(0.35, 0.44, 0.5, 0.59);
-			line(0.65, 0.44, 0.5, 0.59);
-			line(0.20, 0.68, 0.20, 0.80);
-			line(0.20, 0.80, 0.80, 0.80);
-			line(0.80, 0.80, 0.80, 0.68);
-			break;
-		case ToolGlyph::Install:
-			// Plus. Reads as "add" without competing with the Load arrow.
-			line(0.5, 0.24, 0.5, 0.76);
-			line(0.24, 0.5, 0.76, 0.5);
-			break;
-		case ToolGlyph::Packs:
-			// Stacked layers.
-			line(0.5, 0.20, 0.82, 0.37);
-			line(0.82, 0.37, 0.5, 0.54);
-			line(0.5, 0.54, 0.18, 0.37);
-			line(0.18, 0.37, 0.5, 0.20);
-			line(0.18, 0.58, 0.5, 0.75);
-			line(0.5, 0.75, 0.82, 0.58);
-			break;
-		case ToolGlyph::Settings:
-			// Sliders, which is what this actually opens - a cogwheel would
-			// imply system configuration.
-			line(0.18, 0.36, 0.82, 0.36);
-			line(0.18, 0.64, 0.82, 0.64);
-			dot(0.64, 0.36, 0.095);
-			dot(0.36, 0.64, 0.095);
-			break;
-		case ToolGlyph::Input:
-			// Controller body with two sticks.
-			gc->DrawRoundedRectangle(0.14 * s, 0.33 * s, 0.72 * s, 0.34 * s, 0.17 * s);
-			dot(0.34, 0.50, 0.075);
-			dot(0.66, 0.50, 0.075);
-			break;
-		case ToolGlyph::Titles:
-			// Grid, for a library.
-			gc->DrawRoundedRectangle(0.20 * s, 0.20 * s, 0.26 * s, 0.26 * s, 0.05 * s);
-			gc->DrawRoundedRectangle(0.54 * s, 0.20 * s, 0.26 * s, 0.26 * s, 0.05 * s);
-			gc->DrawRoundedRectangle(0.20 * s, 0.54 * s, 0.26 * s, 0.26 * s, 0.05 * s);
-			gc->DrawRoundedRectangle(0.54 * s, 0.54 * s, 0.26 * s, 0.26 * s, 0.05 * s);
-			break;
-		}
+	case ToolGlyph::Stop:     g = FaroGlyph::Stop; break;
+	case ToolGlyph::Load:     g = FaroGlyph::Load; break;
+	case ToolGlyph::Install:  g = FaroGlyph::Install; break;
+	case ToolGlyph::Packs:    g = FaroGlyph::Packs; break;
+	case ToolGlyph::Settings: g = FaroGlyph::Settings; break;
+	case ToolGlyph::Input:    g = FaroGlyph::Input; break;
+	case ToolGlyph::Titles:   g = FaroGlyph::Titles; break;
 	}
-	return bmp;
+	// Stop is the only destructive action on the bar, so it keeps its own
+	// colour instead of the theme's foreground.
+	const wxColour colour = (glyph == ToolGlyph::Stop) ? wxColour(214, 69, 69) : FaroGlyphInkColour();
+	return FaroDrawGlyph(g, FromDIP(22), colour);
 }
 
 void MainWindow::RecreateToolBar()

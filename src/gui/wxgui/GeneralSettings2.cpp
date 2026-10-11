@@ -9,6 +9,8 @@
 #include "Cafe/OS/libs/snd_core/ax.h"
 
 #include <wx/collpane.h>
+#include <wx/listbook.h>
+#include <wx/imaglist.h>
 #include <wx/clrpicker.h>
 #include <wx/cshelp.h>
 #include <wx/textctrl.h>
@@ -128,7 +130,7 @@ private:
 	Account m_account;
 };
 
-wxPanel* GeneralSettings2::AddGeneralPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddGeneralPage(wxBookCtrlBase* notebook)
 {
 	auto* panel = new wxPanel(notebook);
 	auto* general_panel_sizer = new wxBoxSizer(wxVERTICAL);
@@ -353,11 +355,30 @@ wxPanel* GeneralSettings2::AddGeneralPage(wxNotebook* notebook)
 	return panel;
 }
 
-wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 {
 	// Graphics page
 	auto graphics_panel = new wxPanel(notebook);
 	auto graphics_panel_sizer = new wxBoxSizer(wxVERTICAL);
+
+	// Faro: two group boxes for what used to be nine loose controls added
+	// straight to the page sizer, with no box of their own. They sat between the
+	// "Gamma settings" and "Faro Global Enhancements" boxes, which made the
+	// antialiasing and scaling options read as if they belonged to gamma, and
+	// left the fullscreen scaling control orphaned after the effects box.
+	//
+	// Only the sizer each control is added to changes. Parents, bindings, member
+	// pointers and ApplyConfig are untouched: every control on this page writes
+	// straight to GetConfig() from its own handler (StoreConfig does not deal
+	// with them at all - m_vsync, which was not moved, is the same), and a
+	// setting that silently stops being saved is invisible in the window itself.
+	//
+	// Declared at function scope because the controls that go into them are
+	// created across several separate blocks further down.
+	auto* scalingBox = new wxStaticBox(graphics_panel, wxID_ANY, _("Scaling and filtering"));
+	auto* scalingSizer = new wxStaticBoxSizer(scalingBox, wxVERTICAL);
+	auto* aaBox = new wxStaticBox(graphics_panel, wxID_ANY, _("Antialiasing"));
+	auto* aaSizer = new wxStaticBoxSizer(aaBox, wxVERTICAL);
 
 	{
 		auto box = new wxStaticBox(graphics_panel, wxID_ANY, _("General"));
@@ -490,6 +511,13 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		graphics_panel_sizer->Add(box_sizer, 0, wxEXPAND | wxALL, 5);
 	}
 
+	// Attached here, after the gamma box and before the Faro effects box, so the
+	// page keeps the order these controls already had on screen. Items may be
+	// added to a sizer after it has been attached; the dialog's SetSizerAndFit
+	// lays everything out once at the end.
+	graphics_panel_sizer->Add(scalingSizer, 0, wxEXPAND | wxALL, 5);
+	graphics_panel_sizer->Add(aaSizer, 0, wxEXPAND | wxALL, 5);
+
 	{
 		// FSR 1.0 (EASU) is an upscaling reconstruction filter only - it
 		// samples a small fixed local neighborhood around each OUTPUT pixel,
@@ -511,7 +539,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			m_fsr_rcas_sharpness->Enable(fsrActive);
 			m_fsr_rcas_denoise->Enable(fsrActive);
 		});
-		graphics_panel_sizer->Add(m_upscale_filter, 0, wxALL | wxEXPAND, 5);
+		scalingSizer->Add(m_upscale_filter, 0, wxALL | wxEXPAND, 5);
 
 		// Faro: FXAA (1 extra pass), SMAA (3 extra passes: edge -> blend ->
 		// neighborhood) and TAA are available regardless of which upscale/
@@ -529,7 +557,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			m_smaa_quality->Enable(event.GetSelection() == CemuConfig::kAASmaa);
 			m_taa_spatial_aa->Enable(event.GetSelection() == CemuConfig::kAATaa);
 		});
-		graphics_panel_sizer->Add(m_antialiasing_mode, 0, wxALL, 5);
+		aaSizer->Add(m_antialiasing_mode, 0, wxALL, 5);
 
 		// Presets match the public iryoku/smaa reference's own SMAA_PRESET_LOW/
 		// MEDIUM/HIGH/ULTRA exactly (search steps, threshold, diagonal/corner
@@ -543,7 +571,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_smaa_quality->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 			GetConfig().smaa_quality = event.GetSelection();
 		});
-		graphics_panel_sizer->Add(m_smaa_quality, 0, wxALL, 5);
+		aaSizer->Add(m_smaa_quality, 0, wxALL, 5);
 
 		// Faro TAA: which spatial filter runs as TAA's own pre-pass - see
 		// CemuConfig::TaaSpatialAA's own comment. Only meaningful in TAA mode.
@@ -554,7 +582,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_taa_spatial_aa->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 			GetConfig().taa_spatial_aa = event.GetSelection();
 		});
-		graphics_panel_sizer->Add(m_taa_spatial_aa, 0, wxALL, 5);
+		aaSizer->Add(m_taa_spatial_aa, 0, wxALL, 5);
 
 
 		// Faro FSR1: RCAS sharpness - see CemuConfig::fsr_rcas_sharpness.
@@ -583,6 +611,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 
 			m_fsr_rcas_sharpness_text = new wxStaticText(graphics_panel, wxID_ANY,
 				FormatRcasSharpness(GetConfig().fsr_rcas_sharpness.GetValue()));
+			SetSliderValueWidth(m_fsr_rcas_sharpness_text);
 			rcasSizer->Add(m_fsr_rcas_sharpness_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
 			m_fsr_rcas_sharpness->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
 				const sint32 stops = CemuConfig::kFsrRcasSharpnessMax - event.GetInt();
@@ -590,7 +619,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 				m_fsr_rcas_sharpness_text->SetLabel(FormatRcasSharpness(stops));
 			});
 
-			graphics_panel_sizer->Add(rcasSizer, 0, wxEXPAND);
+			scalingSizer->Add(rcasSizer, 0, wxEXPAND);
 
 			m_fsr_rcas_denoise = new wxCheckBox(graphics_panel, wxID_ANY, _("FSR grain-aware sharpening"));
 			m_fsr_rcas_denoise->SetToolTip(_("Makes FSR 1.0's sharpening concentrate on real edges instead of amplifying film grain and dithering. Useful for games with noisy output; costs a little extra GPU time."));
@@ -599,7 +628,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			m_fsr_rcas_denoise->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
 				GetConfig().fsr_rcas_denoise = event.IsChecked();
 			});
-			graphics_panel_sizer->Add(m_fsr_rcas_denoise, 0, wxALL, 5);
+			scalingSizer->Add(m_fsr_rcas_denoise, 0, wxALL, 5);
 		}
 
 		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
@@ -608,7 +637,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_downscale_filter->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
 			GetConfig().downscale_filter = event.GetSelection();
 		});
-		graphics_panel_sizer->Add(m_downscale_filter, 0, wxALL | wxEXPAND, 5);
+		scalingSizer->Add(m_downscale_filter, 0, wxALL | wxEXPAND, 5);
 	}
 
 	{
@@ -625,7 +654,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_force_anisotropic_level->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
 			GetConfig().force_anisotropic_level = event.GetSelection();
 		});
-		graphics_panel_sizer->Add(m_force_anisotropic_level, 0, wxALL | wxEXPAND, 5);
+		scalingSizer->Add(m_force_anisotropic_level, 0, wxALL | wxEXPAND, 5);
 	}
 
 	{
@@ -661,13 +690,20 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		box_sizer->Add(m_faro_ssao, 0, wxALL, 5);
 
 		auto ssaoRow = new wxBoxSizer(wxHORIZONTAL);
-		ssaoRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("SSAO intensity  ")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		ssaoRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("SSAO intensity")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
 		m_faro_ssao_intensity = new wxSlider(graphics_panel, wxID_ANY, 60, 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
 		m_faro_ssao_intensity->SetToolTip(_("SSAO strength 0-100."));
-		m_faro_ssao_intensity->Bind(wxEVT_SLIDER, [](wxCommandEvent& event) {
+		ssaoRow->Add(m_faro_ssao_intensity, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+		// This slider had no readout at all, so there was no way to tell what it
+		// was set to or to come back to a value that looked right.
+		m_faro_ssao_intensity_text = new wxStaticText(graphics_panel, wxID_ANY,
+			wxString::Format("%d%%", GetConfig().faro_ssao_intensity.GetValue()));
+		SetSliderValueWidth(m_faro_ssao_intensity_text);
+		ssaoRow->Add(m_faro_ssao_intensity_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+		m_faro_ssao_intensity->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
 			GetConfig().faro_ssao_intensity = event.GetInt();
+			m_faro_ssao_intensity_text->SetLabel(wxString::Format("%d%%", event.GetInt()));
 		});
-		ssaoRow->Add(m_faro_ssao_intensity, 1, wxEXPAND | wxRIGHT, 5);
 		box_sizer->Add(ssaoRow, 0, wxEXPAND | wxALL, 5);
 
 		wxString faro_ssao_quality_choices[] = { _("Low"), _("Medium"), _("High") };
@@ -722,14 +758,14 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_fullscreen_scaling->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
 			GetConfig().fullscreen_scaling = event.GetSelection();
 		});
-		graphics_panel_sizer->Add(m_fullscreen_scaling, 0, wxALL | wxEXPAND, 5);
+		scalingSizer->Add(m_fullscreen_scaling, 0, wxALL | wxEXPAND, 5);
 	}
 
 	graphics_panel->SetSizerAndFit(graphics_panel_sizer);
 	return graphics_panel;
 }
 
-wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddAudioPage(wxBookCtrlBase* notebook)
 {
 	auto audio_panel = new wxPanel(notebook, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
 	auto audio_panel_sizer = new wxBoxSizer(wxVERTICAL);
@@ -739,6 +775,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto audio_general_row = new wxFlexGridSizer(0, 3, 0, 0);
+		// Faro: column 1 holds the slider. Without this the slider keeps its
+		// default width and never fills the row - proportion is ignored by a
+		// flex grid, and wxEXPAND in a horizontal layout only stretches height.
+		audio_general_row->AddGrowableCol(1, 1);
 		audio_general_row->SetFlexibleDirection(wxBOTH);
 		audio_general_row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
 
@@ -767,6 +807,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		m_audio_latency->SetToolTip(_("Controls the amount of buffered audio data\nHigher values will create a delay in audio playback, but may avoid audio problems when emulation is too slow"));
 		audio_general_row->Add(m_audio_latency, 0, wxEXPAND | wxALL, 5);
 		auto latency_text = new wxStaticText(box, wxID_ANY, "24ms");
+		SetSliderValueWidth(latency_text);
 		audio_general_row->Add(latency_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);
 		m_audio_latency->Bind(wxEVT_SLIDER, &GeneralSettings2::OnLatencySliderChanged, this, wxID_ANY, wxID_ANY, new wxControlObject(latency_text));
 		m_audio_latency->Bind(wxEVT_SLIDER, &GeneralSettings2::OnAudioLatencyChanged, this);
@@ -781,6 +822,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto audio_tv_row = new wxFlexGridSizer(0, 3, 0, 0);
+		// Faro: column 1 holds the slider. Without this the slider keeps its
+		// default width and never fills the row - proportion is ignored by a
+		// flex grid, and wxEXPAND in a horizontal layout only stretches height.
+		audio_tv_row->AddGrowableCol(1, 1);
 		audio_tv_row->SetFlexibleDirection(wxBOTH);
 		audio_tv_row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
 
@@ -806,6 +851,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		m_tv_volume = new wxSlider(box, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
 		audio_tv_row->Add(m_tv_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_tv_volume_text = new wxStaticText(box, wxID_ANY, "100%");
+		SetSliderValueWidth(audio_tv_volume_text);
 		audio_tv_row->Add(audio_tv_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);
 
 		m_tv_volume->Bind(wxEVT_SLIDER, &GeneralSettings2::OnSliderChangedPercent, this, wxID_ANY, wxID_ANY, new wxControlObject(audio_tv_volume_text));
@@ -820,6 +866,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto audio_pad_row = new wxFlexGridSizer(0, 3, 0, 0);
+		// Faro: column 1 holds the slider. Without this the slider keeps its
+		// default width and never fills the row - proportion is ignored by a
+		// flex grid, and wxEXPAND in a horizontal layout only stretches height.
+		audio_pad_row->AddGrowableCol(1, 1);
 		audio_pad_row->SetFlexibleDirection(wxBOTH);
 		audio_pad_row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
 
@@ -847,6 +897,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		m_pad_volume = new wxSlider(box, wxID_ANY, 100, 0, 100);
 		audio_pad_row->Add(m_pad_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_pad_volume_text = new wxStaticText(box, wxID_ANY, "100%");
+		SetSliderValueWidth(audio_pad_volume_text);
 		audio_pad_row->Add(audio_pad_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);
 
 		m_pad_volume->Bind(wxEVT_SLIDER, &GeneralSettings2::OnSliderChangedPercent, this, wxID_ANY, wxID_ANY, new wxControlObject(audio_pad_volume_text));
@@ -861,6 +912,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto audio_input_row = new wxFlexGridSizer(0, 3, 0, 0);
+		// Faro: column 1 holds the slider. Without this the slider keeps its
+		// default width and never fills the row - proportion is ignored by a
+		// flex grid, and wxEXPAND in a horizontal layout only stretches height.
+		audio_input_row->AddGrowableCol(1, 1);
 		audio_input_row->SetFlexibleDirection(wxBOTH);
 		audio_input_row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
 
@@ -888,6 +943,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		m_input_volume = new wxSlider(box, wxID_ANY, 100, 0, 100);
 		audio_input_row->Add(m_input_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_input_volume_text = new wxStaticText(box, wxID_ANY, "100%");
+		SetSliderValueWidth(audio_input_volume_text);
 		audio_input_row->Add(audio_input_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);
 
 		m_input_volume->Bind(wxEVT_SLIDER, &GeneralSettings2::OnSliderChangedPercent, this, wxID_ANY, wxID_ANY, new wxControlObject(audio_input_volume_text));
@@ -902,6 +958,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto portal_audio_row = new wxFlexGridSizer(0, 3, 0, 0);
+		// Faro: column 1 holds the slider. Without this the slider keeps its
+		// default width and never fills the row - proportion is ignored by a
+		// flex grid, and wxEXPAND in a horizontal layout only stretches height.
+		portal_audio_row->AddGrowableCol(1, 1);
 		portal_audio_row->SetFlexibleDirection(wxBOTH);
 		portal_audio_row->SetNonFlexibleGrowMode(wxFLEX_GROWMODE_SPECIFIED);
 
@@ -918,6 +978,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		m_portal_volume = new wxSlider(box, wxID_ANY, 100, 0, 100);
 		portal_audio_row->Add(m_portal_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_pad_volume_text = new wxStaticText(box, wxID_ANY, "100%");
+		SetSliderValueWidth(audio_pad_volume_text);
 		portal_audio_row->Add(audio_pad_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);
 
 		m_portal_volume->Bind(wxEVT_SLIDER, &GeneralSettings2::OnSliderChangedPercent, this, wxID_ANY, wxID_ANY, new wxControlObject(audio_pad_volume_text));
@@ -931,7 +992,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 	return audio_panel;
 }
 
-wxPanel* GeneralSettings2::AddOverlayPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddOverlayPage(wxBookCtrlBase* notebook)
 {
 	auto* panel = new wxPanel(notebook, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
 	auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
@@ -1077,7 +1138,7 @@ wxPanel* GeneralSettings2::AddOverlayPage(wxNotebook* notebook)
 	return panel;
 }
 
-wxPanel* GeneralSettings2::AddAccountPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddAccountPage(wxBookCtrlBase* notebook)
 {
 	auto* online_panel = new wxPanel(notebook);
 	auto* online_panel_sizer = new wxBoxSizer(wxVERTICAL);
@@ -1216,7 +1277,7 @@ wxPanel* GeneralSettings2::AddAccountPage(wxNotebook* notebook)
 	return online_panel;
 }
 
-wxPanel* GeneralSettings2::AddDebugPage(wxNotebook* notebook)
+wxPanel* GeneralSettings2::AddDebugPage(wxBookCtrlBase* notebook)
 {
 	auto* panel = new wxPanel(notebook, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
 	auto* debug_panel_sizer = new wxBoxSizer(wxVERTICAL);
@@ -1292,6 +1353,14 @@ wxPanel* GeneralSettings2::AddDebugPage(wxNotebook* notebook)
 	return panel;
 }
 
+// Reserves room for the widest reading a slider's number can take ("100%",
+// "24ms"), so the slider's own end stays put instead of jumping sideways as the
+// value goes from one digit to three.
+void GeneralSettings2::SetSliderValueWidth(wxStaticText* text) const
+{
+	text->SetMinSize(wxSize(FromDIP(44), -1));
+}
+
 // AMD's RCAS scale is "stops of reduction": 0.00 is sharpest and every whole
 // number halves the sharpening. Shown as a percentage that rises with the
 // slider, because showing the stored figure made the number fall as the
@@ -1309,14 +1378,36 @@ GeneralSettings2::GeneralSettings2(wxWindow* parent, bool game_launched)
 	SetIcon(wxICON(X_SETTINGS));
 
 	auto* sizer = new wxBoxSizer(wxVERTICAL);
-	auto* notebook = new wxNotebook(this, wxID_ANY);
+	// Faro: a wxListbook with the list on the left instead of a wxNotebook with
+	// tabs along the top. Both derive from wxBookCtrlBase and share the
+	// AddPage/AssignImageList API, so the pages themselves need no changes -
+	// only the six AddXxxPage signatures widened from wxNotebook* to
+	// wxBookCtrlBase*.
+	auto* notebook = new wxListbook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLB_LEFT);
 
-	notebook->AddPage(AddGeneralPage(notebook), _("General"));
-	notebook->AddPage(AddGraphicsPage(notebook), _("Graphics"));
-	notebook->AddPage(AddAudioPage(notebook), _("Audio"));
-	notebook->AddPage(AddOverlayPage(notebook), _("Overlay"));
-	notebook->AddPage(AddAccountPage(notebook), _("Account"));
-	notebook->AddPage(AddDebugPage(notebook), _("Debug"));
+	// Faro: tab icons, drawn by the same painter the main window's toolbar uses
+	// (see FaroDrawGlyph). The image list is owned by the notebook once handed
+	// over with AssignImageList, so it must not be deleted here.
+	// Larger than a tab strip would allow - a side list has the room, and the
+	// glyphs are drawn so there is no asset to re-export for a new size.
+	const int tabIconSize = FromDIP(24);
+	const wxColour tabInk = FaroGlyphInkColour();
+	auto* tabIcons = new wxImageList(tabIconSize, tabIconSize);
+	// Order matters: the index passed to AddPage below is this list's index.
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabGeneral, tabIconSize, tabInk));
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabGraphics, tabIconSize, tabInk));
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabAudio, tabIconSize, tabInk));
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabOverlay, tabIconSize, tabInk));
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabAccount, tabIconSize, tabInk));
+	tabIcons->Add(FaroDrawGlyph(FaroGlyph::TabDebug, tabIconSize, tabInk));
+	notebook->AssignImageList(tabIcons);
+
+	notebook->AddPage(AddGeneralPage(notebook), _("General"), false, 0);
+	notebook->AddPage(AddGraphicsPage(notebook), _("Graphics"), false, 1);
+	notebook->AddPage(AddAudioPage(notebook), _("Audio"), false, 2);
+	notebook->AddPage(AddOverlayPage(notebook), _("Overlay"), false, 3);
+	notebook->AddPage(AddAccountPage(notebook), _("Account"), false, 4);
+	notebook->AddPage(AddDebugPage(notebook), _("Debug"), false, 5);
 
 	Bind(wxEVT_CLOSE_WINDOW, &GeneralSettings2::OnClose, this);
 
@@ -1327,6 +1418,10 @@ GeneralSettings2::GeneralSettings2(wxWindow* parent, bool game_launched)
 	SetSizerAndFit(sizer);
 	Layout();
 	Centre(wxBOTH);
+
+	// Faro: see FaroApplyRoundedCorners - top-level only, and already the
+	// Windows 11 default, so this just makes it explicit.
+	FaroApplyRoundedCorners(this);
 
 	//
 
@@ -2226,6 +2321,10 @@ void GeneralSettings2::ApplyConfig()
 	m_faro_postfx->SetValue(config.faro_postfx_enabled);
 	m_faro_ssao->SetValue(config.faro_ssao_enabled);
 	m_faro_ssao_intensity->SetValue(config.faro_ssao_intensity);
+	// The readout has to be refreshed alongside the slider. Setting one without
+	// the other is what left the FSR sharpness figure showing a stale value
+	// after this path ran - same defect, so it is worth not repeating here.
+	m_faro_ssao_intensity_text->SetLabel(wxString::Format("%d%%", (int)config.faro_ssao_intensity));
 	{
 		sint32 q = config.faro_ssao_quality;
 		if (q < 0 || q > 2)

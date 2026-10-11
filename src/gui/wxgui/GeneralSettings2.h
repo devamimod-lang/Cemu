@@ -84,12 +84,6 @@ private:
 	// Faro FSR1: RCAS controls - only enabled while FSR 1.0 is the active
 	// upscale filter (RCAS is FSR1's own second pass).
 	wxSlider* m_fsr_rcas_sharpness;
-	// Faro TAA: history length / sharpening - only enabled in TAA mode.
-	wxCheckBox* m_taa_jitter;
-	wxSlider* m_taa_history;
-	wxSlider* m_taa_sharpness;
-	// Faro TAA reprojection switch - see CemuConfig::faro_taa_reprojection.
-	wxCheckBox* m_taa_reprojection = nullptr;
 	wxCheckBox* m_fsr_rcas_denoise;
 	wxRadioBox* m_force_anisotropic_level;
 	wxCheckBox *m_faro_postfx, *m_faro_ssao;

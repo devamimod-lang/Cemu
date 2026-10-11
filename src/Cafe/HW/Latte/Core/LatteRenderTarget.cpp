@@ -1160,67 +1160,20 @@ void LatteRenderTarget_advanceTaaJitter()
 // the 3D scene; accepted as a known limitation of camera-only jitter.
 void LatteMRT::GetCurrentTaaJitter(float* jitter)
 {
+	// Faro TAA: jitter is disabled on purpose. The resolve pass (RendererOuputShader.cpp)
+	// blends history against the current frame at matching pixel coordinates with no
+	// reprojection (no motion vectors, no delta between this frame's and the previous
+	// frame's view/projection matrices) - real per-frame camera jitter needs that
+	// reprojection to cancel back out, otherwise every jittered frame draws geometry
+	// shifted by a different sub-pixel offset and the resolve blends those raw, which
+	// reads as constant shimmer/trembling on edges, grass, shadows and distant detail
+	// (confirmed - this is what happens if jitter is enabled here). Without reprojection,
+	// jittering the camera is strictly worse than not jittering it at all, so this always
+	// returns zero for now. The push-constant delivery mechanism (see SET_POSITION's own
+	// comment in LatteDecompilerEmitGLSLHeader.hpp) is left in place so real jitter can be
+	// re-enabled here later if/when a reprojected resolve is implemented.
 	jitter[0] = 0.0f;
 	jitter[1] = 0.0f;
-
-	// Jitter is ENABLED again, and that is the whole reason the temporal pass
-	// now removes aliasing at all.
-	//
-	// Without jitter every frame renders the scene at exactly the same sample
-	// positions, so on a still camera frame N and frame N-1 are pixel
-	// identical. Blending identical images returns that same image: the
-	// temporal pass could not add one bit of antialiasing, no matter how it
-	// was tuned. All the AA came from the FXAA/SMAA pre-pass, while the blend
-	// contributed only softening during motion - the worst of both, and
-	// exactly the "barely removes jaggies but blurs" that was reported.
-	// Sub-pixel jitter is what turns accumulation into real supersampling.
-	//
-	// An earlier revision turned this off because enabling it shimmered, and
-	// re-enabling it shimmered again - the whole image trembled with TAA
-	// active while FXAA, which applies no jitter, stayed clean.
-	//
-	// The cause was never the jitter. It was that the resolve rejected
-	// history TWICE: it clipped history into the local colour box (correct,
-	// and sufficient) and then ALSO drove the blend weight towards 0.95 in
-	// proportion to how far that clip had moved it. On a high-contrast edge a
-	// sub-pixel shift moves the colour far, so the weight saturated, nothing
-	// accumulated on exactly the edges that needed it, and the raw jitter was
-	// left on screen as wobble. Both the original luma-difference form and
-	// its clip-distance replacement had this shape; swapping the criterion
-	// changed nothing because the second rejection was the problem.
-	//
-	// The resolve now clips and blends with a FIXED weight, which is the
-	// Karis 2014 formulation and the reason every real TAA can jitter at all
-	// (see s_taa_resolve_shader_source).
-	//
-	// Only while TAA is the active mode: these offsets move every draw call,
-	// and with no resolve pass to average them back out the image would
-	// simply wobble. Also skipped when the history slider is near zero, for
-	// the same reason - that setting means "barely keep any history", which
-	// leaves nothing to average the jitter away.
-	if (GetConfig().antialiasing_mode != CemuConfig::kAATaa)
-		return;
-	// Player's call - see CemuConfig::taa_jitter. Off means the temporal pass
-	// can only fade towards the previous frame and every bit of antialiasing
-	// comes from the FXAA/SMAA pre-pass.
-	if (!GetConfig().taa_jitter)
-		return;
-	if (GetConfig().taa_history < 10)
-		return;
-
-	// Host-side render size, not the guest viewport: the resolve runs at the
-	// real render resolution, so a "half pixel" has to mean half a pixel
-	// there.
-	const sint32 renderWidth = sLatteRenderTargetState.currentEffectiveSize.width;
-	const sint32 renderHeight = sLatteRenderTargetState.currentEffectiveSize.height;
-	if (renderWidth <= 0 || renderHeight <= 0)
-		return;
-
-	const auto& tap = kTaaHalton[(size_t)(s_taaFrameIndex % kTaaHalton.size())];
-	// SET_POSITION applies this as `gl_Position.xy += uf_taaJitter * w`, so the
-	// value is in NDC, where one pixel spans 2/dimension.
-	jitter[0] = tap.first * 2.0f / (float)renderWidth;
-	jitter[1] = tap.second * 2.0f / (float)renderHeight;
 }
 
 // flag all FBO textures as updated via GPU

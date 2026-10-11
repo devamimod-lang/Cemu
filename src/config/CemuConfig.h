@@ -592,60 +592,6 @@ struct CemuConfig
 	};
 	ConfigValue<sint32> faro_debug_view{kFaroDebugOff};
 
-	// Faro TAA: how much of the previous frame the temporal resolve is allowed
-	// to keep, 0-100. Higher means a longer history: more antialiasing, but
-	// also more softening, because this TAA has no motion vectors yet (see
-	// LatteMRT::GetCurrentTaaJitter) and so blends history that is misaligned
-	// by whatever the camera moved. That trade-off has no single right answer
-	// - it depends on the game, the resolution and how much softness the
-	// player tolerates - which is why it is a slider rather than a constant.
-	// Maps to the minimum weight of the CURRENT frame in the resolve:
-	// 100 -> 0.05 (longest history), 0 -> 1.00 (history off entirely).
-	// The default of 90 reproduces the 0.10 floor the resolve used before this
-	// setting existed.
-	ConfigValue<sint32> taa_history{90};
-
-	// Faro TAA: sub-pixel jitter, which is what makes the temporal pass a real
-	// antialiaser rather than a fade.
-	//
-	// A setting rather than a constant because it has been switched both ways
-	// on evidence and the call belongs to the player. Without jitter, a still
-	// camera renders frame N identical to frame N-1, so blending them returns
-	// that same image and the pass cannot add one bit of antialiasing - all of
-	// it comes from the FXAA/SMAA pre-pass. With jitter, accumulation is
-	// genuine supersampling. The catch is that it only works if the resolve
-	// accumulates instead of rejecting: an earlier resolve drove the blend
-	// weight towards the current frame in proportion to how far history had
-	// been clipped, which stalled accumulation on exactly the high-contrast
-	// edges that needed it and left the jitter on screen as a visible tremble.
-	// That is fixed (see s_taa_resolve_shader_source), but the setting stays so
-	// the two can be compared without a rebuild.
-	ConfigValue<bool> taa_jitter{true};
-
-	// Faro TAA: strength of the resolve's own unsharp mask, 0-100, scaled by
-	// how much history was actually used so a still image (the case that gets
-	// softened most) gets the most correction. Compensates the temporal blur
-	// above; too much of it brings back aliasing as ringing.
-	ConfigValue<sint32> taa_sharpness{50};
-
-	// Faro TAA: use the motion field to fetch history from where this pixel
-	// USED to be, instead of from its own coordinate.
-	//
-	// This is what makes a long history safe. Without it the resolve can only
-	// average a pixel with itself one frame earlier, which is not
-	// antialiasing but a fade towards the previous frame - and that is the
-	// whole reason taa_history has to be turned down by hand to avoid smearing.
-	// With it, the samples being averaged all show the same piece of world, so
-	// taa_history can go back up without the blur.
-	//
-	// A setting rather than a compile-time constant, and off by default,
-	// because this changes what every single pixel fetches: being able to A/B
-	// it against the old behaviour on the same scene is the only way to tell
-	// an improvement from a different set of artifacts. Needs a depth buffer
-	// to match on, so it silently does nothing on a title without one - see
-	// RunFaroMotionEstimation's own bail-outs.
-	ConfigValue<bool> faro_taa_reprojection{false};
-
 	// Faro: force anisotropic filtering globally, overriding whatever level the
 	// game's own sampler requested. Only applied when a graphic pack hasn't
 	// already set its own per-texture override (LatteTexture.h's

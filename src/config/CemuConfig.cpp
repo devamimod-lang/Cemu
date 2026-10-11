@@ -157,10 +157,6 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	fsr_rcas_denoise = graphic.get("FsrRcasDenoise", false);
 	faro_depth_snapshot = graphic.get("FaroDepthSnapshot", false);
 	faro_debug_view = std::clamp<sint32>(graphic.get("FaroDebugView", 0), 0, 6);
-	taa_history = std::clamp<sint32>(graphic.get("TaaHistory", 90), 0, 100);
-	taa_jitter = graphic.get("TaaJitter", true);
-	taa_sharpness = std::clamp<sint32>(graphic.get("TaaSharpness", 50), 0, 100);
-	faro_taa_reprojection = graphic.get("FaroTaaReprojection", false);
 	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
 	// Faro Global Enhancements (see CemuConfig.h)
 	faro_postfx_enabled = graphic.get("FaroPostFX", false);
@@ -411,10 +407,6 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("FsrRcasDenoise", fsr_rcas_denoise);
 	graphic.set("FaroDepthSnapshot", faro_depth_snapshot);
 	graphic.set("FaroDebugView", faro_debug_view);
-	graphic.set("TaaHistory", taa_history);
-	graphic.set("TaaJitter", taa_jitter);
-	graphic.set("TaaSharpness", taa_sharpness);
-	graphic.set("FaroTaaReprojection", faro_taa_reprojection);
 	graphic.set("ForceAnisotropicLevel", force_anisotropic_level);
 	graphic.set("FaroPostFX", faro_postfx_enabled);
 	graphic.set("FaroSSAO", faro_ssao_enabled);

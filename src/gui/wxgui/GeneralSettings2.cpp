@@ -528,11 +528,6 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			GetConfig().antialiasing_mode = event.GetSelection();
 			m_smaa_quality->Enable(event.GetSelection() == CemuConfig::kAASmaa);
 			m_taa_spatial_aa->Enable(event.GetSelection() == CemuConfig::kAATaa);
-			m_taa_history->Enable(event.GetSelection() == CemuConfig::kAATaa);
-			m_taa_jitter->Enable(event.GetSelection() == CemuConfig::kAATaa);
-			m_taa_sharpness->Enable(event.GetSelection() == CemuConfig::kAATaa);
-			if (m_taa_reprojection)
-				m_taa_reprojection->Enable(event.GetSelection() == CemuConfig::kAATaa);
 		});
 		graphics_panel_sizer->Add(m_antialiasing_mode, 0, wxALL, 5);
 
@@ -561,63 +556,6 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		});
 		graphics_panel_sizer->Add(m_taa_spatial_aa, 0, wxALL, 5);
 
-		// Faro TAA: history length and sharpening - see CemuConfig::taa_history
-		// for why these have to be adjustable rather than fixed.
-		{
-			const bool taaActive = GetConfig().antialiasing_mode == CemuConfig::kAATaa;
-
-			m_taa_jitter = new wxCheckBox(graphics_panel, wxID_ANY, _("TAA sub-pixel jitter"));
-			m_taa_jitter->SetValue(GetConfig().taa_jitter.GetValue());
-			m_taa_jitter->SetToolTip(_("Shifts each frame by a fraction of a pixel so the temporal pass accumulates genuinely new samples - this is what makes TAA remove jaggies instead of merely fading between frames. Turn it off to compare: without it all antialiasing comes from the FXAA/SMAA pre-pass."));
-			m_taa_jitter->Enable(taaActive);
-			m_taa_jitter->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
-				GetConfig().taa_jitter = event.IsChecked();
-			});
-			graphics_panel_sizer->Add(m_taa_jitter, 0, wxALL, 5);
-
-			auto* histSizer = new wxBoxSizer(wxHORIZONTAL);
-			histSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("TAA history")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			m_taa_history = new wxSlider(graphics_panel, wxID_ANY, GetConfig().taa_history.GetValue(), 0, 100);
-			m_taa_history->SetToolTip(_("How many frames of sub-pixel samples TAA accumulates. Higher means more antialiasing - with jitter enabled this is real supersampling, so it sharpens detail rather than blurring it. Lower it only if you see trails behind moving objects."));
-			m_taa_history->Enable(taaActive);
-			histSizer->Add(m_taa_history, 1, wxALL | wxEXPAND, 5);
-			auto* histText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%d%%", GetConfig().taa_history.GetValue()));
-			histSizer->Add(histText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			m_taa_history->Bind(wxEVT_SLIDER, [histText](wxCommandEvent& event) {
-				GetConfig().taa_history = event.GetInt();
-				histText->SetLabel(wxString::Format("%d%%", event.GetInt()));
-			});
-			graphics_panel_sizer->Add(histSizer, 0, wxEXPAND);
-
-			auto* taaSharpSizer = new wxBoxSizer(wxHORIZONTAL);
-			taaSharpSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("TAA sharpening")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			m_taa_sharpness = new wxSlider(graphics_panel, wxID_ANY, GetConfig().taa_sharpness.GetValue(), 0, 100);
-			m_taa_sharpness->SetToolTip(_("Optional extra acuity on the resolved image. No longer needed for sharpness now that accumulation is real supersampling; too much brings aliasing back as ringing around edges."));
-			m_taa_sharpness->Enable(taaActive);
-			taaSharpSizer->Add(m_taa_sharpness, 1, wxALL | wxEXPAND, 5);
-			auto* taaSharpText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%d%%", GetConfig().taa_sharpness.GetValue()));
-			taaSharpSizer->Add(taaSharpText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			m_taa_sharpness->Bind(wxEVT_SLIDER, [taaSharpText](wxCommandEvent& event) {
-				GetConfig().taa_sharpness = event.GetInt();
-				taaSharpText->SetLabel(wxString::Format("%d%%", event.GetInt()));
-			});
-			graphics_panel_sizer->Add(taaSharpSizer, 0, wxEXPAND);
-
-			// Reprojection - see CemuConfig::faro_taa_reprojection. Off by
-			// default and independently switchable from the history slider
-			// above, because the two answer different questions: the slider
-			// trades blur against trailing, this one changes WHICH pixel the
-			// history comes from. Turning it on with a low history length is
-			// a valid, conservative combination and not a mistake.
-			m_taa_reprojection = new wxCheckBox(graphics_panel, wxID_ANY, _("Reproject history with the motion field (experimental)"));
-			m_taa_reprojection->SetToolTip(_("Read the previous frame from where this pixel used to be, using an estimated motion field, instead of from its own position. Makes a long history safe: raise TAA history afterwards and the softening should stop. Needs a depth buffer, so it does nothing on titles without one. Experimental - compare against off."));
-			m_taa_reprojection->SetValue(GetConfig().faro_taa_reprojection.GetValue());
-			m_taa_reprojection->Enable(taaActive);
-			m_taa_reprojection->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
-				GetConfig().faro_taa_reprojection = event.IsChecked();
-			});
-			graphics_panel_sizer->Add(m_taa_reprojection, 0, wxALL, 5);
-		}
 
 		// Faro FSR1: RCAS sharpness - see CemuConfig::fsr_rcas_sharpness.
 		// Only meaningful when FSR 1.0 is the active upscale filter, since
@@ -2240,16 +2178,6 @@ void GeneralSettings2::ApplyConfig()
 			taaSpatialAa = CemuConfig::kTaaSpatialFxaa;
 		m_taa_spatial_aa->SetSelection(taaSpatialAa);
 		m_taa_spatial_aa->Enable(aa == CemuConfig::kAATaa);
-		m_taa_jitter->SetValue(config.taa_jitter);
-		m_taa_history->SetValue(std::clamp<sint32>(config.taa_history, 0, 100));
-		m_taa_sharpness->SetValue(std::clamp<sint32>(config.taa_sharpness, 0, 100));
-		m_taa_history->Enable(aa == CemuConfig::kAATaa);
-		m_taa_sharpness->Enable(aa == CemuConfig::kAATaa);
-		if (m_taa_reprojection)
-		{
-			m_taa_reprojection->SetValue(config.faro_taa_reprojection.GetValue());
-			m_taa_reprojection->Enable(aa == CemuConfig::kAATaa);
-		}
 	}
 	m_downscale_filter->SetSelection(config.downscale_filter);
 

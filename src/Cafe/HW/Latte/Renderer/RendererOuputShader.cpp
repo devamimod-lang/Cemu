@@ -1362,11 +1362,6 @@ RendererOutputShader::RendererOutputShader(const std::string& vertex_source, con
 const std::string RendererOutputShader::s_taa_resolve_shader_source =
 R"(
 layout(binding = 2) uniform sampler2D textureSrc2;
-// Faro motion field (quarter resolution, see RunFaroMotionEstimation). Bound
-// every frame; whether the resolve actually reprojects with it is a separate
-// step - right now it only feeds the debug view, deliberately, so the field
-// can be judged on its own before anything depends on it.
-layout(binding = 3) uniform sampler2D textureMotion;
 
 float FaroLuma(vec3 c) {
 	return dot(c, vec3(0.299, 0.587, 0.114));
@@ -1434,116 +1429,11 @@ void outputShader() {
 	vec2 uv = passUV;
 	vec2 inv = 1.0 / textureSrcResolution;
 
-	// Debug view 6: the motion field, before anything depends on it. Hue is
-	// direction, brightness is speed, grey is at rest.
-	//
-	// Built and checked BEFORE wiring the field into the reprojection on
-	// purpose. The AO investigation burned several rounds inferring the state
-	// of an intermediate buffer from the final image, when looking directly
-	// at the buffer answered it in seconds. A broken motion field is obvious
-	// here - noise, or colour in a still scene - and close to undiagnosable
-	// from a resolved frame.
-	//
-	// What correct looks like: flat grey when nothing moves, and panning the
-	// camera washing the screen in one even colour that flips to the opposite
-	// hue when the pan reverses.
-	if (int(faroDebugParams.x + 0.5) == 6)
-	{
-		// faroMotionParams.x says whether a real field is bound. Without this
-		// check the view painted whatever happened to be bound as a fallback
-		// - the scene itself - and reading its red/green channels as a vector
-		// produced a convincing-looking colour image that meant nothing. A
-		// debug view that invents data is worse than no debug view, so when
-		// there is no field this says so plainly: flat black.
-		if (faroMotionParams.x < 0.5)
-		{
-			colorOut0 = vec4(0.0, 0.0, 0.0, 1.0);
-			return;
-		}
-		vec2 motion = texture(textureMotion, uv).rg;
-		float speed = clamp(length(motion) * 40.0, 0.0, 1.0);
-		float angle = atan(motion.y, motion.x);
-		vec3 wheel = clamp(abs(mod(angle / 6.2831853 * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
-		colorOut0 = vec4(mix(vec3(0.5), wheel, speed), 1.0);
-		return;
-	}
-
-vec3 cM = texture(textureSrc, uv).rgb;
+	vec3 cM = texture(textureSrc, uv).rgb;
 	if (!taaHistoryValid) {
 		// First frame after boot/resize/reset - no history to blend with yet.
 		colorOut0 = vec4(cM, 1.0);
 		return;
-	}
-
-	// === Reprojection ===
-	//
-	// Without this the history is read at the pixel's own coordinate, which
-	// means the temporal filter can only ever average a pixel with ITSELF one
-	// frame ago. That is not antialiasing, it is a fade towards the previous
-	// frame, and it forces the choice documented in FARO_TAA_FSR1_DEPTH_
-	// investigacion.md: a little history barely smooths anything, a lot of
-	// history smears whatever the camera moved over. Which is why TaaHistory
-	// has to be pulled down to 60-70 by hand.
-	//
-	// The motion field says where this pixel USED to be, so the history can be
-	// read from there instead. That is what makes a long history safe: the
-	// samples being averaged all show the same piece of world.
-	//
-	// faroMotionParams.x is the dispatch's own "is there a field" flag, set
-	// from RunFaroMotionEstimation's return value. When it is unset the
-	// offset stays zero and this whole block collapses to the same-coordinate
-	// read it replaces - an exact, unchanged fallback rather than a second
-	// code path to keep in sync.
-vec2 motionOffset = vec2(0.0);
-	vec3 hist;
-	if (faroMotionParams.x > 0.5)
-	{
-		// Sampled with a plain bilinear fetch rather than nearest: the field
-		// is a quarter of native resolution and its texels are bilinear
-		// themselves, so nearest would quantise the offset to whole
-		// quarter-res texels and reintroduce the very stepping the smooth
-		// upsample exists to avoid.
-		motionOffset = texture(textureMotion, uv).rg;
-		// The estimate is in the field's own quarter-resolution units, so it
-		// has to become a fraction of THIS pass's UV to be an offset in UV.
-		// Written as an explicit component divide rather than `/=`: GLSL has
-		// no componentwise divide-assign, and `v /= s` silently tries to
-		// assign a float back into a vec2.
-		motionOffset = vec2(motionOffset.x / max(textureSrcResolution.x, 1.0),
-			motionOffset.y / max(textureSrcResolution.y, 1.0));
-		// Clamped rather than discarded. The matcher already rejects
-		// off-screen vectors, but a bilinear fetch at the very edge of the
-		// field can still round one just past it, and sampling outside the
-		// history target reads whatever the driver decides is there.
-		vec2 historyUV = clamp(uv + motionOffset, vec2(0.0), vec2(1.0));
-		// faroMotionParams.y is the master switch, so turning reprojection
-		// off drives the offset to exactly zero and this collapses to the
-		// same-coordinate read it replaces - the pre-field behaviour, not an
-		// approximation of it.
-		historyUV = mix(uv, historyUV, faroMotionParams.y);
-		hist = clamp(SampleHistoryBicubic(historyUV), 0.0, 1.0);
-
-		// The whole point of reprojection is to arrive somewhere that still
-		// holds what this pixel held. If it does not, the field is wrong
-		// here - grass, a wrong match, a disocclusion the estimator missed -
-		// and reprojecting faithfully would blend two different things. The
-		// variance clip below would catch most of that on its own, but only
-		// AFTER the fetch, and it rejects on colour alone. Checking the
-		// colour at the ORIGINAL coordinate is nearly free and catches the
-		// case the clip cannot: history that is merely a plausible colour
-		// somewhere else entirely.
-		vec3 cHistUnshifted = texture(textureSrc2, uv).rgb;
-		float unshiftedDist = length(cHistUnshifted - cM);
-		float shiftedDist = length(hist - cM);
-		// Only override when staying put was clearly better, so a correct
-		// reprojection that lands on a similar-but-not-identical colour (any
-		// real motion, any lighting change) is still trusted.
-		if (unshiftedDist < shiftedDist * 0.6)
-			hist = clamp(SampleHistoryBicubic(uv), 0.0, 1.0);
-	}
-	else
-	{
-		hist = clamp(SampleHistoryBicubic(uv), 0.0, 1.0);
 	}
 
 	vec3 cN = texture(textureSrc, uv + vec2(0.0, -inv.y)).rgb;
@@ -1563,119 +1453,20 @@ vec2 motionOffset = vec2(0.0);
 	vec3 m1 = (yM + yN + yS + yE + yW + yNE + ySE + yNW + ySW) * (1.0 / 9.0);
 	vec3 m2 = (yM * yM + yN * yN + yS * yS + yE * yE + yW * yW + yNE * yNE + ySE * ySE + yNW * yNW + ySW * ySW) * (1.0 / 9.0);
 
-	// Clamped to [0,1] on the way in. SampleHistoryBicubic has negative lobes,
-	// so it overshoots and undershoots the range of its own source even when
-	// that source is perfectly in range. While the history buffer was 8-bit
-	// UNORM every write saturated and this never mattered; it is now 16-bit
-	// float (see EnsureTaaHistoryTarget), which clamps nothing, and the result
-// feeds back into the history every frame. An out-of-range value entering
-	// this loop can grow instead of decaying - and the Karis inverse below
-	// divides by (1 - luma), so a luma approaching 1 multiplies by up to 1e4
-	// and the pixel blows out to white.
-	//
-	// (hist itself was sampled above, in the reprojection block.)
+	vec3 hist = SampleHistoryBicubic(uv);
+	vec3 vavg = (cM + cN + cS + cE + cW) * 0.2;
+	float lHist = FaroLuma(hist);
+	float lCur = FaroLuma(vavg);
+	float lMin = min(FaroLuma(cM), min(min(FaroLuma(cN), FaroLuma(cS)), min(FaroLuma(cE), FaroLuma(cW))));
+	float lMax = max(FaroLuma(cM), max(max(FaroLuma(cN), FaroLuma(cS)), max(FaroLuma(cE), FaroLuma(cW))));
+	float lRange = max(0.02, lMax - lMin);
+	float ghost = clamp(abs(lHist - lCur) / (lRange * 2.0), 0.0, 1.0);
 
-	// Variance box in YCoCg, at a FIXED width. It used to be widened or
-	// narrowed by a luma-difference "ghost" term; that term is gone, and
-	// removing it is what let sub-pixel jitter be switched back on - see
-	// below and LatteMRT::GetCurrentTaaJitter.
-	//
-	// The floor on the box matters: on a flat surface the neighbourhood
-	// variance is almost zero, so without it the box would collapse and
-	// reject history over mere quantization noise, stalling accumulation
-	// exactly where it is cheapest to accumulate.
-	vec3 vbox = max(sqrt(max(m2 - m1 * m1, vec3(0.0))) * 1.25, vec3(0.015));
-	vec3 yHist = RGB2YCoCg(hist);
-	vec3 yClamped = ClipAABB(m1 - vbox, m1 + vbox, yHist);
-	vec3 histClamped = YCoCg2RGB(yClamped);
+	vec3 vbox = sqrt(max(m2 - m1 * m1, vec3(0.0))) * mix(2.0, 0.75, ghost);
+	vec3 histClamped = YCoCg2RGB(ClipAABB(m1 - vbox, m1 + vbox, RGB2YCoCg(hist)));
+	float blendCur = mix(0.10, 0.85, ghost * ghost);
 
-	// Blend fraction of the CURRENT frame: a FIXED weight, from
-	// CemuConfig::taa_history (faroFsrParams.z). The clip above is the entire
-	// rejection mechanism; the blend weight must not reject a second time.
-	//
-	// This used to be mix(slider, 0.95, clamp(clipDistance, 0, 1)), i.e. the
-	// weight was pushed towards "almost entirely the current frame" in
-	// proportion to how far history had been clipped. That was wrong, and it
-	// is what made the whole image tremble with TAA active while FXAA (which
-	// applies no jitter at all) looked clean.
-	//
-	// Why it was wrong: the comment it replaced claimed a jittered sample of
-	// the same surface "still lies INSIDE the local colour box, so it clips
-	// by nothing". That is false exactly where it matters. The box is built
-	// from the CURRENT frame's 3x3 neighbourhood, and on a high-contrast edge
-	// a sub-pixel shift moves the colour a long way - so history clipped far,
-	// clipDist saturated, the weight went to ~0.95, and the output was
-	// essentially the raw jittered frame. Accumulation stalled precisely on
-	// the edges that needed it, and the jitter was left on screen as wobble.
-	// Double-rejecting cancelled the feature out: jitter supplies sub-pixel
-	// samples, and this threw them away.
-	//
-	// Karis 2014 clips history into the box and then blends with a constant
-	// weight - the clip bounds the error, which is its job. With no
-	// reprojection, fast camera motion means history is stale, but clipping
-	// keeps it inside the local colour box, so the result degrades to a
-	// slightly softened current frame rather than a smear.
-	//
-	// Going as low as 0.05 is only meaningful because the history buffer is
-	// 16-bit float (see EnsureTaaHistoryTarget) - at 8 bits a 0.05
-	// contribution falls below one quantization step for any difference under
-	// ~8% and the accumulation stalls outright.
-	float blendCur = clamp(faroFsrParams.z, 0.05, 1.0);
-
-	// Karis 2014 ("High Quality Temporal Supersampling") HDR weighting: blend
-	// in a tonemapped space, c / (1 + luma(c)), instead of linearly. Without
-	// it a single very bright sample dominates the average and reads as a
-	// flickering firefly on specular highlights and foliage; the transform
-	// compresses the bright end so one hot sample can no longer outvote the
-	// rest, and the blend is then expanded back.
-	//
-	// NOTE the direction: this reweights the SAMPLES. Scaling the blend
-	// factor by a luma term instead (a tempting shortcut) does the opposite
-	// of what is wanted here - it would make bright pixels retain MORE
-	// history and so ghost harder, which is exactly the artifact Karis's
-	// weighting exists to remove.
-	vec3 tCur = cM / (1.0 + FaroLuma(cM));
-	vec3 tHist = histClamped / (1.0 + FaroLuma(histClamped));
-	vec3 tMix = mix(tHist, tCur, blendCur);
-	// Inverse transform. The denominator is clamped away from zero: luma of
-	// the tonemapped value approaches 1 for very bright input, and an
-	// unclamped reciprocal there produces infinities that propagate as white
-	// specks.
-	vec3 resolved = tMix / max(1.0 - FaroLuma(tMix), 1e-4);
-
-	// Optional unsharp mask against the SPATIAL cross - deliberately not
-	// against the history, since cM - hist is a temporal difference and
-	// amplifying it would boost exactly the pixels that disagree between
-	// frames, manufacturing shimmer rather than detail.
-	//
-	// Strength is now a flat fraction of the slider instead of scaling with
-	// how much history was used, and that inversion matters. The old form
-	// sharpened HARDEST when history dominated, on the assumption that
-	// history means blur. With jitter that assumption is backwards: heavy
-	// accumulation is now genuine supersampling, which comes out sharper AND
-	// less aliased, so sharpening it hardest would re-introduce the very edge
-	// contrast the pass just resolved away. Left on the slider because
-	// whether an upscaled image wants a touch of acuity back is a taste call,
-	// but it is no longer load-bearing.
-	vec3 spatialBlur = (cN + cS + cE + cW) * 0.25;
-	vec3 sharpened = resolved + (faroFsrParams.w * 0.5) * (resolved - spatialBlur);
-
-	// Anti-ringing guard on the unsharp mask, so it cannot overshoot into
-	// halos around high-contrast edges (same reason EASU clips against the
-	// min/max of its own nearest 4 taps).
-	//
-	// The box is the local neighbourhood WIDENED to include `resolved`
-	// itself, and that widening is the important part: clamping purely to
-	// the current frame's own min/max would discard exactly the temporally
-	// accumulated values that lie outside this frame's neighbourhood - which
-	// is the entire output of the temporal filter. Widening makes this a
-	// pure "the sharpen may not push the pixel further out than it already
-	// was" limiter, leaving the resolve itself untouched.
-	vec3 mnBox = min(min(min(cM, cN), min(cS, cE)), cW);
-	vec3 mxBox = max(max(max(cM, cN), max(cS, cE)), cW);
-	mnBox = min(mnBox, resolved);
-	mxBox = max(mxBox, resolved);
-	colorOut0 = vec4(clamp(sharpened, mnBox, mxBox), 1.0);
+	colorOut0 = vec4(mix(histClamped, cM, blendCur), 1.0);
 }
 )";
 
@@ -1708,15 +1499,11 @@ RendererOutputShader::OutputUniformVariables RendererOutputShader::FillUniformBl
 	vars.faroFsrParams[0] = (float)std::clamp(GetConfig().fsr_rcas_sharpness.GetValue(),
 		CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax) / 100.0f;
 	vars.faroFsrParams[1] = GetConfig().fsr_rcas_denoise ? 1.0f : 0.0f;
-	// Faro TAA: z = minimum weight of the current frame in the resolve (the
-	// history length, see CemuConfig::taa_history - 100 maps to 0.05 for the
-	// longest history, 0 to 1.0 which disables history entirely), w = unsharp
-	// strength (CemuConfig::taa_sharpness). Carried in the spare slots of this
-	// same vec4 rather than a new uniform, so the std140 block layout is
-	// unchanged.
-	const float taaHistory = (float)std::clamp(GetConfig().taa_history.GetValue(), 0, 100) / 100.0f;
-	vars.faroFsrParams[2] = 1.0f - taaHistory * 0.95f;
-	vars.faroFsrParams[3] = (float)std::clamp(GetConfig().taa_sharpness.GetValue(), 0, 100) / 100.0f;
+	// z/w are unused: the restored resolve (see s_taa_resolve_shader_source)
+	// takes no parameters. Left zero rather than removed from the struct so the
+	// std140 block layout is unchanged.
+	vars.faroFsrParams[2] = 0.0f;
+	vars.faroFsrParams[3] = 0.0f;
 
 	// Faro debug view - see OutputUniformVariables::faroDebugParams.
 	vars.faroDebugParams[0] = (float)GetConfig().faro_debug_view.GetValue();
@@ -2350,16 +2137,21 @@ float luma = FaroMotionLuma((c0 + c1 + c2 + c3) * 0.25);
 	// The same 2x2 footprint is reused rather than a fresh offset set so the
 	// depth average describes exactly the block the luma average describes -
 	// two channels of one texel, not two independent samples of the area.
-	vec2 d0 = textureLod(textureDepth, passUV + vec2(-0.5, -0.5) * texel, 0.0).x;
-	vec2 d1 = textureLod(textureDepth, passUV + vec2( 0.5, -0.5) * texel, 0.0).x;
-	vec2 d2 = textureLod(textureDepth, passUV + vec2(-0.5,  0.5) * texel, 0.0).x;
-	vec2 d3 = textureLod(textureDepth, passUV + vec2( 0.5,  0.5) * texel, 0.0).x;
+	// float, not vec2: .x of a depth fetch is a scalar. Declaring these vec2
+	// made this shader fail to compile outright ("cannot convert from float to
+	// 2-component vector of float"), which is why the motion field never
+	// existed - the whole pass was silently absent, and the only trace was one
+	// GLSL error at startup.
+	float d0 = textureLod(textureDepth, passUV + vec2(-0.5, -0.5) * texel, 0.0).x;
+	float d1 = textureLod(textureDepth, passUV + vec2( 0.5, -0.5) * texel, 0.0).x;
+	float d2 = textureLod(textureDepth, passUV + vec2(-0.5,  0.5) * texel, 0.0).x;
+	float d3 = textureLod(textureDepth, passUV + vec2( 0.5,  0.5) * texel, 0.0).x;
 	// Compressed per-tap and then averaged, NOT averaged raw then compressed.
 	// The compressed curve is strongly nonlinear, so compressing the mean is
 	// not the same value and would quietly bias every texel toward the near
 	// plane.
-	float depth = (FaroMotionCompressDepth(d0.x) + FaroMotionCompressDepth(d1.x) +
-		FaroMotionCompressDepth(d2.x) + FaroMotionCompressDepth(d3.x)) * 0.25;
+	float depth = (FaroMotionCompressDepth(d0) + FaroMotionCompressDepth(d1) +
+		FaroMotionCompressDepth(d2) + FaroMotionCompressDepth(d3)) * 0.25;
 
 	colorOut0 = vec4(luma, depth, 0.0, 1.0);
 }

@@ -7297,9 +7297,9 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	texView->baseTexture->GetEffectiveSize(nativeWidth, nativeHeight, 0);
 
 	if (imageWidth <= 0 || imageHeight <= 0 || nativeWidth <= 0 || nativeHeight <= 0 ||
-		!EnsureTaaSpatialNativeTargets(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight) ||
-		!EnsureTaaNativeResolveTarget(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight) ||
-		!EnsureTaaHistoryTarget(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaSpatialNativeTargets(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaNativeResolveTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
 		!EnsureFsr1EasuIntermediateTarget(chainInfo.m_surfaceFormat.format, (uint32)imageWidth, (uint32)imageHeight))
 		return false;
 
@@ -7579,7 +7579,7 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 	// is correct. Reprojection off is exactly the pass as it behaved before
 	// the field existed - not an approximation of it.
 	pass0Uniforms.faroMotionParams[0] = motionFieldUsable ? 1.0f : 0.0f;
-	pass0Uniforms.faroMotionParams[1] = GetConfig().faro_taa_reprojection ? 1.0f : 0.0f;
+	pass0Uniforms.faroMotionParams[1] = 0.0f; // reprojection off - motion estimation is disabled
 	if (!m_taaHistoryValid)
 		m_faroTaaNoHistoryFrames++;
 	auto pass0UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass0Uniforms, sizeof(decltype(pass0Uniforms)) });
@@ -8144,9 +8144,9 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 	texView->baseTexture->GetEffectiveSize(nativeWidth, nativeHeight, 0);
 
 	if (imageWidth <= 0 || imageHeight <= 0 || nativeWidth <= 0 || nativeHeight <= 0 ||
-		!EnsureTaaSpatialNativeTargets(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight) ||
-		!EnsureTaaNativeResolveTarget(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight) ||
-		!EnsureTaaHistoryTarget(VK_FORMAT_R16G16B16A16_SFLOAT, (uint32)nativeWidth, (uint32)nativeHeight))
+		!EnsureTaaSpatialNativeTargets(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaNativeResolveTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight) ||
+		!EnsureTaaHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight))
 		return false;
 
 	draw_endRenderPass();
@@ -8424,7 +8424,7 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 	// is correct. Reprojection off is exactly the pass as it behaved before
 	// the field existed - not an approximation of it.
 	pass0Uniforms.faroMotionParams[0] = motionFieldUsable ? 1.0f : 0.0f;
-	pass0Uniforms.faroMotionParams[1] = GetConfig().faro_taa_reprojection ? 1.0f : 0.0f;
+	pass0Uniforms.faroMotionParams[1] = 0.0f; // reprojection off - motion estimation is disabled
 	if (!m_taaHistoryValid)
 		m_faroTaaNoHistoryFrames++;
 	auto pass0UniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&pass0Uniforms, sizeof(decltype(pass0Uniforms)) });

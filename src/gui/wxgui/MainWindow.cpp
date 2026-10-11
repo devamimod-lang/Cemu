@@ -446,17 +446,36 @@ MainWindow::MainWindow()
 
 	// Faro Mouse motion: register for raw (relative) mouse input on this
 	// window - see MSWWindowProc's own WM_INPUT handling for where the
-	// actual deltas get consumed. RIDEV_INPUTSINK is NOT set, so this only
-	// delivers input while THIS window (or a child of it) has focus -
-	// deliberate, so mouse-look doesn't fire while alt-tabbed away or
-	// while a different window is focused.
+	// actual deltas get consumed.
+	//
+	// RIDEV_INPUTSINK is set so WM_INPUT keeps arriving at THIS window even
+	// when it is not the foreground window. Without it (dwFlags = 0) Windows
+	// only delivers raw input while the registered window itself is in the
+	// foreground, which silently killed mouse-look with the separate GamePad
+	// view open and focused (PadViewFrame is its own top-level window, so the
+	// main frame stops being foreground). Raw input registration is
+	// per-process-per-usage, so a second RegisterRawInputDevices call for
+	// usage 0x02 cannot be added for the pad window - it would REPLACE this
+	// one rather than add to it, which is why INPUTSINK on a single target is
+	// the correct shape here.
+	//
+	// "Don't mouse-look while alt-tabbed" is then enforced where the deltas
+	// are actually consumed (see MSWWindowProc) by checking that the
+	// foreground window still belongs to this process, rather than relying on
+	// Windows to filter the messages for us.
 	{
 		RAWINPUTDEVICE rid{};
 		rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
 		rid.usUsage = 0x02; // HID_USAGE_GENERIC_MOUSE
-		rid.dwFlags = 0;
+		rid.dwFlags = RIDEV_INPUTSINK;
 		rid.hwndTarget = this->GetHWND();
-		::RegisterRawInputDevices(&rid, 1, sizeof(rid));
+		if (!::RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+		{
+			// Logged rather than swallowed: if this fails there is no raw
+			// mouse delta at all, so the mouse-to-gyro provider appears
+			// "connected but dead" with nothing in the UI to explain it.
+			cemuLog_log(LogType::Force, "Faro: RegisterRawInputDevices for mouse motion failed (GetLastError {}) - mouse-to-gyro input will not work", GetLastError());
+		}
 	}
 #endif
 
@@ -1031,8 +1050,52 @@ WXLRESULT MainWindow::MSWWindowProc(WXUINT nMsg, WXWPARAM wParam, WXLPARAM lPara
 			if (raw->header.dwType == RIM_TYPEMOUSE)
 			{
 				const RAWMOUSE& mouse = raw->data.mouse;
+				// Only accumulate movement while a window of THIS process is
+				// in the foreground - RIDEV_INPUTSINK (see the registration
+				// in the constructor) deliberately keeps delivering raw
+				// input in the background, so the "don't mouse-look while
+				// alt-tabbed" rule is enforced here instead. Checked per
+				// message rather than cached because focus can change
+				// between any two mouse packets.
+				DWORD foregroundPid = 0;
+				::GetWindowThreadProcessId(::GetForegroundWindow(), &foregroundPid);
+				const bool ownForeground = foregroundPid == ::GetCurrentProcessId();
+
 				if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0)
-					g_window_info.add_mouse_delta(mouse.lLastX, mouse.lLastY);
+				{
+					if (ownForeground)
+						g_window_info.add_mouse_delta(mouse.lLastX, mouse.lLastY);
+				}
+				else
+				{
+					// Some devices report ABSOLUTE position instead of a
+					// relative delta: Windows Precision Touchpads, pen/tablet
+					// digitizers, VMs and remote-desktop/streaming virtual
+					// mice (RDP, Parsec, Moonlight), and some KVM switches.
+					// On those machines the relative branch above never fires
+					// even once, so mouse-to-gyro was completely dead while
+					// working fine on an ordinary desktop mouse - one of the
+					// reasons this feature behaved differently from PC to PC.
+					// lLastX/lLastY are then normalized coordinates (0..65535
+					// over the virtual desktop, or over the primary monitor
+					// when MOUSE_VIRTUAL_DESKTOP is not set), so the delta
+					// has to be reconstructed by differencing against the
+					// previous packet. Scaled into pixels so sensitivity
+					// means the same thing as on a relative device.
+					const bool virtualDesktop = (mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+					const int screenWidth = ::GetSystemMetrics(virtualDesktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+					const int screenHeight = ::GetSystemMetrics(virtualDesktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+					const sint32 absX = (sint32)((mouse.lLastX / 65535.0f) * std::max(screenWidth, 1));
+					const sint32 absY = (sint32)((mouse.lLastY / 65535.0f) * std::max(screenHeight, 1));
+					if (m_hasLastAbsoluteMousePos && ownForeground)
+						g_window_info.add_mouse_delta(absX - m_lastAbsoluteMouseX, absY - m_lastAbsoluteMouseY);
+					// Tracked even while in the background, so the first
+					// packet after alt-tabbing back does not produce one huge
+					// bogus jump from a stale position.
+					m_lastAbsoluteMouseX = absX;
+					m_lastAbsoluteMouseY = absY;
+					m_hasLastAbsoluteMousePos = true;
+				}
 				// Button IDs (0=left, 1=right, 2=middle, 3/4=side buttons)
 				// match MouseController::get_button_name's own mapping.
 				if (mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) g_window_info.set_mouse_button(0, true);

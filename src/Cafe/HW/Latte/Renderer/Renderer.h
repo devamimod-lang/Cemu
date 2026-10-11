@@ -165,7 +165,30 @@ public:
 	// creates no views/barriers and touches no GPU state, so it cannot change
 	// rendering. Best-effort: no matching tracked view yields invalid, and
 	// consumers must fall back gracefully (current behavior).
+	// Faro: take a private copy of the scene depth buffer while it still holds
+	// the 3D pass, instead of sampling the game's live buffer at present time.
+	// ReShade's generic_depth add-on does the same thing (its "backup
+	// texture", which it uses unconditionally on Vulkan and D3D12) for the
+	// reason that applies here too: once the 3D pass is done the game owns
+	// that buffer again and may clear it, render a second pass into it, or
+	// reuse it entirely before the frame is presented - and whatever it
+	// happens to contain at present time is what the depth-driven effects
+	// would otherwise read.
+	//
+	// Called with the depth buffer the game is UNBINDING, so the copy lands at
+	// the end of a depth-rendering sequence. No-op in the base renderer; only
+	// Vulkan implements it, and it always degrades to "keep sampling the live
+	// buffer" rather than failing, so nothing depends on it succeeding.
+	virtual void CaptureSceneDepthSnapshot(LatteTextureView* depthView) {}
+	// Dropped once per frame, so a frame where no snapshot was taken falls
+	// back to the live buffer rather than reusing last frame's copy.
+	virtual void OnFaroFrameBoundary() {}
+
 	void CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight);
+	// Faro diagnostic: the AA chain bailed out to the plain single-pass path
+	// for this frame - see the increment site in LatteRenderTarget.
+	void NotifyAaFallbackFrame() { m_faroTaaFallbackFrames++; }
+	void NotifyDepthSnapshotTaken() { m_faroDepthSnapshotCount++; }
 	LatteTextureView* GetCapturedDepthView() const { return m_depthCaptureView; }
 	bool HasCapturedDepth() const { return m_depthCaptureValid; }
 	void GetCapturedDepthSize(uint32& w, uint32& h) const { w = m_depthCaptureWidth; h = m_depthCaptureHeight; }
@@ -296,6 +319,29 @@ protected:
 	// consecutive misses since the last confirmed match; reset to 0 on any
 	// fresh match.
 	uint32 m_depthCaptureMissStreak = 0;
+	// Counts captures, to fire the periodic depth-buffer dump - see
+	// LatteMRT::LogDepthCandidates.
+	uint32 m_depthCaptureProbeCounter = 0;
+	// Faro: how many frames actually dispatched each effect, versus how many
+	// frames were presented. Reported by the periodic depth probe. Answers the
+	// one question the depth diagnostics cannot: is the effect being SKIPPED on
+	// some frames, or is it drawn every frame and unstable inside the shader?
+	uint32 m_faroFrameCounter = 0;
+	uint32 m_faroGtaoRanFrames = 0;
+	uint32 m_faroSsrRanFrames = 0;
+	// Faro: per-frame events in the AA chain that produce a visible pop but
+	// log nothing today - the TAA dispatch bailing out to the plain
+	// single-pass fallback, and the history being treated as unusable so the
+	// resolve passes the current frame straight through.
+	uint32 m_faroTaaFallbackFrames = 0;
+	uint32 m_faroTaaNoHistoryFrames = 0;
+	// Faro: how many depth snapshots were taken in a frame. If this is not a
+	// constant, the capture point inside the frame is moving, which means the
+	// depth handed to the AO pass contains a different stage of the scene from
+	// one frame to the next.
+	uint32 m_faroDepthSnapshotCount = 0;
+	uint32 m_faroDepthSnapshotMin = 0xFFFFFFFF;
+	uint32 m_faroDepthSnapshotMax = 0;
 
 #if BOOST_OS_WINDOWS
 	std::unique_ptr<DXGIWrapper> m_dxgi_wrapper{};

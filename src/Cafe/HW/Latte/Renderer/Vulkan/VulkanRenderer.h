@@ -298,6 +298,10 @@ public:
 	// LatteTextureViewVk - used to bind the FXAA/RCAS intermediate target,
 	// which is a raw internal render target rather than an emulated GX2 texture.
 	VkDescriptorSet backbufferBlit_createDescriptorSetRaw(VkDescriptorSetLayout descriptor_set_layout, VkImageView imageView, VkSampler sampler);
+	// See the implementation: cached per view combination and written once,
+	// because rewriting one shared set every frame races the frames still in
+	// flight that are reading it.
+	VkDescriptorSet GetFaroEffectDescriptorSet(VkImageView colorView, VkSampler colorSampler, VkImageView depthView, VkSampler depthSampler, VkImageView extraView = VK_NULL_HANDLE, VkSampler extraSampler = VK_NULL_HANDLE);
 	// (Re)creates m_fsr1EasuIntermediate* (EASU's raw upscaled-but-unsharpened
 	// output - RCAS's own input) to match the requested size/format if needed.
 	// Same render-pass-compatibility trick as EnsureFxaaIntermediateTarget
@@ -408,31 +412,6 @@ public:
 	// output target.
 	bool EnsureGiScratchTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyGiScratchTarget();
-	// Faro SSR: two internal passes now (see s_ssr_flatness_shader's own doc
-	// comment) - a tiny pre-pass computes+temporally-blends the reflective-
-	// surface gate into m_ssrFlatnessScratchImage, then the main ssrShader
-	// pass reads that instead of computing curvature raw. Same
-	// shape/parameters/ping-pong-reuse contract as RunFaroGtaoPass.
-	bool RunFaroSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
-		VkImageView colorInputView, VkSampler colorInputSampler,
-		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent);
-	void DestroySsrTargets();
-	// (Re)creates m_ssrFlatnessScratchImage - this frame's freshly computed +
-	// blended flatness value (see RunFaroSsrPass's own comment) - own
-	// render pass/framebuffer, rendered into every call, R8_UNORM - single
-	// channel is enough, this only ever holds a 0..1 gate value.
-	bool EnsureSsrFlatnessScratchTarget(VkFormat format, uint32 width, uint32 height);
-	void DestroySsrFlatnessScratchTarget();
-	// (Re)creates m_ssrFlatnessHistoryImage - last frame's copy of the
-	// scratch target above, read (never rendered into) by the NEXT frame's
-	// flatness pre-pass as its blend input. Mirrors EnsureTaaHistoryTarget
-	// exactly (WITHOUT resetting validity unless size/format actually
-	// changed - the whole point is for this to survive across frames -
-	// updated via vkCmdCopyImage at the end of RunFaroSsrPass, same
-	// "compute into scratch, copy to history" shape as Faro TAA's own
-	// m_taaNativeResolve -> m_taaHistoryImage step).
-	bool EnsureSsrFlatnessHistoryTarget(VkFormat format, uint32 width, uint32 height);
-	void DestroySsrFlatnessHistoryTarget();
 	// (Re)creates m_taaHistory* to match the requested size/format, WITHOUT
 	// resetting m_taaHistoryValid unless the size/format actually changed (the
 	// whole point of this target is to survive across frames - unlike every
@@ -445,6 +424,10 @@ public:
 	// display output resolution - see DrawBackbufferQuadFsr1Taa's own comment
 	// on why TAA resolves before FSR1's upscale, not after it.
 	bool EnsureTaaHistoryTarget(VkFormat format, uint32 width, uint32 height);
+
+	// Faro scene-depth snapshot - see Renderer::CaptureSceneDepthSnapshot.
+	void CaptureSceneDepthSnapshot(LatteTextureView* depthView) override;
+	void OnFaroFrameBoundary() override;
 	void DestroyTaaHistoryTarget();
 	// (Re)creates the native-resolution target that the TAA resolve pass
 	// renders into (current frame's jittered image blended with history) -
@@ -761,7 +744,11 @@ private:
 	// misc
 	void CreatePipelineCache();
 	VkPipelineShaderStageCreateInfo CreatePipelineShaderStageCreateInfo(VkShaderStageFlagBits stage, VkShaderModule& module, const char* entryName) const;
-	VkPipeline backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader);
+	VkPipeline backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader, VkRenderPass renderPass = VK_NULL_HANDLE);
+	// See the implementation's own comment: required whenever a render pass
+	// these pipelines were built against is destroyed, because the cache key
+	// includes the render pass handle and Vulkan may recycle handle values.
+	void InvalidateBackbufferBlitPipelineCache();
 	bool AcquireNextSwapchainImage(bool mainWindow);
 	void RecreateSwapchain(bool mainWindow, bool skipCreate = false);
 
@@ -794,6 +781,40 @@ private:
 	std::thread m_pipeline_cache_save_thread;
 	VkPipelineCache m_pipeline_cache{ nullptr };
 	std::unordered_map<uint64, VkPipeline> m_backbufferBlitPipelineCache;
+	// Faro effect descriptor sets, keyed on the views they point at - see
+	// GetFaroEffectDescriptorSet.
+	std::unordered_map<uint64, VkDescriptorSet> m_faroEffectDescriptorSetCache;
+	// Pipelines retired because the render pass they were built against went
+	// away - see InvalidateBackbufferBlitPipelineCache for why they outlive
+	// their cache entry instead of being destroyed on the spot.
+	std::vector<VkPipeline> m_backbufferBlitPipelineGraveyard;
+
+	// Faro: private copy of the scene depth buffer - see
+	// Renderer::CaptureSceneDepthSnapshot for why the live buffer is not good
+	// enough. Same format and size as the source depth texture so the copy is
+	// a plain vkCmdCopyImage with no format conversion; the view uses the
+	// DEPTH aspect only, which is what makes it samplable even when the source
+	// is a combined depth/stencil format.
+	VkImage m_faroDepthSnapshotImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroDepthSnapshotAllocation = nullptr;
+	VkImageView m_faroDepthSnapshotView = VK_NULL_HANDLE;
+	VkSampler m_faroDepthSnapshotSampler = VK_NULL_HANDLE;
+	VkExtent2D m_faroDepthSnapshotExtent{};
+	VkFormat m_faroDepthSnapshotFormat = VK_FORMAT_UNDEFINED;
+	// Only true between a successful copy this frame and the next
+	// OnFaroFrameBoundary. GTAO/SSR check it and fall back to the
+	// live depth view when it is false.
+	bool m_faroDepthSnapshotValid = false;
+	bool m_faroDepthSnapshotLoggedOnce = false;
+	// Frames since the last successful copy - see OnFaroFrameBoundary.
+	uint32 m_faroDepthSnapshotAge = 0;
+	// Deferred (re)creation request - see CaptureSceneDepthSnapshot.
+	VkFormat m_faroDepthSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
+	uint32 m_faroDepthSnapshotPendingWidth = 0;
+	uint32 m_faroDepthSnapshotPendingHeight = 0;
+
+	bool EnsureFaroDepthSnapshotTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyFaroDepthSnapshotTarget();
 	std::unordered_map<uint64, VkDescriptorSet> m_backbufferBlitDescriptorSetCache;
 	VkPipelineLayout m_pipelineLayout{nullptr};
 
@@ -817,6 +838,76 @@ private:
 	// or which gets presented directly when no further antialiasing pass is
 	// active. Lazily (re)created by EnsureFxaaIntermediateTarget when the
 	// requested size or format changes (e.g. window resize).
+	// Faro GTAO: the raw AO factor, written by the AO pass and read by the
+	// bilateral denoise pass that then applies it to colour - see
+	// s_gtao_denoise_shader_body for why that split is necessary. Single
+	// channel and 16-bit float: the AO is one scalar in [0,1], and R16_SFLOAT
+	// is a mandatory format for colour attachment plus sampling with linear
+	// filtering, so this needs no per-device fallback.
+	VkImage m_faroAoImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroAoAllocation = nullptr;
+	VkImageView m_faroAoView = VK_NULL_HANDLE;
+	VkSampler m_faroAoSampler = VK_NULL_HANDLE;
+	VkRenderPass m_faroAoRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_faroAoFramebuffer = VK_NULL_HANDLE;
+	VkExtent2D m_faroAoExtent{};
+
+	bool CreateFaroAoTarget(uint32 width, uint32 height);
+	void DestroyFaroAoTarget();
+
+	// Faro motion estimation: a small luma+depth pyramid of this frame and the
+	// previous one, plus the motion field matched between them. Feeds the TAA
+	// resolve so history can be reprojected instead of sampled at the same
+	// pixel - without that, accumulation only works while the camera is still.
+	//
+	// Three levels at a quarter of native resolution and down. Motion fields
+	// are smooth almost everywhere, so a quarter-res field upsamples cleanly
+	// at 1/16 of the cost, and the resolve's variance clipping remains the
+	// safety net for whatever this misses.
+	//
+	// Every level is addressed through its OWN single-mip view, used both as
+	// the render target for that level and as the sampled image when the next
+	// level reads it. That keeps each descriptor's subresource range exactly
+	// equal to what the shader touches, so no level is ever sampled while it
+	// sits in a layout meant for a different one.
+	static constexpr uint32 kFaroMotionLevels = 3;
+	VkImage m_faroMotionGrayImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroMotionGrayAllocation = nullptr;
+	VkImage m_faroMotionPrevImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroMotionPrevAllocation = nullptr;
+	VkImage m_faroMotionVectorImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroMotionVectorAllocation = nullptr;
+	VkImageView m_faroMotionGrayMipView[kFaroMotionLevels]{};
+	VkImageView m_faroMotionPrevMipView[kFaroMotionLevels]{};
+	VkImageView m_faroMotionVectorMipView[kFaroMotionLevels]{};
+	VkFramebuffer m_faroMotionGrayFramebuffer[kFaroMotionLevels]{};
+	VkFramebuffer m_faroMotionVectorFramebuffer[kFaroMotionLevels]{};
+	VkRenderPass m_faroMotionRenderPass = VK_NULL_HANDLE;
+	VkSampler m_faroMotionSampler = VK_NULL_HANDLE;
+	// Own depth sampler. Borrowing m_gtaoDepthSampler meant depending on a
+	// pass that runs LATER in the frame having already created it.
+	VkSampler m_faroMotionDepthSampler = VK_NULL_HANDLE;
+	bool m_faroMotionLoggedBail = false;
+	// Deferred (re)creation request. Allocating these mid-frame means a
+	// WaitDeviceIdle inside a half-recorded frame, which crashes the driver -
+	// see RunFaroMotionEstimation.
+	uint32 m_faroMotionPendingWidth = 0;
+	uint32 m_faroMotionPendingHeight = 0;
+	VkExtent2D m_faroMotionExtent{}; // level 0
+	// False until the previous-frame pyramid actually holds a previous frame.
+	bool m_faroMotionHistoryValid = false;
+
+	bool CreateFaroMotionTargets(uint32 width, uint32 height);
+	void ProcessDeferredFaroTargets();
+	void DestroyFaroMotionTargets();
+	// Builds this frame's pyramid, matches it against last frame's, and
+	// leaves the finest motion field in m_faroMotionVectorMipView[0].
+	// Returns false (and leaves the field unusable) when there is no scene
+	// depth to match on, which is the same gate GTAO uses.
+	bool RunFaroMotionEstimation(LatteTextureView* texView, bool padView,
+		VkImageView sourceColorView, VkSampler sourceColorSampler,
+		sint32 nativeWidth, sint32 nativeHeight);
+
 	VkImage m_fxaaIntermediateImage = VK_NULL_HANDLE;
 	VkImageMemAllocation* m_fxaaIntermediateAllocation = nullptr;
 	VkImageView m_fxaaIntermediateView = VK_NULL_HANDLE;
@@ -905,46 +996,6 @@ private:
 	// output) and binding 2 (scene depth) both rewritten every draw, same
 	// reasoning as m_giDescriptorSet's own bindings.
 	VkDescriptorSet m_giBlurDescriptorSet = VK_NULL_HANDLE;
-
-	// Faro SSR: main pass descriptor set/depth sampler - see RunFaroSsrPass's
-	// own comment for the two-pass (flatness pre-pass + main pass) shape.
-	VkDescriptorSet m_ssrDescriptorSet = VK_NULL_HANDLE;
-	VkSampler m_ssrDepthSampler = VK_NULL_HANDLE;
-
-	// Faro SSR: flatness pre-pass descriptor set + its own sampler for
-	// sampling m_ssrFlatnessHistoryView/m_ssrFlatnessScratchView (linear/
-	// clamp, same simple params as every other Faro-owned sampler here -
-	// shared between reading history in the pre-pass and reading the fresh
-	// scratch result in the main pass, since both are plain single-channel
-	// 0..1 gate values with identical filtering needs).
-	VkDescriptorSet m_ssrFlatnessDescriptorSet = VK_NULL_HANDLE;
-	VkSampler m_ssrFlatnessSampler = VK_NULL_HANDLE;
-	// This frame's freshly computed+blended flatness (see
-	// EnsureSsrFlatnessScratchTarget's own comment) - rendered into via its
-	// own dedicated render pass/framebuffer.
-	// Only the R channel is ever meaningful, but created at the SAME format
-	// as the swapchain surface (see RunFaroSsrPass's own comment) rather
-	// than a single-channel format - needed so backbufferBlit_
-	// createGraphicsPipeline's cached pipeline (built against
-	// chainInfo.m_swapchainRenderPass) stays render-pass-compatible per
-	// Vulkan's compatibility rules (same idea as EnsureFxaaIntermediateTarget's
-	// own doc comment).
-	VkImage m_ssrFlatnessScratchImage = VK_NULL_HANDLE;
-	VkImageMemAllocation* m_ssrFlatnessScratchAllocation = nullptr;
-	VkImageView m_ssrFlatnessScratchView = VK_NULL_HANDLE;
-	VkRenderPass m_ssrFlatnessScratchRenderPass = VK_NULL_HANDLE;
-	VkFramebuffer m_ssrFlatnessScratchFramebuffer = VK_NULL_HANDLE;
-	VkExtent2D m_ssrFlatnessScratchExtent{};
-	VkFormat m_ssrFlatnessScratchFormat = VK_FORMAT_UNDEFINED;
-	// Last frame's copy of the scratch image above (see
-	// EnsureSsrFlatnessHistoryTarget's own comment) - never rendered into,
-	// only vkCmdCopyImage'd into and sampled, same shape as m_taaHistory*.
-	VkImage m_ssrFlatnessHistoryImage = VK_NULL_HANDLE;
-	VkImageMemAllocation* m_ssrFlatnessHistoryAllocation = nullptr;
-	VkImageView m_ssrFlatnessHistoryView = VK_NULL_HANDLE;
-	VkExtent2D m_ssrFlatnessHistoryExtent{};
-	VkFormat m_ssrFlatnessHistoryFormat = VK_FORMAT_UNDEFINED;
-	bool m_ssrFlatnessHistoryValid = false;
 
 	// Faro TAA: history texture (previous frame's resolved TAA output, at
 	// native/source resolution - see DrawBackbufferQuadFsr1Taa's own comment

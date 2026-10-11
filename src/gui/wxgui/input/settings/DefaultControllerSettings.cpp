@@ -54,6 +54,44 @@ DefaultControllerSettings::DefaultControllerSettings(wxWindow* parent, const wxP
 		sizer->Add(box_sizer, 1, wxALL|wxEXPAND, 5);
 	}
 
+	// Faro Mouse motion: mouse-to-gyro only. A real gyro reports actual
+	// angular velocity, so it needs neither a sensitivity scale nor axis
+	// inversion - a simulated one does: the usable scale depends on the
+	// player's own mouse DPI, and which way each axis should go depends on
+	// how the game reads the gyro. Hard-coding either is what makes the
+	// feature feel broken on someone else's PC, so both are exposed here
+	// and persisted in the controller profile (see MouseController::save).
+	m_mouse_controller = std::dynamic_pointer_cast<MouseController>(m_controller);
+	if (m_mouse_controller)
+	{
+		auto* box = new wxStaticBox(this, wxID_ANY, _("Mouse motion"));
+		auto* box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
+
+		auto* sensitivitySizer = new wxBoxSizer(wxHORIZONTAL);
+		sensitivitySizer->Add(new wxStaticText(box, wxID_ANY, _("Sensitivity")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+		// The slider works in permille of the configured maximum so the whole
+		// usable range (kSensitivityMin..kSensitivityMax) is reachable with
+		// integer-only wxSlider positions.
+		m_mouse_sensitivity = new wxSlider(box, wxID_ANY, sensitivity_to_slider(m_mouse_controller->get_sensitivity()), 0, 1000);
+		sensitivitySizer->Add(m_mouse_sensitivity, 1, wxALL | wxEXPAND, 5);
+
+		auto* sensitivityText = new wxStaticText(box, wxID_ANY, wxString::Format("%.4f", m_mouse_controller->get_sensitivity()));
+		sensitivitySizer->Add(sensitivityText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+		m_mouse_sensitivity->Bind(wxEVT_SLIDER, &DefaultControllerSettings::on_mouse_sensitivity_change, this, wxID_ANY, wxID_ANY, new wxControlObject(sensitivityText));
+
+		box_sizer->Add(sensitivitySizer, 0, wxEXPAND);
+
+		m_mouse_invert_x = new wxCheckBox(box, wxID_ANY, _("Invert horizontal (yaw)"));
+		m_mouse_invert_x->SetValue(m_mouse_controller->get_invert_x());
+		box_sizer->Add(m_mouse_invert_x, 0, wxEXPAND | wxALL, 5);
+
+		m_mouse_invert_y = new wxCheckBox(box, wxID_ANY, _("Invert vertical (pitch)"));
+		m_mouse_invert_y->SetValue(m_mouse_controller->get_invert_y());
+		box_sizer->Add(m_mouse_invert_y, 0, wxEXPAND | wxALL, 5);
+
+		sizer->Add(box_sizer, 1, wxALL | wxEXPAND, 5);
+	}
+
 	auto* row_sizer = new wxBoxSizer(wxHORIZONTAL);
 	// Axis
 	{
@@ -231,6 +269,39 @@ void DefaultControllerSettings::update_settings()
 	m_controller->set_settings(m_settings);
 	if (m_use_motion)
 		m_controller->set_use_motion(m_use_motion->GetValue());
+
+	if (m_mouse_controller)
+	{
+		m_mouse_controller->set_sensitivity(slider_to_sensitivity(m_mouse_sensitivity->GetValue()));
+		m_mouse_controller->set_invert_x(m_mouse_invert_x->GetValue());
+		m_mouse_controller->set_invert_y(m_mouse_invert_y->GetValue());
+	}
+}
+
+// Faro Mouse motion: wxSlider positions are integers, while the usable
+// sensitivity range is a narrow band of small floats - these two map between
+// the slider's 0..1000 and that band.
+float DefaultControllerSettings::slider_to_sensitivity(int value)
+{
+	const float t = std::clamp(value / 1000.0f, 0.0f, 1.0f);
+	return MouseController::kSensitivityMin + t * (MouseController::kSensitivityMax - MouseController::kSensitivityMin);
+}
+
+int DefaultControllerSettings::sensitivity_to_slider(float sensitivity)
+{
+	const float t = (sensitivity - MouseController::kSensitivityMin) /
+	                (MouseController::kSensitivityMax - MouseController::kSensitivityMin);
+	return (int)std::lround(std::clamp(t, 0.0f, 1.0f) * 1000.0f);
+}
+
+void DefaultControllerSettings::on_mouse_sensitivity_change(wxCommandEvent& event)
+{
+	// Not update_slider_text(): that one prints the slider's raw integer
+	// position, which here is a meaningless 0..1000 index rather than the
+	// value itself.
+	auto* slider_text = dynamic_cast<wxControlObject*>(event.GetEventUserData())->GetControl<wxStaticText>();
+	wxASSERT(slider_text);
+	slider_text->SetLabel(wxString::Format("%.4f", slider_to_sensitivity(event.GetInt())));
 }
 
 void DefaultControllerSettings::on_timer(wxTimerEvent& event)

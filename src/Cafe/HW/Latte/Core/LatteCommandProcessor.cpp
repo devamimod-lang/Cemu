@@ -80,6 +80,13 @@ public:
 			g_renderer->draw_execute(baseVertex, baseInstance, numInstances, count, MPTR_NULL, Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE::AUTO, m_drawcallContext);
 		}
 		performanceMonitor.cycle[performanceMonitor.cycleIndex].drawCallCounter++;
+		// Faro Global Enhancements: attribute this draw's geometry to the
+		// depth buffer it rendered into, so scene-depth detection can rank
+		// candidate buffers by actual workload (ReShade generic_depth's own
+		// approach - see LatteMRT::FindSceneDepthViewForSize). Recorded here,
+		// in the renderer-agnostic dispatch, so Vulkan/OpenGL/Metal all feed
+		// the same statistics.
+		LatteMRT::NotifyDepthDrawcall(count, numInstances);
 		if (!m_drawcallContext.isFirst)
 			performanceMonitor.cycle[performanceMonitor.cycleIndex].fastDrawCallCounter++;
 		m_drawcallContext.isFirst = false;

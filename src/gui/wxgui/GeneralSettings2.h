@@ -81,9 +81,21 @@ private:
 	wxChoice* m_antialiasing_mode;
 	wxChoice* m_smaa_quality;
 	wxChoice* m_taa_spatial_aa;
+	// Faro FSR1: RCAS controls - only enabled while FSR 1.0 is the active
+	// upscale filter (RCAS is FSR1's own second pass).
+	wxSlider* m_fsr_rcas_sharpness;
+	// Faro TAA: history length / sharpening - only enabled in TAA mode.
+	wxCheckBox* m_taa_jitter;
+	wxSlider* m_taa_history;
+	wxSlider* m_taa_sharpness;
+	// Faro TAA reprojection switch - see CemuConfig::faro_taa_reprojection.
+	wxCheckBox* m_taa_reprojection = nullptr;
+	wxCheckBox* m_fsr_rcas_denoise;
 	wxRadioBox* m_force_anisotropic_level;
-	wxCheckBox *m_faro_postfx, *m_faro_ssao, *m_faro_ssr;
-	wxSlider *m_faro_ssao_intensity, *m_faro_ssr_intensity;
+	wxCheckBox *m_faro_postfx, *m_faro_ssao;
+	wxCheckBox* m_faro_depth_snapshot;
+	wxChoice* m_faro_debug_view;
+	wxSlider *m_faro_ssao_intensity;
 	wxChoice* m_faro_ssao_quality;
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;

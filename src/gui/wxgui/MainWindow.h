@@ -205,6 +205,17 @@ private:
 	bool m_menu_visible = false;
 	bool m_game_launched = false;
 
+#if BOOST_OS_WINDOWS
+	// Faro Mouse motion: last absolute position reported by a raw mouse that
+	// sends MOUSE_MOVE_ABSOLUTE packets (touchpads, tablets, virtual/remote
+	// mice) - such a device never reports a relative delta, so MSWWindowProc
+	// has to difference consecutive positions itself. See its own WM_INPUT
+	// handling for why that matters.
+	sint32 m_lastAbsoluteMouseX = 0;
+	sint32 m_lastAbsoluteMouseY = 0;
+	bool m_hasLastAbsoluteMousePos = false;
+#endif
+
 	#ifdef ENABLE_DISCORD_RPC
 	std::unique_ptr<DiscordPresence> m_discord;
 	#endif

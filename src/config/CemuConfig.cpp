@@ -153,6 +153,14 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 		antialiasing_mode = kAANone;
 	smaa_quality = graphic.get("SmaaQuality", kSmaaHigh);
 	taa_spatial_aa = graphic.get("TaaSpatialAA", kTaaSpatialFxaa);
+	fsr_rcas_sharpness = std::clamp<sint32>(graphic.get("FsrRcasSharpness", 20), kFsrRcasSharpnessMin, kFsrRcasSharpnessMax);
+	fsr_rcas_denoise = graphic.get("FsrRcasDenoise", false);
+	faro_depth_snapshot = graphic.get("FaroDepthSnapshot", false);
+	faro_debug_view = std::clamp<sint32>(graphic.get("FaroDebugView", 0), 0, 6);
+	taa_history = std::clamp<sint32>(graphic.get("TaaHistory", 90), 0, 100);
+	taa_jitter = graphic.get("TaaJitter", true);
+	taa_sharpness = std::clamp<sint32>(graphic.get("TaaSharpness", 50), 0, 100);
+	faro_taa_reprojection = graphic.get("FaroTaaReprojection", false);
 	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
 	// Faro Global Enhancements (see CemuConfig.h)
 	faro_postfx_enabled = graphic.get("FaroPostFX", false);
@@ -161,8 +169,6 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	faro_ssao_quality = graphic.get("FaroSSAOQuality", 1);
 	faro_gi_enabled = graphic.get("FaroGI", false);
 	faro_gi_intensity = graphic.get("FaroGIIntensity", 50);
-	faro_ssr_enabled = graphic.get("FaroSSR", false);
-	faro_ssr_intensity = graphic.get("FaroSSRIntensity", 50);
 	faro_shadow_scale = graphic.get("FaroShadowScale", 1);
 	async_compile = graphic.get("AsyncCompile", async_compile);
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
@@ -401,6 +407,14 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("AntialiasingMode", antialiasing_mode);
 	graphic.set("SmaaQuality", smaa_quality);
 	graphic.set("TaaSpatialAA", taa_spatial_aa);
+	graphic.set("FsrRcasSharpness", fsr_rcas_sharpness);
+	graphic.set("FsrRcasDenoise", fsr_rcas_denoise);
+	graphic.set("FaroDepthSnapshot", faro_depth_snapshot);
+	graphic.set("FaroDebugView", faro_debug_view);
+	graphic.set("TaaHistory", taa_history);
+	graphic.set("TaaJitter", taa_jitter);
+	graphic.set("TaaSharpness", taa_sharpness);
+	graphic.set("FaroTaaReprojection", faro_taa_reprojection);
 	graphic.set("ForceAnisotropicLevel", force_anisotropic_level);
 	graphic.set("FaroPostFX", faro_postfx_enabled);
 	graphic.set("FaroSSAO", faro_ssao_enabled);
@@ -408,8 +422,6 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("FaroSSAOQuality", faro_ssao_quality);
 	graphic.set("FaroGI", faro_gi_enabled);
 	graphic.set("FaroGIIntensity", faro_gi_intensity);
-	graphic.set("FaroSSR", faro_ssr_enabled);
-	graphic.set("FaroSSRIntensity", faro_ssr_intensity);
 	graphic.set("FaroShadowScale", faro_shadow_scale);
 	graphic.set("AsyncCompile", async_compile.GetValue());
 	graphic.set("vkAccurateBarriers", vk_accurate_barriers);

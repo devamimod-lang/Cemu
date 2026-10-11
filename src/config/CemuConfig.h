@@ -543,6 +543,109 @@ struct CemuConfig
 	};
 	ConfigValue<sint32> taa_spatial_aa{kTaaSpatialFxaa};
 
+	// Faro FSR1: RCAS sharpness, in AMD's own "stops" scale from
+	// FsrRcasCon (ffx_fsr1.h): 0.0 = maximum sharpness, and each whole step
+	// up halves it (sharpness is applied as exp2(-stops)). Stored in
+	// hundredths of a stop so it can live in an integer ConfigValue and still
+	// be adjusted finely - the useful range is roughly 0.0 to 2.0 stops.
+	// Previously a hard-coded 0.2 inside the shader with no way to change it,
+	// which is not a sensible single answer: how sharp FSR1 should be depends
+	// on the upscale ratio (more aggressive upscales need more sharpening to
+	// stop looking soft) and on the display, so this is exactly the kind of
+	// value that has to be adjustable per machine rather than chosen once.
+	static constexpr sint32 kFsrRcasSharpnessMin = 0;   // 0.00 stops - sharpest
+	static constexpr sint32 kFsrRcasSharpnessMax = 200; // 2.00 stops - softest
+	ConfigValue<sint32> fsr_rcas_sharpness{20};         // 0.20 stops, the previous hard-coded value
+
+	// Faro FSR1: enable RCAS's own optional noise-detection path
+	// (FSR_RCAS_DENOISE in ffx_fsr1.h). It computes a normalized highpass of
+	// the local neighbourhood and scales the sharpening lobe by it, so
+	// sharpening concentrates on real edges instead of amplifying film grain
+	// and dithering. AMD leaves it off by default and suggests applying grain
+	// after RCAS instead - but an emulator cannot reorder a game's own
+	// post-processing, and Wii U titles frequently ship dithered/grainy
+	// output, so being able to turn it on matters here in a way it does not
+	// in a native integration. Costs a handful of extra ALU ops in the RCAS
+	// pass.
+	ConfigValue<bool> fsr_rcas_denoise{false};
+
+	// Faro: let GTAO/SSR read a private copy of the scene depth instead of the
+	// game's live buffer (see Renderer::CaptureSceneDepthSnapshot). Off by
+	// default because the copy is recorded mid-frame from the framebuffer-bind
+	// path; ReShade ships its own equivalent (preserve_depth_buffers) off by
+	// default for the same kind of reason.
+	ConfigValue<bool> faro_depth_snapshot{false};
+
+	// Faro: output an intermediate buffer of the AO chain instead of the
+	// shaded image, to localise instability by eye. CPU counters can prove a
+	// pass ran and that the depth selection held; they cannot show whether the
+	// depth DATA is steady, and that is the gap this closes.
+	enum FaroDebugView
+	{
+		kFaroDebugOff = 0,
+		kFaroDebugRawDepth = 1,
+		kFaroDebugRawAo = 2,
+		kFaroDebugConfidence = 3,
+		kFaroDebugMarchRadius = 4,
+		kFaroDebugDenoisedAo = 5,
+		kFaroDebugMotionField = 6,
+	};
+	ConfigValue<sint32> faro_debug_view{kFaroDebugOff};
+
+	// Faro TAA: how much of the previous frame the temporal resolve is allowed
+	// to keep, 0-100. Higher means a longer history: more antialiasing, but
+	// also more softening, because this TAA has no motion vectors yet (see
+	// LatteMRT::GetCurrentTaaJitter) and so blends history that is misaligned
+	// by whatever the camera moved. That trade-off has no single right answer
+	// - it depends on the game, the resolution and how much softness the
+	// player tolerates - which is why it is a slider rather than a constant.
+	// Maps to the minimum weight of the CURRENT frame in the resolve:
+	// 100 -> 0.05 (longest history), 0 -> 1.00 (history off entirely).
+	// The default of 90 reproduces the 0.10 floor the resolve used before this
+	// setting existed.
+	ConfigValue<sint32> taa_history{90};
+
+	// Faro TAA: sub-pixel jitter, which is what makes the temporal pass a real
+	// antialiaser rather than a fade.
+	//
+	// A setting rather than a constant because it has been switched both ways
+	// on evidence and the call belongs to the player. Without jitter, a still
+	// camera renders frame N identical to frame N-1, so blending them returns
+	// that same image and the pass cannot add one bit of antialiasing - all of
+	// it comes from the FXAA/SMAA pre-pass. With jitter, accumulation is
+	// genuine supersampling. The catch is that it only works if the resolve
+	// accumulates instead of rejecting: an earlier resolve drove the blend
+	// weight towards the current frame in proportion to how far history had
+	// been clipped, which stalled accumulation on exactly the high-contrast
+	// edges that needed it and left the jitter on screen as a visible tremble.
+	// That is fixed (see s_taa_resolve_shader_source), but the setting stays so
+	// the two can be compared without a rebuild.
+	ConfigValue<bool> taa_jitter{true};
+
+	// Faro TAA: strength of the resolve's own unsharp mask, 0-100, scaled by
+	// how much history was actually used so a still image (the case that gets
+	// softened most) gets the most correction. Compensates the temporal blur
+	// above; too much of it brings back aliasing as ringing.
+	ConfigValue<sint32> taa_sharpness{50};
+
+	// Faro TAA: use the motion field to fetch history from where this pixel
+	// USED to be, instead of from its own coordinate.
+	//
+	// This is what makes a long history safe. Without it the resolve can only
+	// average a pixel with itself one frame earlier, which is not
+	// antialiasing but a fade towards the previous frame - and that is the
+	// whole reason taa_history has to be turned down by hand to avoid smearing.
+	// With it, the samples being averaged all show the same piece of world, so
+	// taa_history can go back up without the blur.
+	//
+	// A setting rather than a compile-time constant, and off by default,
+	// because this changes what every single pixel fetches: being able to A/B
+	// it against the old behaviour on the same scene is the only way to tell
+	// an improvement from a different set of artifacts. Needs a depth buffer
+	// to match on, so it silently does nothing on a title without one - see
+	// RunFaroMotionEstimation's own bail-outs.
+	ConfigValue<bool> faro_taa_reprojection{false};
+
 	// Faro: force anisotropic filtering globally, overriding whatever level the
 	// game's own sampler requested. Only applied when a graphic pack hasn't
 	// already set its own per-texture override (LatteTexture.h's
@@ -581,8 +684,6 @@ struct CemuConfig
 	// gating it off, per user request.
 	ConfigValue<bool> faro_gi_enabled{false};
 	ConfigValue<sint32> faro_gi_intensity{50};
-	ConfigValue<bool> faro_ssr_enabled{false};
-	ConfigValue<sint32> faro_ssr_intensity{50};
 	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio

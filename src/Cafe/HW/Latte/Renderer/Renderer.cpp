@@ -79,9 +79,24 @@ void Renderer::CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight)
 	// misses with the last confirmed view (kept alive only while it's still
 	// genuinely tracked - see IsDepthViewStillTracked) smooths this over
 	// without touching the underlying MRU search at all.
-	constexpr uint32 kDepthCaptureGraceFrames = 4;
-
-	LatteTextureView* depthView = LatteMRT::FindSceneDepthViewForSize(outputWidth, outputHeight);
+	// Faro: the selection is STICKY, matching ReShade's generic_depth add-on.
+	// In its on_begin_render_effects, when the heuristic finds no winner for a
+	// frame the whole update block is skipped and the previously selected
+	// shader resource is simply kept - it never falls back to "no depth". That
+	// is deliberate: a frame where the search comes up empty is almost always
+	// a hiccup in the search (an alternating depth buffer, a frame that
+	// skipped the 3D pass, a buffer rebound in a different order), not the
+	// scene depth actually ceasing to exist.
+	//
+	// This used to expire after a few frames, which is what made SSAO and SSR
+	// visibly blink off and back on - both standing still and moving - because
+	// they are hard-gated on HasCapturedDepth() with no smoothing of their
+	// own. Holding the last known-good view for as long as it is genuinely
+	// still tracked (NotifyTextureDeletion prunes it the moment the texture is
+	// actually gone, so this can never dangle) removes that class of flicker
+	// entirely instead of merely shortening it.
+	LatteTextureView* depthView = LatteMRT::FindSceneDepthViewForSize(outputWidth, outputHeight, m_depthCaptureView);
+	LatteTextureView* previousView = m_depthCaptureView;
 	bool freshMatch = false;
 	uint32 w = 0, h = 0;
 	if (depthView && depthView->baseTexture)
@@ -102,9 +117,13 @@ void Renderer::CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight)
 	}
 	else
 	{
+		// Hold the previous selection for as long as the texture behind it is
+		// still alive. No frame counter: the only thing that can legitimately
+		// invalidate it is the texture actually going away, and
+		// NotifyTextureDeletion handles that by pruning it from the tracked
+		// set, which IsDepthViewStillTracked reports here.
 		m_depthCaptureMissStreak++;
-		bool stillAlive = m_depthCaptureView && LatteMRT::IsDepthViewStillTracked(m_depthCaptureView);
-		valid = stillAlive && m_depthCaptureMissStreak <= kDepthCaptureGraceFrames;
+		valid = m_depthCaptureView && LatteMRT::IsDepthViewStillTracked(m_depthCaptureView);
 		if (!valid)
 		{
 			m_depthCaptureView = nullptr;
@@ -113,14 +132,61 @@ void Renderer::CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight)
 		}
 	}
 	m_depthCaptureValid = valid;
+
+	// Periodic full dump of the tracked depth buffers - see
+	// LatteMRT::LogDepthCandidates for the question it exists to answer.
+	// Every 600th capture rather than per frame, so it costs a handful of log
+	// lines every few seconds instead of flooding the file.
+	m_faroFrameCounter++;
+	m_faroDepthSnapshotMin = std::min(m_faroDepthSnapshotMin, m_faroDepthSnapshotCount);
+	m_faroDepthSnapshotMax = std::max(m_faroDepthSnapshotMax, m_faroDepthSnapshotCount);
+	m_faroDepthSnapshotCount = 0;
+	if ((++m_depthCaptureProbeCounter % 600) == 0)
+	{
+		cemuLog_log(LogType::Force, "Faro effect dispatch: GTAO ran {}/{} frames, SSR ran {}/{} frames",
+			m_faroGtaoRanFrames, m_faroFrameCounter, m_faroSsrRanFrames, m_faroFrameCounter);
+		cemuLog_log(LogType::Force, "Faro depth snapshots per frame: min {} max {} (a varying count means the capture point inside the frame moves)",
+			m_faroDepthSnapshotMin == 0xFFFFFFFF ? 0u : m_faroDepthSnapshotMin, m_faroDepthSnapshotMax);
+		m_faroDepthSnapshotMin = 0xFFFFFFFF; m_faroDepthSnapshotMax = 0;
+		cemuLog_log(LogType::Force, "Faro AA chain: TAA fell back to single-pass on {}/{} frames, resolve had no usable history on {}/{} frames",
+			m_faroTaaFallbackFrames, m_faroFrameCounter, m_faroTaaNoHistoryFrames, m_faroFrameCounter);
+		m_faroFrameCounter = 0; m_faroGtaoRanFrames = 0; m_faroSsrRanFrames = 0;
+		m_faroTaaFallbackFrames = 0; m_faroTaaNoHistoryFrames = 0;
+		LatteMRT::LogDepthCandidates(outputWidth, outputHeight, m_depthCaptureView);
+	}
+	// A CHANGE OF BUFFER is logged as well, not just a change of validity.
+	// Switching between two same-size depth buffers keeps `valid` true the
+	// whole time, so a selection flip-flopping frame to frame used to produce
+	// no log output at all while SSAO/SSR visibly cut in and out - which sent
+	// an earlier round of this investigation after the wrong cause entirely.
+	// See the hysteresis in FindSceneDepthViewForSize.
+	if (valid && m_depthCaptureView != previousView && previousView != nullptr)
+	{
+		uint32 vertices = 0, drawcalls = 0;
+		LatteMRT::GetSceneDepthViewStats(m_depthCaptureView, vertices, drawcalls);
+		cemuLog_log(LogType::Force, "Faro depth capture: switched scene depth buffer to {}x{} ({} drawcalls / {} vertices last frame)",
+			m_depthCaptureWidth, m_depthCaptureHeight, drawcalls, vertices);
+	}
 	// log transitions only, never per-frame
 	if (valid != m_depthCaptureLoggedValid)
 	{
 		m_depthCaptureLoggedValid = valid;
 		if (valid)
-			cemuLog_log(LogType::Force, "Faro depth capture: valid depth {}x{} for post FX", m_depthCaptureWidth, m_depthCaptureHeight);
+		{
+			// Includes the workload the winning buffer was ranked on (see
+			// LatteMRT::FindSceneDepthViewForSize) and the output size it was
+			// matched against: when SSAO/SSR look wrong on someone else's PC
+			// or in a specific game, this one line says whether the wrong
+			// depth buffer was picked, and on what evidence.
+			uint32 vertices = 0, drawcalls = 0;
+			LatteMRT::GetSceneDepthViewStats(m_depthCaptureView, vertices, drawcalls);
+			cemuLog_log(LogType::Force, "Faro depth capture: using depth {}x{} for post FX (output {}x{}, {} drawcalls / {} vertices last frame)",
+				m_depthCaptureWidth, m_depthCaptureHeight, outputWidth, outputHeight, drawcalls, vertices);
+		}
 		else
-			cemuLog_log(LogType::Force, "Faro depth capture: no depth attachment at output time, post FX depth passes will fall back");
+		{
+			cemuLog_log(LogType::Force, "Faro depth capture: no scene depth buffer matched output {}x{}, post FX depth passes will fall back", outputWidth, outputHeight);
+		}
 	}
 }
 

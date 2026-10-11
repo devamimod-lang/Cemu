@@ -90,67 +90,452 @@ LatteCachedFBO::LatteCachedFBO(uint64 key) : key(key)
 
 namespace
 {
-	// Faro Global Enhancements: see NotifyDepthAttachmentUsed/
-	// FindSceneDepthViewForSize's own doc comment in LatteCachedFBO.h.
-	// Deliberately persistent across frames (not reset per-frame) - not every
-	// game rewrites its depth buffer on literally every single frame, so
-	// requiring a fresh match every frame would miss valid, still-current
-	// depth buffers. Entries are only pruned via NotifyDepthTextureDeleted
-	// (the texture is actually gone), so a stale view can only linger for as
-	// long as Cemu's own texture cache keeps it alive anyway.
-	std::vector<LatteTextureView*> s_sceneDepthCandidates;
+	// Faro Global Enhancements: scene-depth detection, modeled on ReShade's
+	// own built-in "generic depth" add-on (examples/09-depth/
+	// generic_depth_addon.cpp in crosire/reshade) - the reference solution to
+	// exactly this problem: out of every depth buffer an application binds,
+	// work out which one holds the main 3D scene, with no cooperation from
+	// the application itself.
+	//
+	// The previous heuristic here was "most recently bound depth view whose
+	// size exactly matches the output size". That is weaker than ReShade's in
+	// two ways that both showed up in practice:
+	//
+	//  1. Recency is not evidence. A shadow map, minimap, cutscene letterbox
+	//     or UI depth buffer that happens to share the scene's resolution and
+	//     gets bound AFTER the scene within the same frame simply wins. Only
+	//     a tie-breaker based on how much geometry was actually drawn into
+	//     each buffer distinguishes "the main scene" from "something else the
+	//     same size" - which is why ReShade ranks candidates by per-frame
+	//     vertex/draw-call counts rather than by binding order.
+	//  2. Exact-size-only has no fallback. When the 3D scene is rendered at a
+	//     different resolution than the buffer being presented (any graphic
+	//     pack resolution mod, and plenty of games natively), nothing matches
+	//     at all and every depth-driven effect switches off outright instead
+	//     of degrading. ReShade's check_aspect_ratio accepts a buffer whose
+	//     aspect ratio matches and whose scale is in a sane band.
+	//
+	// Deliberately NOT reset per frame: entries persist and are pruned only
+	// via NotifyDepthTextureDeleted (the texture is actually gone), so a
+	// stale view can only linger as long as Cemu's own texture cache keeps it
+	// alive anyway. Only the per-frame STATS roll over (see
+	// AdvanceDepthStatsFrame).
+	struct FaroDepthStats
+	{
+		uint32 vertices = 0;
+		uint32 drawcalls = 0;
+	};
+
+	struct FaroDepthCandidate
+	{
+		LatteTextureView* view = nullptr;
+		// Geometry recorded into this buffer during the frame currently being
+		// built, and during the last frame that completed. The heuristic
+		// reads lastFrame: at present time the current frame's own stats are
+		// complete, but reading the completed frame keeps the choice stable
+		// across the swap boundary the same way ReShade reads
+		// 'last_frame_stats'.
+		FaroDepthStats current;
+		// Work recorded since the last depth-buffer UNBIND, as opposed to
+		// `current` which accumulates across the whole frame. The snapshot
+		// rule needs the per-segment figure: see the unbind branch in
+		// NotifyDepthAttachmentUsed.
+		FaroDepthStats segment;
+		FaroDepthStats lastFrame;
+		uint64 lastUsedFrame = 0;
+		uint64 firstSeenFrame = 0;
+	};
+
+	std::vector<FaroDepthCandidate> s_sceneDepthCandidates;
+	// The depth view draw calls are currently being attributed to - set by
+	// NotifyDepthAttachmentUsed (which ApplyCurrentState already calls on
+	// every framebuffer bind), consumed by NotifyDepthDrawcall.
+	LatteTextureView* s_currentDepthView = nullptr;
+	uint64 s_depthStatsFrameIndex = 0;
+	// Highest per-frame geometry count already snapshotted this frame - see
+	// NotifyDepthAttachmentUsed's unbind branch for ReShade's best-copy rule.
+	uint32 s_depthSnapshotBestVertices = 0;
 
 	void NotifyDepthTextureDeleted(LatteTexture* texture)
 	{
+		if (s_currentDepthView && s_currentDepthView->baseTexture == texture)
+			s_currentDepthView = nullptr;
 		s_sceneDepthCandidates.erase(
 			std::remove_if(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(),
-				[texture](LatteTextureView* view) { return view->baseTexture == texture; }),
+				[texture](const FaroDepthCandidate& candidate) { return candidate.view->baseTexture == texture; }),
 			s_sceneDepthCandidates.end());
+	}
+
+	FaroDepthCandidate* FindDepthCandidate(LatteTextureView* view)
+	{
+		auto it = std::find_if(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(),
+			[view](const FaroDepthCandidate& candidate) { return candidate.view == view; });
+		return it == s_sceneDepthCandidates.end() ? nullptr : &*it;
+	}
+
+	// Port of ReShade's own check_aspect_ratio (generic_depth_addon.cpp), with
+	// its 'similar_aspect_ratio' and 'multiples_of_resolution' modes folded
+	// into one test. Both are wanted here rather than either alone: Cemu's
+	// graphic packs routinely render the 3D scene at an exact 2x/3x/4x
+	// multiple of the presented buffer, which lands outside ReShade's own
+	// 0.5x..1.85x "similar" band, while non-integer internal resolutions do
+	// fall inside it.
+	bool FaroDepthAspectMatches(sint32 candidateWidth, sint32 candidateHeight, sint32 outputWidth, sint32 outputHeight)
+	{
+		if (candidateWidth <= 0 || candidateHeight <= 0 || outputWidth <= 0 || outputHeight <= 0)
+			return false;
+
+		const float cw = (float)candidateWidth, ch = (float)candidateHeight;
+		const float ow = (float)outputWidth, oh = (float)outputHeight;
+
+		// Reject anything that is not the same shape as the output - this is
+		// what rules out square shadow maps (1024x1024 against a 16:9 scene).
+		if (std::abs((ow / oh) - (cw / ch)) > 0.1f)
+			return false;
+
+		float wRatio = ow / cw;
+		float hRatio = oh / ch;
+		if (wRatio <= 1.85f && wRatio >= 0.5f && hRatio <= 1.85f && hRatio >= 0.5f)
+			return true;
+
+		// Near-integer multiple in either direction (scene larger or smaller
+		// than what gets presented).
+		float wIntegral, hIntegral;
+		if (std::modf(wRatio, &wIntegral) <= 0.02f && std::modf(hRatio, &hIntegral) <= 0.02f)
+			return true;
+		float wInvIntegral, hInvIntegral;
+		return std::modf(cw / ow, &wInvIntegral) <= 0.02f && std::modf(ch / oh, &hInvIntegral) <= 0.02f;
 	}
 }
 
 void LatteMRT::NotifyDepthAttachmentUsed(LatteTextureView* view)
 {
+	LatteTextureView* previous = s_currentDepthView;
+	s_currentDepthView = view;
 	if (!view)
+	{
+		// Unbinding a depth buffer. This is the point where a depth-rendering
+		// sequence has just finished, so it is the right moment to take a
+		// private copy before the game starts doing something else with that
+		// buffer - see Renderer::CaptureSceneDepthSnapshot.
+		//
+		// Which unbind to copy on uses ReShade's own rule (its
+		// `best_copy_stats` check in on_clear_depth_impl): copy whenever this
+		// sequence drew at least as much geometry as the best one copied so
+		// far this frame. A frame typically unbinds several depth buffers, and
+		// this converges on the heaviest one - the main scene - without
+		// needing to know in advance which unbind is the last.
+		// ONLY the buffer the selection heuristic already picked is worth
+		// copying. Without this check the best-copy rule above copies whatever
+		// the frame's first depth-rendering sequence happened to be - observed
+		// in practice snapshotting a 64x64 buffer (a shadow or cubemap face)
+		// and handing that to GTAO as if it were a 720p scene. It also meant
+		// the snapshot image got recreated for every differently-sized buffer
+		// the game unbound, which is what made the recreation path run
+		// mid-frame at all.
+		if (previous && g_renderer && previous == g_renderer->GetCapturedDepthView())
+		{
+			if (FaroDepthCandidate* candidate = FindDepthCandidate(previous))
+			{
+				// Compared on the SEGMENT - the work drawn since the previous
+				// unbind - and not on the frame-cumulative `current`. That
+				// distinction is the whole point, and getting it wrong is what
+				// made the AO flash.
+				//
+				// `current` only ever grows within a frame, so comparing it
+				// against the best-so-far meant the LAST unbind of the frame
+				// always won. A game that renders the scene, clears depth, and
+				// then draws a small second pass therefore ended up
+				// snapshotting the freshly CLEARED buffer, because its
+				// cumulative count was still the highest. The AO then had
+				// essentially empty depth for that frame - which reads as a
+				// bright flash wherever the surrounding depth is dark, i.e.
+				// precisely when the camera is low and most of the screen is
+				// near geometry.
+				//
+				// ReShade avoids this by resetting stats.current at every
+				// clear (on_clear_depth_impl) so each segment is judged on its
+				// own workload. Same rule here.
+				if (candidate->segment.vertices >= s_depthSnapshotBestVertices && candidate->segment.vertices > 3)
+				{
+					s_depthSnapshotBestVertices = candidate->segment.vertices;
+					g_renderer->CaptureSceneDepthSnapshot(previous);
+					g_renderer->NotifyDepthSnapshotTaken();
+				}
+				// NOT reset here. The segment is reset by a CLEAR
+				// (NotifyDepthBufferCleared), never by an unbind, and that
+				// distinction matters: a game routinely binds and unbinds the
+				// same depth buffer several times while still accumulating
+				// into the SAME contents - terrain, then structures, then
+				// props - with no clear in between.
+				//
+				// Resetting per unbind split one coherent scene into chunks
+				// and judged each chunk on its own. Only the heaviest chunk
+				// then cleared the best-so-far bar, so the snapshot was taken
+				// partway through the scene and the geometry drawn in the
+				// later chunks was simply missing from it. Those pixels read
+				// as cleared depth, got no occlusion, and showed up as
+				// patches of floor and structures that looked see-through.
+				//
+				// Counting from the last clear is what ReShade does
+				// (stats.current is reset in on_clear_depth_impl) and it is
+				// the only boundary that actually means "these are different
+				// depth contents".
+			}
+		}
 		return;
-	// Move to the back on every use (not just the first time) - the list
-	// order must reflect RECENCY OF ACTUAL USE, not "order first seen ever".
-	// A view seen once (e.g. a loading screen's or menu's own depth buffer)
-	// and never touched again used to stay wherever it was first inserted;
-	// if gameplay's own depth view happened to be tracked BEFORE that one-
-	// off menu/loading view but shares the exact same resolution, the stale
-	// menu/loading view would keep winning FindSceneDepthViewForSize's
-	// back-to-front search forever afterward, even during real gameplay -
-	// confirmed via user testing: the AO effect showed during a loading
-	// screen and stuck around from the inventory menu instead of tracking
-	// the actual gameplay scene. Erasing+re-pushing on every genuine use
-	// keeps the list in true most-recently-used order.
-	auto it = std::find(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(), view);
-	if (it != s_sceneDepthCandidates.end())
-		s_sceneDepthCandidates.erase(it);
-	s_sceneDepthCandidates.push_back(view);
+	}
+
+	FaroDepthCandidate* candidate = FindDepthCandidate(view);
+	if (!candidate)
+	{
+		FaroDepthCandidate fresh;
+		fresh.view = view;
+		fresh.firstSeenFrame = s_depthStatsFrameIndex;
+		fresh.lastUsedFrame = s_depthStatsFrameIndex;
+		s_sceneDepthCandidates.push_back(fresh);
+		return;
+	}
+	candidate->lastUsedFrame = s_depthStatsFrameIndex;
 }
 
-LatteTextureView* LatteMRT::FindSceneDepthViewForSize(sint32 width, sint32 height)
+// A depth buffer was cleared: whatever was drawn into it before this point is
+// gone, so the per-segment workload used by the snapshot rule starts over.
+//
+// This is the boundary ReShade uses (it resets stats.current inside
+// on_clear_depth_impl) and it is the only one that genuinely marks "different
+// depth contents". An unbind does not - see the unbind branch in
+// NotifyDepthAttachmentUsed for what resetting there instead cost.
+//
+// Note the frame's best-so-far bar is deliberately NOT reset here: the point
+// of that bar is to end the frame holding the HEAVIEST segment, so a light
+// pass drawn after a clear must not displace the real scene already captured.
+void LatteMRT::NotifyDepthBufferCleared(LatteTexture* texture)
 {
-	// Walked back-to-front: NotifyDepthAttachmentUsed now keeps the list in
-	// true most-recently-used order (see its own comment), so the last
-	// same-size match here is the one actually bound most recently - not
-	// just the first one ever seen.
-	for (auto it = s_sceneDepthCandidates.rbegin(); it != s_sceneDepthCandidates.rend(); ++it)
+	if (!texture)
+		return;
+	for (auto& candidate : s_sceneDepthCandidates)
 	{
-		LatteTextureView* view = *it;
-		sint32 viewWidth, viewHeight;
-		view->baseTexture->GetEffectiveSize(viewWidth, viewHeight, view->firstMip);
-		if (viewWidth == width && viewHeight == height)
-			return view;
+		if (candidate.view->baseTexture == texture)
+			candidate.segment = {};
 	}
-	return nullptr;
+}
+
+void LatteMRT::NotifyDepthDrawcall(uint32 vertexCount, uint32 instanceCount)
+{
+	if (!s_currentDepthView)
+		return;
+	FaroDepthCandidate* candidate = FindDepthCandidate(s_currentDepthView);
+	if (!candidate)
+		return;
+
+	// Saturating add: a runaway count would only corrupt the ranking, and
+	// these are compared, never used as real geometry totals.
+	const uint64 vertices = (uint64)vertexCount * (uint64)std::max(instanceCount, 1u);
+	candidate->current.vertices = (uint32)std::min<uint64>((uint64)candidate->current.vertices + vertices, std::numeric_limits<uint32>::max());
+	candidate->segment.vertices = (uint32)std::min<uint64>((uint64)candidate->segment.vertices + vertices, std::numeric_limits<uint32>::max());
+	if (candidate->current.drawcalls != std::numeric_limits<uint32>::max())
+		candidate->current.drawcalls++;
+	if (candidate->segment.drawcalls != std::numeric_limits<uint32>::max())
+		candidate->segment.drawcalls++;
+	candidate->lastUsedFrame = s_depthStatsFrameIndex;
+}
+
+void LatteMRT::AdvanceDepthStatsFrame()
+{
+	for (auto& candidate : s_sceneDepthCandidates)
+	{
+		candidate.lastFrame = candidate.current;
+		candidate.current = {};
+		candidate.segment = {};
+	}
+	s_depthStatsFrameIndex++;
+	// A fresh frame has to earn its own snapshot; without this reset the first
+	// heavy frame would keep every later frame from ever copying again.
+	s_depthSnapshotBestVertices = 0;
+	if (g_renderer)
+		g_renderer->OnFaroFrameBoundary();
+	// Deliberately not cleared: whatever was bound last stays the
+	// attribution target until the next bind, matching how Cemu keeps the
+	// render target state across the swap.
+}
+
+LatteTextureView* LatteMRT::FindSceneDepthViewForSize(sint32 width, sint32 height, LatteTextureView* currentlySelected)
+{
+	// Selection, in ReShade generic_depth's own order: filter out buffers
+	// that cannot be the scene, then rank what is left by how much geometry
+	// went into it.
+	const FaroDepthCandidate* best = nullptr;
+	bool bestIsExactSize = false;
+	uint32 bestVertices = 0;
+	uint32 bestDrawcalls = 0;
+
+	for (const auto& candidate : s_sceneDepthCandidates)
+	{
+		// Judge a candidate on the best of "this frame so far" and "the last
+		// completed frame", rather than on the completed frame alone.
+		//
+		// This matters because games commonly PING-PONG between two depth
+		// buffers on alternating frames. Looking only at the completed frame,
+		// buffer A reports zero work on every frame where B was the one being
+		// drawn into, and vice versa - so on any given frame BOTH look unused
+		// and both get rejected, the search comes up empty, and every
+		// depth-driven effect blinks off. (ReShade does not hit this because
+		// it never drops its previous selection when a frame finds no winner;
+		// see CaptureDepthForPostFX, which now behaves the same way.)
+		//
+		// Using `current` as well is safe here: this runs at backbuffer-copy
+		// time, after the frame's 3D geometry has already been submitted, so
+		// `current` is a complete and in fact fresher picture than
+		// `lastFrame`.
+		const uint32 candVertices = std::max(candidate.current.vertices, candidate.lastFrame.vertices);
+		const uint32 candDrawcalls = std::max(candidate.current.drawcalls, candidate.lastFrame.drawcalls);
+
+		// Minimum workload to be considered a 3D scene at all. ReShade's own
+		// threshold here is just "more than 3 vertices", which turns out to be
+		// far too permissive in this codebase: a log of a real session showed
+		// the selection alternating between two 1280x720 buffers reporting 30
+		// and 12 vertices (10 and 4 draw calls) while the actual scene buffer,
+		// when present, reported 4082 draw calls and 3.86M vertices. Both junk
+		// buffers cleared ReShade's bar, and with workloads that small and
+		// that noisy the hysteresis below gets crossed by nothing at all -
+		// which is what kept SSAO/SSR cutting in and out.
+		//
+		// Three orders of magnitude separate the real scene from that noise,
+		// so the exact values here are not delicate. Requiring BOTH signals
+		// matters though: a long run of 2-vertex draws is still not a scene.
+		//
+		// When nothing clears the bar the result is no match, and that is the
+		// correct answer rather than a failure - on a title screen or a 2D
+		// menu there is no 3D scene for depth-driven effects to shade.
+		constexpr uint32 kMinSceneVertices = 300;
+		constexpr uint32 kMinSceneDrawcalls = 16;
+		if (candDrawcalls < kMinSceneDrawcalls || candVertices < kMinSceneVertices)
+			continue;
+		// Skip buffers that only just appeared: their first frame's stats are
+		// partial, so they would be ranked against everyone else unfairly.
+		if (s_depthStatsFrameIndex <= candidate.firstSeenFrame + 1)
+			continue;
+		// Skip buffers not touched recently. Two frames of slack rather than
+		// one, for the same alternating-buffer reason as above.
+		if (candidate.lastUsedFrame + 2 < s_depthStatsFrameIndex)
+			continue;
+
+		sint32 viewWidth, viewHeight;
+		candidate.view->baseTexture->GetEffectiveSize(viewWidth, viewHeight, candidate.view->firstMip);
+		if (!FaroDepthAspectMatches(viewWidth, viewHeight, width, height))
+			continue;
+
+		const bool isExactSize = (viewWidth == width && viewHeight == height);
+
+		// An exact resolution match always outranks a merely aspect-
+		// compatible one. This is a Cemu-specific addition on top of
+		// ReShade's ranking, and it is what keeps the common case behaving
+		// exactly as it did before this heuristic existed: a Wii U game's
+		// scene depth normally IS the same size as the buffer being
+		// presented, so the loosened aspect test only ever comes into play
+		// when nothing matches exactly.
+		if (!best || (isExactSize && !bestIsExactSize))
+		{
+			best = &candidate;
+			bestIsExactSize = isExactSize;
+			bestVertices = candVertices;
+			bestDrawcalls = candDrawcalls;
+			continue;
+		}
+		if (bestIsExactSize && !isExactSize)
+			continue;
+
+		// Same tier - rank by workload. Cemu issues no indirect draws, so
+		// ReShade's "prefer_vertices" branch is the only one that applies;
+		// draw calls break ties.
+		//
+		// Hysteresis: a candidate has to beat the buffer ALREADY SELECTED by a
+		// wide margin to take over, and conversely the selected one keeps its
+		// place even when it is momentarily behind. Without this, a game that
+		// owns two depth buffers OF THE SAME SIZE - which is the normal case,
+		// since the exact-resolution tier above cannot separate them - flips
+		// between them on alternating frames as their per-frame workloads
+		// cross over. The selection stayed "valid" the whole time, so nothing
+		// logged, while SSAO/SSR silently alternated between the real scene
+		// depth and a near-empty buffer: seen in practice as SSAO cutting out
+		// in bursts, which reads as the image flashing brighter. (A real
+		// example from a log: the scene buffer reporting 4082 drawcalls /
+		// 3.86M vertices and a junk buffer of the same size reporting 10
+		// drawcalls / 30 vertices, both 1280x720.)
+		const bool bestIsIncumbent = (currentlySelected && best->view == currentlySelected);
+		const bool candIsIncumbent = (currentlySelected && candidate.view == currentlySelected);
+		uint32 beatVertices = bestVertices;
+		uint32 beatDrawcalls = bestDrawcalls;
+		if (bestIsIncumbent && !candIsIncumbent)
+		{
+			// Challenger must be clearly better - 2x the geometry.
+			beatVertices = (bestVertices > (std::numeric_limits<uint32>::max() / 2)) ? std::numeric_limits<uint32>::max() : bestVertices * 2;
+			beatDrawcalls = (bestDrawcalls > (std::numeric_limits<uint32>::max() / 2)) ? std::numeric_limits<uint32>::max() : bestDrawcalls * 2;
+		}
+		else if (candIsIncumbent && !bestIsIncumbent)
+		{
+			// Incumbent only has to be within half of the current leader.
+			beatVertices = bestVertices / 2;
+			beatDrawcalls = bestDrawcalls / 2;
+		}
+
+		if (candVertices > beatVertices ||
+			(candVertices == beatVertices && candDrawcalls > beatDrawcalls))
+		{
+			best = &candidate;
+			bestIsExactSize = isExactSize;
+			bestVertices = candVertices;
+			bestDrawcalls = candDrawcalls;
+		}
+	}
+
+	return best ? best->view : nullptr;
+}
+
+// Diagnostic for the long-standing "SSAO/SSR flicker" that predates every
+// selection heuristic in this file - the original MRU code already carried a
+// 4-frame grace window as a band-aid for it, and three successive rounds of
+// improving the SELECTION did not move it. The question this answers is
+// whether the game keeps several scene-sized depth buffers and alternates
+// which one holds the current frame's geometry: in that case no amount of
+// picking the "right" buffer helps, because the one picked only holds valid
+// scene depth on some frames and whatever remains on the others, and that is
+// a content problem rather than a selection problem.
+//
+// Dumps the full tracked set rather than just the winner, so the alternation
+// is visible if it is there.
+void LatteMRT::LogDepthCandidates(sint32 outputWidth, sint32 outputHeight, LatteTextureView* selected)
+{
+	cemuLog_log(LogType::Force, "Faro depth probe: output {}x{}, {} tracked depth buffers", outputWidth, outputHeight, (uint32)s_sceneDepthCandidates.size());
+	for (const auto& candidate : s_sceneDepthCandidates)
+	{
+		sint32 viewWidth = 0, viewHeight = 0;
+		candidate.view->baseTexture->GetEffectiveSize(viewWidth, viewHeight, candidate.view->firstMip);
+		cemuLog_log(LogType::Force, "  {} {}x{}  this frame: {} draws / {} verts | last frame: {} draws / {} verts | lastUsed {} frames ago{}",
+			candidate.view == selected ? "->" : "  ",
+			viewWidth, viewHeight,
+			candidate.current.drawcalls, candidate.current.vertices,
+			candidate.lastFrame.drawcalls, candidate.lastFrame.vertices,
+			(uint32)(s_depthStatsFrameIndex - candidate.lastUsedFrame),
+			FaroDepthAspectMatches(viewWidth, viewHeight, outputWidth, outputHeight) ? "" : " [aspect reject]");
+	}
+}
+
+void LatteMRT::GetSceneDepthViewStats(LatteTextureView* view, uint32& vertices, uint32& drawcalls)
+{
+	vertices = 0;
+	drawcalls = 0;
+	if (const FaroDepthCandidate* candidate = FindDepthCandidate(view))
+	{
+		vertices = candidate->lastFrame.vertices;
+		drawcalls = candidate->lastFrame.drawcalls;
+	}
 }
 
 bool LatteMRT::IsDepthViewStillTracked(LatteTextureView* view)
 {
-	return std::find(s_sceneDepthCandidates.begin(), s_sceneDepthCandidates.end(), view) != s_sceneDepthCandidates.end();
+	return FindDepthCandidate(view) != nullptr;
 }
 
 void LatteMRT::NotifyTextureDeletion(LatteTexture* texture)
@@ -239,6 +624,22 @@ void LatteMRT::ApplyCurrentState()
 			fboLookupView = sLatteCurrentRendertargets.depthBuffer.view;
 		}
 		LatteMRT::NotifyDepthAttachmentUsed(sLatteCurrentRendertargets.depthBuffer.view);
+	}
+	else
+	{
+		// No depth attachment on this framebuffer - clear the attribution
+		// target, otherwise NotifyDepthDrawcall keeps crediting draws to
+		// whichever depth buffer happened to be bound LAST. Games bind plenty
+		// of depth-less framebuffers (HUD, UI, post-process fullscreen
+		// quads), and all of those draws were landing on an unrelated depth
+		// buffer, which is exactly the kind of noise that makes the
+		// workload ranking in FindSceneDepthViewForSize pick the wrong
+		// buffer.
+		//
+		// This unbind is also the moment to snapshot the scene depth - see
+		// LatteMRT::NotifyDepthAttachmentUsed, which decides whether this
+		// particular unbind is worth copying.
+		LatteMRT::NotifyDepthAttachmentUsed(nullptr);
 	}
 	// use fboLookupTexture to find cached FBO
 	if (fboLookupView == nullptr)
@@ -759,20 +1160,67 @@ void LatteRenderTarget_advanceTaaJitter()
 // the 3D scene; accepted as a known limitation of camera-only jitter.
 void LatteMRT::GetCurrentTaaJitter(float* jitter)
 {
-	// Faro TAA: jitter is disabled on purpose. The resolve pass (RendererOuputShader.cpp)
-	// blends history against the current frame at matching pixel coordinates with no
-	// reprojection (no motion vectors, no delta between this frame's and the previous
-	// frame's view/projection matrices) - real per-frame camera jitter needs that
-	// reprojection to cancel back out, otherwise every jittered frame draws geometry
-	// shifted by a different sub-pixel offset and the resolve blends those raw, which
-	// reads as constant shimmer/trembling on edges, grass, shadows and distant detail
-	// (confirmed - this is what happens if jitter is enabled here). Without reprojection,
-	// jittering the camera is strictly worse than not jittering it at all, so this always
-	// returns zero for now. The push-constant delivery mechanism (see SET_POSITION's own
-	// comment in LatteDecompilerEmitGLSLHeader.hpp) is left in place so real jitter can be
-	// re-enabled here later if/when a reprojected resolve is implemented.
 	jitter[0] = 0.0f;
 	jitter[1] = 0.0f;
+
+	// Jitter is ENABLED again, and that is the whole reason the temporal pass
+	// now removes aliasing at all.
+	//
+	// Without jitter every frame renders the scene at exactly the same sample
+	// positions, so on a still camera frame N and frame N-1 are pixel
+	// identical. Blending identical images returns that same image: the
+	// temporal pass could not add one bit of antialiasing, no matter how it
+	// was tuned. All the AA came from the FXAA/SMAA pre-pass, while the blend
+	// contributed only softening during motion - the worst of both, and
+	// exactly the "barely removes jaggies but blurs" that was reported.
+	// Sub-pixel jitter is what turns accumulation into real supersampling.
+	//
+	// An earlier revision turned this off because enabling it shimmered, and
+	// re-enabling it shimmered again - the whole image trembled with TAA
+	// active while FXAA, which applies no jitter, stayed clean.
+	//
+	// The cause was never the jitter. It was that the resolve rejected
+	// history TWICE: it clipped history into the local colour box (correct,
+	// and sufficient) and then ALSO drove the blend weight towards 0.95 in
+	// proportion to how far that clip had moved it. On a high-contrast edge a
+	// sub-pixel shift moves the colour far, so the weight saturated, nothing
+	// accumulated on exactly the edges that needed it, and the raw jitter was
+	// left on screen as wobble. Both the original luma-difference form and
+	// its clip-distance replacement had this shape; swapping the criterion
+	// changed nothing because the second rejection was the problem.
+	//
+	// The resolve now clips and blends with a FIXED weight, which is the
+	// Karis 2014 formulation and the reason every real TAA can jitter at all
+	// (see s_taa_resolve_shader_source).
+	//
+	// Only while TAA is the active mode: these offsets move every draw call,
+	// and with no resolve pass to average them back out the image would
+	// simply wobble. Also skipped when the history slider is near zero, for
+	// the same reason - that setting means "barely keep any history", which
+	// leaves nothing to average the jitter away.
+	if (GetConfig().antialiasing_mode != CemuConfig::kAATaa)
+		return;
+	// Player's call - see CemuConfig::taa_jitter. Off means the temporal pass
+	// can only fade towards the previous frame and every bit of antialiasing
+	// comes from the FXAA/SMAA pre-pass.
+	if (!GetConfig().taa_jitter)
+		return;
+	if (GetConfig().taa_history < 10)
+		return;
+
+	// Host-side render size, not the guest viewport: the resolve runs at the
+	// real render resolution, so a "half pixel" has to mean half a pixel
+	// there.
+	const sint32 renderWidth = sLatteRenderTargetState.currentEffectiveSize.width;
+	const sint32 renderHeight = sLatteRenderTargetState.currentEffectiveSize.height;
+	if (renderWidth <= 0 || renderHeight <= 0)
+		return;
+
+	const auto& tap = kTaaHalton[(size_t)(s_taaFrameIndex % kTaaHalton.size())];
+	// SET_POSITION applies this as `gl_Position.xy += uf_taaJitter * w`, so the
+	// value is in NDC, where one pixel spans 2/dimension.
+	jitter[0] = tap.first * 2.0f / (float)renderWidth;
+	jitter[1] = tap.second * 2.0f / (float)renderHeight;
 }
 
 // flag all FBO textures as updated via GPU
@@ -802,6 +1250,10 @@ void LatteRenderTarget_itHLESwapScanBuffer()
 	LattePerformanceMonitor_frameEnd();
 	LatteGPUState.frameCounter++;
 	LatteRenderTarget_advanceTaaJitter();
+	// Faro Global Enhancements: roll per-depth-buffer draw statistics over to
+	// "last frame" - see LatteMRT::FindSceneDepthViewForSize, which ranks on
+	// the completed frame's numbers.
+	LatteMRT::AdvanceDepthStatsFrame();
 	g_renderer->SwapBuffers(true, true);
 
 	catchOpenGLError();
@@ -834,6 +1286,13 @@ void LatteRenderTarget_applyTextureDepthClear(LatteTexture* texture, uint32 slic
 {
 	if(texture->isDepth)
 	{
+		if (hasDepthClear)
+		{
+			// A clear is the real boundary between one set of depth contents
+			// and the next, and it is where the snapshot rule has to start
+			// counting again - see LatteMRT::NotifyDepthBufferCleared.
+			LatteMRT::NotifyDepthBufferCleared(texture);
+		}
 		g_renderer->texture_clearDepthSlice(texture, sliceIndex, mipIndex, hasDepthClear, hasStencilClear, depthValue, stencilValue);
 	}
 	else
@@ -993,10 +1452,17 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	_currentOutputImageWidth = effectiveWidth;
 	_currentOutputImageHeight = effectiveHeight;
 
-	// Faro Global Enhancements (Phase 0): probe scene depth for later
-	// SSAO/GI/SSR passes. Recording only - see Renderer::CaptureDepthForPostFX.
-	// Needs the output resolution (just computed above) to pick the right
-	// tracked depth view - see FindSceneDepthViewForSize's own comment.
+	// Faro Global Enhancements (Phase 0): probe scene depth for later passes.
+	// Recording only - see Renderer::CaptureDepthForPostFX. Needs the output
+	// resolution (just computed above) to pick the right tracked depth view -
+	// see FindSceneDepthViewForSize's own comment.
+	//
+	// Scene depth is captured for the post-processing effects only. This was
+	// briefly widened to also capture whenever TAA was active, because the
+	// motion estimator matched on depth too; that estimator is disabled (see
+	// RunFaroMotionEstimation) and the widened gate made depth capture run in
+	// configurations that never used it, so it is back to the SSAO-verified
+	// condition. Re-widen it only alongside a consumer that needs it.
 	if (GetConfig().faro_postfx_enabled)
 	{
 		g_renderer->CaptureDepthForPostFX(effectiveWidth, effectiveHeight);
@@ -1237,7 +1703,16 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 		}
 	}
 	if (!drewMultiPass)
+	{
+		// Counted, because this is a silent per-frame behaviour change: the
+		// frame gets drawn with no antialiasing and no temporal resolve at
+		// all, which pops visibly against its neighbours. Any of the
+		// multi-pass dispatches can land here just by failing to allocate a
+		// target, and only some of those paths log anything.
+		if (GetConfig().antialiasing_mode != CemuConfig::kAANone)
+			g_renderer->NotifyAaFallbackFrame();
 		g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+	}
 	g_renderer->HandleScreenshotRequest(textureView, isPadView);
 	if (!g_renderer->ImguiBegin(!isPadView))
 		return;

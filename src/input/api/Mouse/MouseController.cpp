@@ -6,6 +6,35 @@
 MouseController::MouseController()
 	: base_type("mouse", "Mouse")
 {
+	// Faro Mouse motion: motion ON by default. ControllerBase::Settings::motion
+	// defaults to false because for every other provider motion is an opt-in
+	// extra on top of buttons/axes - but this controller has no axes at all
+	// (has_axis() == false) and no default button mapping, so with motion off
+	// it does literally nothing. Leaving it off by default is what made the
+	// feature look broken on a fresh profile: use_motion() returned false, so
+	// EmulatedController::get_motion_data() skipped the mouse entirely.
+	// A profile that already stored <motion>false</motion> still wins over
+	// this (InputManager::load applies the stored value afterwards), which is
+	// why the settings dialog also had to be made reachable for this API -
+	// see InputSettings2::on_controller_settings.
+	set_use_motion(true);
+}
+
+void MouseController::save(pugi::xml_node& node)
+{
+	node.append_child("mouse_sensitivity").append_child(pugi::node_pcdata).set_value(fmt::format("{}", m_sensitivity).c_str());
+	node.append_child("mouse_invert_x").append_child(pugi::node_pcdata).set_value(fmt::format("{}", m_invert_x).c_str());
+	node.append_child("mouse_invert_y").append_child(pugi::node_pcdata).set_value(fmt::format("{}", m_invert_y).c_str());
+}
+
+void MouseController::load(const pugi::xml_node& node)
+{
+	if (const auto value = node.child("mouse_sensitivity"))
+		set_sensitivity(ConvertString<float>(value.child_value()));
+	if (const auto value = node.child("mouse_invert_x"))
+		m_invert_x = ConvertString<bool>(value.child_value());
+	if (const auto value = node.child("mouse_invert_y"))
+		m_invert_y = ConvertString<bool>(value.child_value());
 }
 
 std::string MouseController::get_button_name(uint64 button) const
@@ -52,9 +81,16 @@ ControllerState MouseController::raw_state()
 	// confirmed via research only as "the standard FPS mouselook mapping
 	// applied to this console's axis layout", not via in-game testing
 	// (that needs a human actually playing a motion-aimed game like
-	// Splatoon) - may need gx/gz swapped or sign-flipped once tested.
+	// Splatoon). Rather than guess the signs, both axes are invertible from
+	// the controller's own settings dialog - whichever way a given game
+	// reads the gyro, the player can flip it instead of being stuck with a
+	// mapping that happens to be backwards for them.
 	sint32 dx, dy;
 	windowInfo.consume_mouse_delta(dx, dy);
+	if (m_invert_x)
+		dx = -dx;
+	if (m_invert_y)
+		dy = -dy;
 
 	const auto now = std::chrono::steady_clock::now();
 	if (m_has_last_poll_time)
@@ -62,8 +98,8 @@ ControllerState MouseController::raw_state()
 		float deltaTime = std::chrono::duration<float>(now - m_last_poll_time).count();
 		if (deltaTime > 0.0001f && (dx != 0 || dy != 0))
 		{
-			float gz = (float)dx * kMouseGyroSensitivity / deltaTime;
-			float gx = (float)dy * kMouseGyroSensitivity / deltaTime;
+			float gz = (float)dx * m_sensitivity / deltaTime;
+			float gx = (float)dy * m_sensitivity / deltaTime;
 			m_motion_handler.processMotionSample(deltaTime, gx, 0.0f, gz, 0.0f, 0.0f, 1.0f);
 		}
 		else if (deltaTime > 0.0001f)

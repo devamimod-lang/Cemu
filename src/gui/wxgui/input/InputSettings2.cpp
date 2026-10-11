@@ -948,6 +948,19 @@ void InputSettings2::on_controller_settings(wxCommandEvent& event)
 	switch(controller->api())
 	{
 	
+	// Faro Mouse motion: the Mouse provider MUST have a case here. Without
+	// one this switch silently fell through, so the settings ("gear") button
+	// did nothing for it - which left the "Use motion" checkbox unreachable,
+	// and since ControllerBase::Settings::motion defaults to false,
+	// use_motion() stayed false forever and
+	// EmulatedController::get_motion_data() never read the mouse at all.
+	// That is why mouse-to-gyro looked dead on other machines (confirmed
+	// against a saved controller0.xml that carried <motion>false</motion>
+	// for its own Mouse entry). DefaultControllerSettings is the right
+	// dialog: the mouse has no axes (has_axis() == false) but does report
+	// has_motion(), which is exactly what that dialog gates its own
+	// "Use motion" checkbox on.
+	case InputAPI::Mouse:
 	case InputAPI::DirectInput:
 	case InputAPI::XInput:
 	case InputAPI::GameCube:

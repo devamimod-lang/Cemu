@@ -505,6 +505,11 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		m_upscale_filter->SetToolTip(_("Upscaling filters are used when the game resolution is smaller than the window size. FSR 1.0 (AMD FidelityFX Super Resolution) gives the sharpest, most detailed result of these but costs a bit more GPU time - not available on macOS/Metal yet."));
 		m_upscale_filter->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent& event) {
 			GetConfig().upscale_filter = event.GetSelection();
+			// RCAS is FSR1's own second pass, so its controls only mean
+			// anything while FSR1 is the active upscale filter.
+			const bool fsrActive = event.GetSelection() == kFsr1Filter;
+			m_fsr_rcas_sharpness->Enable(fsrActive);
+			m_fsr_rcas_denoise->Enable(fsrActive);
 		});
 		graphics_panel_sizer->Add(m_upscale_filter, 0, wxALL | wxEXPAND, 5);
 
@@ -523,6 +528,11 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			GetConfig().antialiasing_mode = event.GetSelection();
 			m_smaa_quality->Enable(event.GetSelection() == CemuConfig::kAASmaa);
 			m_taa_spatial_aa->Enable(event.GetSelection() == CemuConfig::kAATaa);
+			m_taa_history->Enable(event.GetSelection() == CemuConfig::kAATaa);
+			m_taa_jitter->Enable(event.GetSelection() == CemuConfig::kAATaa);
+			m_taa_sharpness->Enable(event.GetSelection() == CemuConfig::kAATaa);
+			if (m_taa_reprojection)
+				m_taa_reprojection->Enable(event.GetSelection() == CemuConfig::kAATaa);
 		});
 		graphics_panel_sizer->Add(m_antialiasing_mode, 0, wxALL, 5);
 
@@ -550,6 +560,101 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			GetConfig().taa_spatial_aa = event.GetSelection();
 		});
 		graphics_panel_sizer->Add(m_taa_spatial_aa, 0, wxALL, 5);
+
+		// Faro TAA: history length and sharpening - see CemuConfig::taa_history
+		// for why these have to be adjustable rather than fixed.
+		{
+			const bool taaActive = GetConfig().antialiasing_mode == CemuConfig::kAATaa;
+
+			m_taa_jitter = new wxCheckBox(graphics_panel, wxID_ANY, _("TAA sub-pixel jitter"));
+			m_taa_jitter->SetValue(GetConfig().taa_jitter.GetValue());
+			m_taa_jitter->SetToolTip(_("Shifts each frame by a fraction of a pixel so the temporal pass accumulates genuinely new samples - this is what makes TAA remove jaggies instead of merely fading between frames. Turn it off to compare: without it all antialiasing comes from the FXAA/SMAA pre-pass."));
+			m_taa_jitter->Enable(taaActive);
+			m_taa_jitter->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
+				GetConfig().taa_jitter = event.IsChecked();
+			});
+			graphics_panel_sizer->Add(m_taa_jitter, 0, wxALL, 5);
+
+			auto* histSizer = new wxBoxSizer(wxHORIZONTAL);
+			histSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("TAA history")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_taa_history = new wxSlider(graphics_panel, wxID_ANY, GetConfig().taa_history.GetValue(), 0, 100);
+			m_taa_history->SetToolTip(_("How many frames of sub-pixel samples TAA accumulates. Higher means more antialiasing - with jitter enabled this is real supersampling, so it sharpens detail rather than blurring it. Lower it only if you see trails behind moving objects."));
+			m_taa_history->Enable(taaActive);
+			histSizer->Add(m_taa_history, 1, wxALL | wxEXPAND, 5);
+			auto* histText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%d%%", GetConfig().taa_history.GetValue()));
+			histSizer->Add(histText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_taa_history->Bind(wxEVT_SLIDER, [histText](wxCommandEvent& event) {
+				GetConfig().taa_history = event.GetInt();
+				histText->SetLabel(wxString::Format("%d%%", event.GetInt()));
+			});
+			graphics_panel_sizer->Add(histSizer, 0, wxEXPAND);
+
+			auto* taaSharpSizer = new wxBoxSizer(wxHORIZONTAL);
+			taaSharpSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("TAA sharpening")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_taa_sharpness = new wxSlider(graphics_panel, wxID_ANY, GetConfig().taa_sharpness.GetValue(), 0, 100);
+			m_taa_sharpness->SetToolTip(_("Optional extra acuity on the resolved image. No longer needed for sharpness now that accumulation is real supersampling; too much brings aliasing back as ringing around edges."));
+			m_taa_sharpness->Enable(taaActive);
+			taaSharpSizer->Add(m_taa_sharpness, 1, wxALL | wxEXPAND, 5);
+			auto* taaSharpText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%d%%", GetConfig().taa_sharpness.GetValue()));
+			taaSharpSizer->Add(taaSharpText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_taa_sharpness->Bind(wxEVT_SLIDER, [taaSharpText](wxCommandEvent& event) {
+				GetConfig().taa_sharpness = event.GetInt();
+				taaSharpText->SetLabel(wxString::Format("%d%%", event.GetInt()));
+			});
+			graphics_panel_sizer->Add(taaSharpSizer, 0, wxEXPAND);
+
+			// Reprojection - see CemuConfig::faro_taa_reprojection. Off by
+			// default and independently switchable from the history slider
+			// above, because the two answer different questions: the slider
+			// trades blur against trailing, this one changes WHICH pixel the
+			// history comes from. Turning it on with a low history length is
+			// a valid, conservative combination and not a mistake.
+			m_taa_reprojection = new wxCheckBox(graphics_panel, wxID_ANY, _("Reproject history with the motion field (experimental)"));
+			m_taa_reprojection->SetToolTip(_("Read the previous frame from where this pixel used to be, using an estimated motion field, instead of from its own position. Makes a long history safe: raise TAA history afterwards and the softening should stop. Needs a depth buffer, so it does nothing on titles without one. Experimental - compare against off."));
+			m_taa_reprojection->SetValue(GetConfig().faro_taa_reprojection.GetValue());
+			m_taa_reprojection->Enable(taaActive);
+			m_taa_reprojection->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
+				GetConfig().faro_taa_reprojection = event.IsChecked();
+			});
+			graphics_panel_sizer->Add(m_taa_reprojection, 0, wxALL, 5);
+		}
+
+		// Faro FSR1: RCAS sharpness - see CemuConfig::fsr_rcas_sharpness.
+		// Only meaningful when FSR 1.0 is the active upscale filter, since
+		// RCAS only runs as FSR1's second pass.
+		{
+			auto* rcasSizer = new wxBoxSizer(wxHORIZONTAL);
+			rcasSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("FSR sharpness")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			// Slider runs "sharpest on the right": AMD's scale counts stops of
+			// REDUCTION, so it reads backwards as a sharpness control. The
+			// value shown and stored stays AMD's own, the slider is just
+			// inverted for presentation.
+			m_fsr_rcas_sharpness = new wxSlider(graphics_panel, wxID_ANY,
+				CemuConfig::kFsrRcasSharpnessMax - GetConfig().fsr_rcas_sharpness.GetValue(),
+				CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax);
+			m_fsr_rcas_sharpness->SetToolTip(_("Sharpening strength of FSR 1.0's RCAS pass. Higher is sharper. Stronger upscales generally need more sharpening; too much makes edges look crunchy."));
+			m_fsr_rcas_sharpness->Enable(GetConfig().upscale_filter == kFsr1Filter);
+			rcasSizer->Add(m_fsr_rcas_sharpness, 1, wxALL | wxEXPAND, 5);
+
+			auto* rcasText = new wxStaticText(graphics_panel, wxID_ANY, wxString::Format("%.2f", GetConfig().fsr_rcas_sharpness.GetValue() / 100.0f));
+			rcasSizer->Add(rcasText, 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			m_fsr_rcas_sharpness->Bind(wxEVT_SLIDER, [rcasText](wxCommandEvent& event) {
+				const sint32 stops = CemuConfig::kFsrRcasSharpnessMax - event.GetInt();
+				GetConfig().fsr_rcas_sharpness = stops;
+				rcasText->SetLabel(wxString::Format("%.2f", stops / 100.0f));
+			});
+
+			graphics_panel_sizer->Add(rcasSizer, 0, wxEXPAND);
+
+			m_fsr_rcas_denoise = new wxCheckBox(graphics_panel, wxID_ANY, _("FSR grain-aware sharpening"));
+			m_fsr_rcas_denoise->SetToolTip(_("Makes FSR 1.0's sharpening concentrate on real edges instead of amplifying film grain and dithering. Useful for games with noisy output; costs a little extra GPU time."));
+			m_fsr_rcas_denoise->SetValue(GetConfig().fsr_rcas_denoise);
+			m_fsr_rcas_denoise->Enable(GetConfig().upscale_filter == kFsr1Filter);
+			m_fsr_rcas_denoise->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
+				GetConfig().fsr_rcas_denoise = event.IsChecked();
+			});
+			graphics_panel_sizer->Add(m_fsr_rcas_denoise, 0, wxALL, 5);
+		}
 
 		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
 		m_downscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Downscale filter"), wxDefaultPosition, wxDefaultSize, std::size(downscale_choices), downscale_choices, 5, wxRA_SPECIFY_COLS);
@@ -590,8 +695,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 			m_faro_ssao->Enable(on);
 			m_faro_ssao_intensity->Enable(on && GetConfig().faro_ssao_enabled);
 			m_faro_ssao_quality->Enable(on && GetConfig().faro_ssao_enabled);
-			m_faro_ssr->Enable(on);
-			m_faro_ssr_intensity->Enable(on && GetConfig().faro_ssr_enabled);
+			m_faro_depth_snapshot->Enable(on);
 		};
 
 		m_faro_postfx = new wxCheckBox(graphics_panel, wxID_ANY, _("Enable global post-processing (SSAO/SSR)"));
@@ -628,23 +732,38 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxNotebook* notebook)
 		});
 		box_sizer->Add(m_faro_ssao_quality, 0, wxALL | wxLEFT, 20);
 
-		m_faro_ssr = new wxCheckBox(graphics_panel, wxID_ANY, _("SSR (screen-space reflections)"));
-		m_faro_ssr->SetToolTip(_("Raymarched reflections. Reflects everything visible (no material info); can artifact on some titles - disable per game if so."));
-		m_faro_ssr->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
-			GetConfig().faro_ssr_enabled = event.IsChecked();
-			updateFaroEnables();
-		});
-		box_sizer->Add(m_faro_ssr, 0, wxALL, 5);
+		// Faro SSR removed. It never actually ran - instrumentation showed
+		// "SSR ran 0/600 frames" throughout - and the approach it took
+		// (raymarching with no material information, so every surface
+		// reflects) was never going to be right for arbitrary titles.
 
-		auto ssrRow = new wxBoxSizer(wxHORIZONTAL);
-		ssrRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("SSR intensity  ")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
-		m_faro_ssr_intensity = new wxSlider(graphics_panel, wxID_ANY, 50, 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
-		m_faro_ssr_intensity->SetToolTip(_("Reflection strength 0-100."));
-		m_faro_ssr_intensity->Bind(wxEVT_SLIDER, [](wxCommandEvent& event) {
-			GetConfig().faro_ssr_intensity = event.GetInt();
+		// Faro: scene-depth snapshot - see Renderer::CaptureSceneDepthSnapshot.
+		// Belongs here rather than only in settings.xml: it is the switch to
+		// flip when SSAO/SSR misbehave, so it has to be findable without
+		// editing a file.
+		m_faro_depth_snapshot = new wxCheckBox(graphics_panel, wxID_ANY, _("Use a private copy of the scene depth (experimental)"));
+		m_faro_depth_snapshot->SetToolTip(_("Copies the depth buffer while the 3D scene is still rendered into it, instead of reading it at the end of the frame. Can make SSAO/SSR more stable, but it touches the renderer mid-frame - turn it off if you see crashes or glitches."));
+		m_faro_depth_snapshot->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
+			GetConfig().faro_depth_snapshot = event.IsChecked();
 		});
-		ssrRow->Add(m_faro_ssr_intensity, 1, wxEXPAND | wxRIGHT, 5);
-		box_sizer->Add(ssrRow, 0, wxEXPAND | wxALL, 5);
+		box_sizer->Add(m_faro_depth_snapshot, 0, wxALL, 5);
+
+		// Faro debug view - see CemuConfig::FaroDebugView. In the GUI rather
+		// than settings.xml because its whole purpose is to be switched
+		// between while looking at the screen.
+		{
+			auto* dbgSizer = new wxBoxSizer(wxHORIZONTAL);
+			dbgSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Debug view")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
+			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter") };
+			m_faro_debug_view = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(dbgChoices), dbgChoices);
+			m_faro_debug_view->SetToolTip(_("Shows an intermediate buffer of the ambient-occlusion chain instead of the game image, to see which stage is unstable. 'Raw depth' is remapped so distant geometry is visible."));
+			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, 6));
+			m_faro_debug_view->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+				GetConfig().faro_debug_view = event.GetSelection();
+			});
+			dbgSizer->Add(m_faro_debug_view, 1, wxALL | wxEXPAND, 5);
+			box_sizer->Add(dbgSizer, 0, wxEXPAND);
+		}
 
 		graphics_panel_sizer->Add(box_sizer, 0, wxALL | wxEXPAND, 5);
 		updateFaroEnables();
@@ -2121,8 +2240,29 @@ void GeneralSettings2::ApplyConfig()
 			taaSpatialAa = CemuConfig::kTaaSpatialFxaa;
 		m_taa_spatial_aa->SetSelection(taaSpatialAa);
 		m_taa_spatial_aa->Enable(aa == CemuConfig::kAATaa);
+		m_taa_jitter->SetValue(config.taa_jitter);
+		m_taa_history->SetValue(std::clamp<sint32>(config.taa_history, 0, 100));
+		m_taa_sharpness->SetValue(std::clamp<sint32>(config.taa_sharpness, 0, 100));
+		m_taa_history->Enable(aa == CemuConfig::kAATaa);
+		m_taa_sharpness->Enable(aa == CemuConfig::kAATaa);
+		if (m_taa_reprojection)
+		{
+			m_taa_reprojection->SetValue(config.faro_taa_reprojection.GetValue());
+			m_taa_reprojection->Enable(aa == CemuConfig::kAATaa);
+		}
 	}
 	m_downscale_filter->SetSelection(config.downscale_filter);
+
+	// Faro FSR1: RCAS controls. The slider is inverted relative to the stored
+	// value - see its own comment where it's created.
+	{
+		const sint32 stops = std::clamp<sint32>(config.fsr_rcas_sharpness, CemuConfig::kFsrRcasSharpnessMin, CemuConfig::kFsrRcasSharpnessMax);
+		m_fsr_rcas_sharpness->SetValue(CemuConfig::kFsrRcasSharpnessMax - stops);
+		m_fsr_rcas_denoise->SetValue(config.fsr_rcas_denoise);
+		const bool fsrActive = config.upscale_filter == kFsr1Filter;
+		m_fsr_rcas_sharpness->Enable(fsrActive);
+		m_fsr_rcas_denoise->Enable(fsrActive);
+	}
 
 	{
 		sint32 forceAniso = config.force_anisotropic_level;
@@ -2141,15 +2281,13 @@ void GeneralSettings2::ApplyConfig()
 			q = 1;
 		m_faro_ssao_quality->SetSelection(q);
 	}
-	m_faro_ssr->SetValue(config.faro_ssr_enabled);
-	m_faro_ssr_intensity->SetValue(config.faro_ssr_intensity);
+	m_faro_depth_snapshot->SetValue(config.faro_depth_snapshot);
+	m_faro_debug_view->SetSelection(std::clamp<sint32>(config.faro_debug_view, 0, 6));
 	{
 		const bool on = config.faro_postfx_enabled;
 		m_faro_ssao->Enable(on);
 		m_faro_ssao_intensity->Enable(on && config.faro_ssao_enabled);
 		m_faro_ssao_quality->Enable(on && config.faro_ssao_enabled);
-		m_faro_ssr->Enable(on);
-		m_faro_ssr_intensity->Enable(on && config.faro_ssr_enabled);
 	}
 
 	m_fullscreen_scaling->SetSelection(config.fullscreen_scaling);

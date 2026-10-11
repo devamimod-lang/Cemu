@@ -33,6 +33,28 @@ public:
 		// overrides it afterward (same pattern as taaHistoryValid above).
 		uint32 _padFaroGtao[2];
 		float faroGtaoParams[4];
+		// Faro FSR1: x = RCAS sharpness in AMD's "stops" scale (see
+		// CemuConfig::fsr_rcas_sharpness), y = RCAS denoise on/off, z/w
+		// reserved. Unlike taaHistoryValid/faroGtaoParams above these are
+		// filled by FillUniformBlockBuffer itself rather than overridden per
+		// dispatch - they are plain settings with no per-pass state, so every
+		// pass can be handed the same values and only the RCAS shader reads
+		// them. Already 16-byte aligned (faroGtaoParams ends at offset 64),
+		// so no extra std140 padding is needed.
+		float faroFsrParams[4];
+		// Faro debug view: x = mode (CemuConfig::FaroDebugView), y/z/w spare.
+		// Lets the AO chain output an intermediate buffer instead of the shaded
+		// image, so which stage is unstable can be SEEN rather than inferred -
+		// CPU-side counters can prove a pass ran and prove the depth selection
+		// held, but they cannot say whether the depth DATA is steady, and that
+		// distinction is exactly where this investigation stalled. Already
+		// 16-byte aligned (faroFsrParams ends at offset 80).
+		float faroDebugParams[4];
+		// Faro motion estimation: x = pyramid level to work on, y = search
+		// radius in texels at that level, z = refinement iterations, w = 1.0
+		// when a coarser level's result is available to start the search from
+		// (0.0 at the coarsest level, which starts from rest).
+		float faroMotionParams[4];
 	};
 	enum Shader
 	{
@@ -144,10 +166,26 @@ public:
 	// multi-pass paths); other backends ignore it.
 	static constexpr int kGtaoQualityCount = 3;
 	static RendererOutputShader* s_gtao_shader[kGtaoQualityCount];
+	// Faro GTAO: bilateral denoise + apply pass. One shader, not per quality:
+	// the filter does not depend on the AO sample counts. See
+	// s_gtao_denoise_shader_body for why this pass exists.
+	static RendererOutputShader* s_gtao_denoise_shader;
+
+	// Faro motion estimation: pyramidal block matching, feeding the TAA
+	// resolve a motion field so history can be reprojected instead of being
+	// sampled at the same pixel. Own implementation - see the shader bodies
+	// for why none of the obvious references could be used.
+	static RendererOutputShader* s_motion_fill_shader;
+	static RendererOutputShader* s_motion_downsample_shader;
+	static RendererOutputShader* s_motion_estimate_shader;
 
 	// Builds the GTAO source for one quality preset by prepending the
 	// preset-specific #define block to the shared algorithm body.
 	static std::string BuildGtaoShaderSource(sint32 gtaoQuality);
+	static std::string BuildGtaoDenoiseShaderSource();
+	static std::string BuildMotionFillShaderSource();
+	static std::string BuildMotionDownsampleShaderSource();
+	static std::string BuildMotionEstimateShaderSource();
 
 	// Faro GI: reuses GTAO's exact same directional/step depth-sampling
 	// kernel (see BuildGtaoShaderSource's own doc comment - same NaN-safe
@@ -180,36 +218,6 @@ public:
 	static RendererOutputShader* s_gi_blur_shader;
 
 	static std::string BuildGiBlurShaderSource();
-
-	// Faro SSR: screen-space reflections. Reconstructs a depth-derived
-	// normal and assumed-FOV pseudo-view-space positions (McGuire & Mara's
-	// "Efficient GPU Screen-Space Ray Tracing" and Godot's own SSR shader
-	// both fundamentally need a real camera projection matrix + G-buffer
-	// normals, neither available here). Marches along the reflected ray in
-	// pseudo-view-space, projecting each step back to screen UV via the
-	// SAME assumed FOV, and tests against the real depth buffer - a
-	// simplified, single-hit-test substitute for Godot's proper DDA/
-	// perspective-correct screen-space traversal. No roughness/metallic
-	// buffer available, so v1 has no cone-tracing blur - sharp mirror-like
-	// reflections only, single fixed sample count, no quality tiers.
-	static RendererOutputShader* s_ssr_shader;
-
-	static std::string BuildSsrShaderSource();
-
-	// Faro SSR: temporal smoothing for the reflective-surface gate consumed
-	// by s_ssr_shader above (see its own comment on why the raw per-frame
-	// curvature test pops on animated/grazing-angle surfaces). Computes the
-	// SAME depth-derived curvature/flatness test, then blends it against
-	// last frame's own blended result at the same screen UV - no motion
-	// vectors/reprojection, same accepted simplification as Faro TAA's own
-	// history blend (see s_taa_resolve_shader_body's doc comment). Runs as
-	// its own tiny pass into a Faro-owned scratch target (see
-	// VulkanRenderer::RunFaroSsrPass/EnsureSsrFlatnessScratchTarget) BEFORE
-	// the main SSR pass, which then just samples the result instead of
-	// recomputing curvature raw.
-	static RendererOutputShader* s_ssr_flatness_shader;
-
-	static std::string BuildSsrFlatnessShaderSource();
 
 	static std::string GetOpenGlVertexSource(bool render_upside_down);
 	static std::string GetVulkanVertexSource(bool render_upside_down);

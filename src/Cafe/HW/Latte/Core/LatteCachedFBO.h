@@ -159,8 +159,34 @@ public:
 	// capture time hand back whichever one matches the final output
 	// resolution exactly (a shadow map or UI depth buffer essentially never
 	// matches the main scene's render resolution).
+	//
+	// The selection itself is modeled on ReShade's built-in "generic depth"
+	// add-on, which solves this exact problem - see the implementation's own
+	// comment in LatteRenderTarget.cpp for what that buys over picking by
+	// binding order alone.
 	static void NotifyDepthAttachmentUsed(LatteTextureView* view);
-	static LatteTextureView* FindSceneDepthViewForSize(sint32 width, sint32 height);
+	// Attributes one draw call's geometry to whichever depth view is
+	// currently bound. Called from the renderer-agnostic draw dispatch (see
+	// LatteCommandProcessor), so the stats are identical on Vulkan, OpenGL
+	// and Metal.
+	// A clear wipes the buffer, so the snapshot rule's per-segment workload
+	// starts over - see the implementation.
+	static void NotifyDepthBufferCleared(LatteTexture* texture);
+	static void NotifyDepthDrawcall(uint32 vertexCount, uint32 instanceCount);
+	// Rolls this frame's per-depth-buffer stats into "last frame" and starts
+	// fresh. Called once per presented frame.
+	static void AdvanceDepthStatsFrame();
+	// `currentlySelected` enables hysteresis: the buffer already in use wins
+	// ties and only loses to a clearly better candidate. Pass nullptr to get
+	// a plain "best right now" answer.
+	static LatteTextureView* FindSceneDepthViewForSize(sint32 width, sint32 height, LatteTextureView* currentlySelected = nullptr);
+	// Last completed frame's recorded workload for a tracked view - for
+	// logging which buffer got picked and why.
+	static void GetSceneDepthViewStats(LatteTextureView* view, uint32& vertices, uint32& drawcalls);
+	// Dumps every tracked depth buffer with its size and workload. Called
+	// periodically, not per frame - see its own comment for what question it
+	// is meant to answer.
+	static void LogDepthCandidates(sint32 outputWidth, sint32 outputHeight, LatteTextureView* selected);
 	// Faro Global Enhancements: lets Renderer::CaptureDepthForPostFX safely
 	// extend a stale-but-still-alive depth view's validity across a brief
 	// miss streak (see that method's own comment) without ever risking a

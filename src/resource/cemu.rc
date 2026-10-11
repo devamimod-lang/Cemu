@@ -90,11 +90,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "Cemu Wii U emulator"
-            VALUE "InternalName", "Cemu"
-            VALUE "LegalCopyright", "Team Cemu"
-            VALUE "OriginalFilename", "Cemu.exe"
-            VALUE "ProductName", "Cemu"
+            VALUE "FileDescription", "Anubis Nightly Wii U emulator"
+            VALUE "InternalName", "AnubisNightly"
+            VALUE "LegalCopyright", "Team Cemu (MPL-2.0); Anubis fork"
+            VALUE "OriginalFilename", "AnubisNightly.exe"
+            VALUE "ProductName", "Anubis Nightly"
         	VALUE "ProductVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) EMULATOR_VERSION_SUFFIX "\0"
         END
     END

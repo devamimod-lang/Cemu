@@ -1,6 +1,6 @@
 #ifndef EMULATOR_NAME
 
-#define EMULATOR_NAME					"Faro"
+#define EMULATOR_NAME					"Anubis Nightly"
 
 #define EMULATOR_VERSION_SUFFIX			""
 

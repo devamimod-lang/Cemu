@@ -2179,7 +2179,7 @@ class CemuAboutDialog : public wxDialog
 {
 public:
 	CemuAboutDialog(wxWindow* parent = NULL)
-		: wxDialog(NULL, wxID_ANY, _("About Cemu"), wxDefaultPosition, wxSize(500, 700))
+		: wxDialog(NULL, wxID_ANY, _("About Anubis Nightly"), wxDefaultPosition, wxSize(500, 700))
 	{
 		Create(parent);
 	}
@@ -2211,7 +2211,10 @@ public:
 
 	void AddHeaderInfo(wxWindow* parent, wxSizer* sizer)
 	{
-		auto versionString = formatWxString(_("Cemu\nVersion {0}\nCompiled on {1}\nOriginal authors: {2}"), BUILD_VERSION_STRING, BUILD_DATE, "Exzap, Petergov");
+		// The "original authors" line stays as it is. The product is renamed,
+		// but this is MPL-2.0 code and the people who wrote it keep the credit -
+		// hence "a fork of Cemu" rather than quietly dropping the origin.
+		auto versionString = formatWxString(_("Anubis Nightly\nA fork of Cemu\nVersion {0}\nCompiled on {1}\nOriginal authors: {2}"), BUILD_VERSION_STRING, BUILD_DATE, "Exzap, Petergov");
 
 		sizer->Add(new wxStaticText(parent, wxID_ANY, versionString), wxSizerFlags().Border(wxALL, 3).Border(wxTOP, 10));
 		sizer->Add(new wxHyperlinkCtrl(parent, wxID_ANY, "https://cemu.info", "https://cemu.info", wxDefaultPosition, wxDefaultSize, (wxHL_CONTEXTMENU|wxNO_BORDER|wxHL_ALIGN_LEFT)), wxSizerFlags().Expand().Border(wxTOP | wxBOTTOM, 3));

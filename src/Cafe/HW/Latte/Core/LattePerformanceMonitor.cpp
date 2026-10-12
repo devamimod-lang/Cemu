@@ -18,7 +18,50 @@ void LattePerformanceMonitor_frameEnd()
 	performanceMonitor.gpuTime_dcStageIndexMgr.frameFinished();
 	performanceMonitor.gpuTime_dcStageMRT.frameFinished();
 	performanceMonitor.gpuTime_dcStageDrawcallAPI.frameFinished();
-	performanceMonitor.gpuTime_waitForAsync.frameFinished();
+	// Anubis: periodic breakdown of where the render thread's frame actually
+	// goes. Every one of these timers was already being measured and none of
+	// them was reported anywhere, so the question "is the GPU starved by the
+	// CPU, or stalled on a sync point?" had no answer short of an external
+	// profiler. Reading them costs nothing: the values are already collected
+	// above.
+	//
+	// How to read it:
+	//  - idle high   -> the GPU thread is waiting for commands, so the CPU side
+	//                   (PPC recompiler, command processor) is the limit and no
+	//                   amount of GPU-side work-shifting will help.
+	//  - async high  -> blocked in GX2DrawDone / forced texture readback. See
+	//                   GX2DrawDone(), where forceFullSync is hardcoded true on
+	//                   Vulkan, which makes the "Full sync at GX2DrawDone"
+	//                   setting inert on that backend.
+	//  - fence high  -> waiting on GPU fences, i.e. the GPU really is the limit.
+	//  - shader high -> compilation stalls, not steady-state cost.
+	{
+		static uint64 s_accFrame = 0, s_accIdle = 0, s_accAsync = 0, s_accFence = 0, s_accShader = 0;
+		static uint32 s_accFrames = 0;
+		s_accFrame += performanceMonitor.gpuTime_frameTime.getPreviousFrameValue();
+		s_accIdle += performanceMonitor.gpuTime_idleTime.getPreviousFrameValue();
+		s_accAsync += performanceMonitor.gpuTime_waitForAsync.getPreviousFrameValue();
+		s_accFence += performanceMonitor.gpuTime_fenceTime.getPreviousFrameValue();
+		s_accShader += performanceMonitor.gpuTime_shaderCreate.getPreviousFrameValue();
+		s_accFrames++;
+		if (s_accFrames >= 600)
+		{
+			// Percentages of frame time rather than absolute microseconds: the
+			// ratio is what identifies the bottleneck, and it stays meaningful
+			// whatever the framerate happens to be.
+			const double frameUs = (double)PPCTimer_tscToMicroseconds(s_accFrame);
+			auto pct = [frameUs](uint64 ticks) -> double {
+				if (frameUs <= 0.0)
+					return 0.0;
+				return 100.0 * (double)PPCTimer_tscToMicroseconds(ticks) / frameUs;
+			};
+			cemuLog_log(LogType::Force,
+				"Anubis GPU thread: frame {:.2f} ms | idle(waiting on CPU) {:.1f}% | async(GX2DrawDone/readback) {:.1f}% | fence {:.1f}% | shader compile {:.1f}%",
+				frameUs / 1000.0 / (double)s_accFrames, pct(s_accIdle), pct(s_accAsync), pct(s_accFence), pct(s_accShader));
+			s_accFrame = s_accIdle = s_accAsync = s_accFence = s_accShader = 0;
+			s_accFrames = 0;
+		}
+	}
 
 	uint32 elapsedTime = GetTickCount() - performanceMonitor.cycle[performanceMonitor.cycleIndex].lastUpdate;
 	if (elapsedTime >= 1000)

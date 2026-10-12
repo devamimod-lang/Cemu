@@ -95,6 +95,16 @@ enum UpscalingFilter
 	kBicubicHermiteFilter,
 	kNearestNeighborFilter,
 	kFsr1Filter,
+	// Anubis: ratio-aware Lanczos2. Only offered as a DOWNSCALE option, which
+	// is the case the other filters get wrong - they all read a fixed number
+	// of source texels, so above a ratio of about 2 they skip most of the
+	// rendered image. See s_lanczos_shader_source.
+	//
+	// Note this is enum value 5 while it sits at index 4 in the downscale
+	// radio box, because kFsr1Filter (4) is never offered for downscaling.
+	// GeneralSettings2 converts between the two explicitly rather than
+	// relying on index == value.
+	kLanczosFilter,
 };
 
 enum FullscreenScaling

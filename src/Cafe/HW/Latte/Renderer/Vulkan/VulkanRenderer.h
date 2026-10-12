@@ -984,6 +984,11 @@ private:
 	// declaration's own comment.
 	VkDescriptorSet m_giDescriptorSet = VK_NULL_HANDLE;
 	VkSampler m_giDepthSampler = VK_NULL_HANDLE;
+	// One-shot so a per-frame bail does not flood the log. "I turn GI on and
+	// off and nothing happens" was indistinguishable from a broken pass while
+	// every bail-out returned silently.
+	bool m_faroGiLoggedBail = false;
+	bool m_faroGiLoggedNoFsr1Path = false;
 	VkImage m_giScratchImage = VK_NULL_HANDLE;
 	VkImageMemAllocation* m_giScratchAllocation = nullptr;
 	VkImageView m_giScratchView = VK_NULL_HANDLE;

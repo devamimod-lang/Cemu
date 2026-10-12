@@ -93,6 +93,10 @@ private:
 	// percentage that rises with the slider.
 	static wxString FormatRcasSharpness(sint32 stops);
 	// Faro: keeps a slider's numeric readout from resizing as the value changes.
+	// The downscale radio box index is not its stored value - see the
+	// definitions for why kLanczosFilter sits at index 4.
+	static sint32 DownscaleSelectionToFilter(int selection);
+	static int DownscaleFilterToSelection(sint32 filter);
 	void SetSliderValueWidth(wxStaticText* text) const;
 	wxRadioBox* m_force_anisotropic_level;
 	wxCheckBox *m_faro_postfx, *m_faro_ssao;
@@ -101,6 +105,10 @@ private:
 	wxSlider *m_faro_ssao_intensity;
 	wxStaticText* m_faro_ssao_intensity_text;
 	wxChoice* m_faro_ssao_quality;
+	// Anubis GI - independent of the SSAO controls above.
+	wxCheckBox* m_faro_gi;
+	wxSlider* m_faro_gi_intensity;
+	wxStaticText* m_faro_gi_intensity_text;
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;
 	wxCheckBox *m_overlay_fps, *m_overlay_drawcalls, *m_overlay_cpu, *m_overlay_cpu_per_core,*m_overlay_ram, *m_overlay_vram, *m_overlay_debug;

@@ -631,11 +631,20 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			scalingSizer->Add(m_fsr_rcas_denoise, 0, wxALL, 5);
 		}
 
-		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor") };
+		// Anubis: "Lanczos (sharp)" added as a fifth entry. It is the only
+		// filter here whose footprint scales with the downscale ratio - the
+		// other four read a fixed number of source texels, so rendering above
+		// about 200% and downscaling throws most of the rendered image away.
+		//
+		// Its index is 4 but its stored value is kLanczosFilter (5), because
+		// kFsr1Filter owns 4 and is never offered for downscaling (EASU only
+		// works upscaling). The two conversions below are explicit for that
+		// reason - index == value does not hold on this control.
+		wxString downscale_choices[] = { _("Bilinear"), _("Bicubic"), _("Hermite"), _("Nearest Neighbor"), _("Lanczos (sharp)") };
 		m_downscale_filter = new wxRadioBox(graphics_panel, wxID_ANY, _("Downscale filter"), wxDefaultPosition, wxDefaultSize, std::size(downscale_choices), downscale_choices, 5, wxRA_SPECIFY_COLS);
-		m_downscale_filter->SetToolTip(_("Downscaling filters are used when the game resolution is bigger than the window size"));
+		m_downscale_filter->SetToolTip(_("Downscaling filters are used when the game resolution is bigger than the window size.\nLanczos keeps every rendered pixel, so it is the one to use for supersampling (rendering above 100% and scaling down); the others sample a fixed small area and discard most of the extra detail. It can ring slightly on very high contrast edges."));
 		m_downscale_filter->Bind(wxEVT_RADIOBOX, [](wxCommandEvent& event) {
-			GetConfig().downscale_filter = event.GetSelection();
+			GetConfig().downscale_filter = DownscaleSelectionToFilter(event.GetSelection());
 		});
 		scalingSizer->Add(m_downscale_filter, 0, wxALL | wxEXPAND, 5);
 	}
@@ -670,6 +679,8 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			m_faro_ssao->Enable(on);
 			m_faro_ssao_intensity->Enable(on && GetConfig().faro_ssao_enabled);
 			m_faro_ssao_quality->Enable(on && GetConfig().faro_ssao_enabled);
+			m_faro_gi->Enable(on);
+			m_faro_gi_intensity->Enable(on && GetConfig().faro_gi_enabled);
 			m_faro_depth_snapshot->Enable(on);
 		};
 
@@ -713,6 +724,36 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			GetConfig().faro_ssao_quality = event.GetSelection();
 		});
 		box_sizer->Add(m_faro_ssao_quality, 0, wxALL | wxLEFT, 20);
+
+		// Anubis GI: its own switch, independent of SSAO, and added BEFORE the
+		// pass is enabled in the renderer on purpose. GI was disabled after
+		// being implicated in a hang under a downscaling+TAA combination, and
+		// the thing that made that hard to pin down was that it could not be
+		// turned off and compared against without a rebuild. Every new effect
+		// gets its own toggle first.
+		m_faro_gi = new wxCheckBox(graphics_panel, wxID_ANY, _("Global illumination (experimental)"));
+		m_faro_gi->SetToolTip(_("Screen-space bounce lighting: gathers light from nearby lit surfaces using the depth buffer, then blends it back in. Separate from SSAO - SSAO darkens crevices, this one adds indirect light. Experimental: compare it against off."));
+		m_faro_gi->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_gi_enabled = event.IsChecked();
+			updateFaroEnables();
+		});
+		box_sizer->Add(m_faro_gi, 0, wxALL, 5);
+
+		auto giRow = new wxBoxSizer(wxHORIZONTAL);
+		giRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("GI intensity")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_gi_intensity = new wxSlider(graphics_panel, wxID_ANY,
+			GetConfig().faro_gi_intensity.GetValue(), 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_gi_intensity->SetToolTip(_("Strength of the added indirect light, 0-100."));
+		giRow->Add(m_faro_gi_intensity, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+		m_faro_gi_intensity_text = new wxStaticText(graphics_panel, wxID_ANY,
+			wxString::Format("%d%%", GetConfig().faro_gi_intensity.GetValue()));
+		SetSliderValueWidth(m_faro_gi_intensity_text);
+		giRow->Add(m_faro_gi_intensity_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+		m_faro_gi_intensity->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+			GetConfig().faro_gi_intensity = event.GetInt();
+			m_faro_gi_intensity_text->SetLabel(wxString::Format("%d%%", event.GetInt()));
+		});
+		box_sizer->Add(giRow, 0, wxEXPAND | wxALL, 5);
 
 		// Faro SSR removed. It never actually ran - instrumentation showed
 		// "SSR ran 0/600 frames" throughout - and the approach it took
@@ -1351,6 +1392,31 @@ wxPanel* GeneralSettings2::AddDebugPage(wxBookCtrlBase* notebook)
 	panel->SetSizerAndFit(debug_panel_sizer);
 
 	return panel;
+}
+
+// The downscale radio box's index is not its stored value.
+//
+// kFsr1Filter is 4 but is never offered for downscaling (EASU only works
+// upscaling), so the box's fifth entry - Lanczos, at index 4 - stores
+// kLanczosFilter (5) instead. These two functions are the only places that
+// knowledge lives; everything else deals in UpscalingFilter values.
+sint32 GeneralSettings2::DownscaleSelectionToFilter(int selection)
+{
+	if (selection == 4)
+		return kLanczosFilter;
+	return selection;
+}
+
+int GeneralSettings2::DownscaleFilterToSelection(sint32 filter)
+{
+	if (filter == kLanczosFilter)
+		return 4;
+	// Anything out of range lands on Bilinear rather than on an invalid index.
+	// A settings.xml written by a build where 4 meant something else, or hand
+	// edited, must not be able to put this control into an impossible state.
+	if (filter < 0 || filter > 3)
+		return 0;
+	return filter;
 }
 
 // Reserves room for the widest reading a slider's number can take ("100%",
@@ -2293,7 +2359,7 @@ void GeneralSettings2::ApplyConfig()
 		m_taa_spatial_aa->SetSelection(taaSpatialAa);
 		m_taa_spatial_aa->Enable(aa == CemuConfig::kAATaa);
 	}
-	m_downscale_filter->SetSelection(config.downscale_filter);
+	m_downscale_filter->SetSelection(DownscaleFilterToSelection(config.downscale_filter));
 
 	// Faro FSR1: RCAS controls. The slider is inverted relative to the stored
 	// value - see its own comment where it's created.
@@ -2320,6 +2386,11 @@ void GeneralSettings2::ApplyConfig()
 	// Faro Global Enhancements (see construction above)
 	m_faro_postfx->SetValue(config.faro_postfx_enabled);
 	m_faro_ssao->SetValue(config.faro_ssao_enabled);
+	m_faro_gi->SetValue(config.faro_gi_enabled);
+	m_faro_gi_intensity->SetValue(std::clamp<sint32>(config.faro_gi_intensity, 0, 100));
+	// Label refreshed with the slider, not after it - see the FSR sharpness
+	// readout for what happens when only one of the two is updated here.
+	m_faro_gi_intensity_text->SetLabel(wxString::Format("%d%%", (int)config.faro_gi_intensity));
 	m_faro_ssao_intensity->SetValue(config.faro_ssao_intensity);
 	// The readout has to be refreshed alongside the slider. Setting one without
 	// the other is what left the FSR sharpness figure showing a stale value

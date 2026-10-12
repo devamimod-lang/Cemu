@@ -1515,6 +1515,35 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 
 			filter = LatteTextureView::MagFilter::kNearestNeighbor;
 		}
+		else if (scaling_filter == kLanczosFilter)
+		{
+			// Anubis: ratio-aware Lanczos2, the mirror image of the FSR1 case
+			// below. EASU only works upscaling; this one only earns its cost
+			// downscaling, where it is the only filter here whose footprint
+			// grows with the ratio instead of skipping source texels.
+			//
+			// kLinear on the sampler is deliberate and load-bearing: the
+			// shader spaces its taps two source texels apart precisely so the
+			// hardware's own bilinear filtering averages each pair, which is
+			// what keeps the tap count bounded.
+			//
+			// Falls back to Bicubic when the shader is null, which is the case
+			// on Metal (no port yet) - same defensive pattern as FSR1, and it
+			// also covers a settings.xml that selected this before the option
+			// existed.
+			RendererOutputShader* lanczos = renderUpsideDown ?
+				RendererOutputShader::s_lanczos_shader_ud : RendererOutputShader::s_lanczos_shader;
+			if (lanczos)
+			{
+				shader = lanczos;
+			}
+			else
+			{
+				shader = renderUpsideDown ?
+					RendererOutputShader::s_bicubic_shader_ud : RendererOutputShader::s_bicubic_shader;
+			}
+			filter = LatteTextureView::MagFilter::kLinear;
+		}
 		else if (scaling_filter == kFsr1Filter)
 		{
 			// FSR1's EASU only makes sense for upscaling (see GeneralSettings2.cpp's

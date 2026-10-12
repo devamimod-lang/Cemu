@@ -180,6 +180,105 @@ void outputShader(){
 }
 )";
 
+// Anubis: Lanczos2 downscale filter with a RATIO-AWARE footprint.
+//
+// Why the existing filters are wrong for downscaling. Bilinear reads 2x2 source
+// texels, and the bicubic/Hermite filters above read a fixed 4x4 neighbourhood
+// (4 bilinear taps) - in both cases the footprint is a constant number of
+// SOURCE texels. When the render resolution is higher than the window, one
+// output pixel covers ratio^2 source texels, so above a ratio of about 2 most
+// of the rendered pixels are never read at all. Rendering at 300% and then
+// throwing away two thirds of it is not supersampling, it is point sampling
+// with extra steps, and the giveaway is aliasing that supersampling was
+// supposed to remove. This is the same defect the code already documents for
+// FSR1's EASU, which is why EASU is not offered as a downscale option.
+//
+// The fix is a kernel whose width follows the ratio, so every source texel
+// inside the output pixel's footprint contributes.
+//
+// Lanczos2 rather than a box: a 2x2 box is the cheapest possible resolve, but
+// it does not cut high frequencies fast enough (it still aliases) and it
+// attenuates low frequencies, which reads as mush. Lanczos2 - sinc windowed by
+// sinc, support 2 - has a far sharper frequency response for the same support
+// and is the standard choice for a quality resolve. It can ring slightly on
+// very high contrast edges; that is the known trade and the reason this is an
+// added option rather than a replacement for the existing filters.
+//
+// Cost is bounded by sampling with BILINEAR taps spaced two source texels
+// apart, so each fetch already averages its own neighbourhood and the tap grid
+// stays small: 3x3 fetches at ratio 1, 5x5 at ratio 2, 7x7 at ratio 3, capped
+// there. The maths is textbook signal processing, implemented from the
+// definition - no third-party code.
+const std::string RendererOutputShader::s_lanczos_shader_source =
+R"(
+float AnubisLanczos2(float x)
+{
+	x = abs(x);
+	if (x < 1e-5)
+		return 1.0;
+	if (x >= 2.0)
+		return 0.0;
+	float px = 3.14159265359 * x;
+	// sinc(x) * sinc(x/2), the Lanczos a=2 window.
+	return (sin(px) / px) * (sin(px * 0.5) / (px * 0.5));
+}
+
+void outputShader()
+{
+	vec2 srcRes = max(textureSrcResolution, vec2(1.0));
+	vec2 dstRes = max(outputResolution, vec2(1.0));
+	// Per-axis, because a non-uniform aspect correction can downscale one axis
+	// and not the other.
+	vec2 ratio = max(srcRes / dstRes, vec2(1.0));
+
+	// A FIXED number of taps with an ADAPTIVE step, not the other way round.
+	//
+	// The first version fixed the step at 2 source texels and let the tap
+	// count follow the ratio. That is wrong at low ratios: at 1800p -> 1080p
+	// (ratio 1.67) the taps land at 0, 1.2 and 2.4 output pixels, and 2.4 is
+	// outside Lanczos2's support of 2.0, so it weighs zero and drops out. Only
+	// three taps per axis survive, which samples the KERNEL too coarsely to
+	// represent it - a different artifact from the one being fixed.
+	//
+	// Deriving the step from the support instead keeps the kernel properly
+	// sampled at every ratio, keeps the cost constant (7x7 fetches), and still
+	// scales the footprint with the ratio, which was the whole point. The
+	// 3.5 divisor places the outermost tap at 1.71 output pixels - inside the
+	// support, so no tap is wasted on a zero weight.
+	const int TAPS_PER_SIDE = 3;
+	// Named tapStep, not step: step() is a GLSL built-in and shadowing it here
+	// would compile but read as a bug waiting to happen.
+	vec2 tapStep = (2.0 * ratio) / 3.5;
+
+	vec2 centerTexel = passUV * srcRes;
+	vec3 sum = vec3(0.0);
+	float wsum = 0.0;
+	for (int y = -TAPS_PER_SIDE; y <= TAPS_PER_SIDE; y++)
+	{
+		// Offsets are in source texels; the kernel is evaluated in OUTPUT
+		// pixels. Dividing by the ratio to cross between the two is what makes
+		// the footprint follow the scale factor.
+		float offY = float(y) * tapStep.y;
+		float wy = AnubisLanczos2(offY / ratio.y);
+		for (int x = -TAPS_PER_SIDE; x <= TAPS_PER_SIDE; x++)
+		{
+			float offX = float(x) * tapStep.x;
+			float wx = AnubisLanczos2(offX / ratio.x);
+			vec2 tapUV = (centerTexel + vec2(offX, offY)) / srcRes;
+			float w = wx * wy;
+			sum += texture(textureSrc, tapUV).rgb * w;
+			wsum += w;
+		}
+	}
+	// Lanczos weights are signed, so the sum can be negative on a high
+	// contrast edge (this is the ringing). Clamping here keeps the result in
+	// range, which also matters because FSR1's RCAS returns NaN for negative
+	// input if this ever feeds it.
+	vec3 result = wsum > 1e-5 ? sum / wsum : texture(textureSrc, passUV).rgb;
+	colorOut0 = vec4(clamp(result, vec3(0.0), vec3(1.0)), 1.0);
+}
+)";
+
 const std::string RendererOutputShader::s_hermite_shader_source_mtl =
 R"(#include <metal_stdlib>
 using namespace metal;
@@ -1549,6 +1648,8 @@ RendererOutputShader* RendererOutputShader::s_bicubic_shader_ud;
 
 RendererOutputShader* RendererOutputShader::s_hermit_shader;
 RendererOutputShader* RendererOutputShader::s_hermit_shader_ud;
+RendererOutputShader* RendererOutputShader::s_lanczos_shader;
+RendererOutputShader* RendererOutputShader::s_lanczos_shader_ud;
 
 RendererOutputShader* RendererOutputShader::s_fsr1_easu_shader;
 RendererOutputShader* RendererOutputShader::s_fsr1_easu_shader_ud;
@@ -2497,6 +2598,25 @@ float GiHash(vec2 p)
 	vec3 m = vec3(0.06711056, 0.00583715, 52.9829189);
 	return fract(m.z * fract(dot(p, m.xy)));
 }
+// Point-sampled depth, alongside the bilinear texture() reads elsewhere.
+//
+// The depth sampler is VK_FILTER_LINEAR, so a plain texture() fetch across a
+// SILHOUETTE blends the character's depth with the background's and returns a
+// value that exists nowhere in the scene. The gather then treats that invented
+// in-between depth as a real nearby surface and collects bounce light off it -
+// which is what produced patches around the character.
+//
+// Technique from Tomasz Stachowiak's depth-buffer raymarching
+// (dual Apache-2.0 / MIT): sample the depth buffer BOTH point-sampled and
+// bilinear-filtered, because each one's artifacts cancel the other's. Point
+// sampling alone reintroduces the quantization stepping that bilinear exists to
+// smooth out, so neither is used on its own - see the gather loop for how the
+// two are combined.
+float GiPointDepth(vec2 uv, vec2 res)
+{
+	ivec2 p = ivec2(uv * res);
+	return min(max(texelFetch(textureDepth, clamp(p, ivec2(0), ivec2(res) - ivec2(1)), 0).x, 0.0), 1.0);
+}
 
 // Reconstructs a pseudo-view-space position from linearized depth, same
 // 60-degree-vertical-FOV assumption already used throughout this file's
@@ -2557,9 +2677,27 @@ void outputShader()
 	vec3 centerPos = GiReconstructPos(passUV, viewZ, aspect);
 	vec3 normal = GiReconstructNormal(passUV, centerPos, viewZ, aspect, 1.0 / outRes);
 	float marchPx = max(faroGtaoParams.z, 1.0);
-	float rot = GiHash(gl_FragCoord.xy) * 3.14159265;
+	// Ordered 4x4 dither, not white noise.
+	//
+	// This used to be GiHash(gl_FragCoord.xy), a per-pixel hash. That gives
+	// every pixel an unrelated set of gather directions, so neighbouring
+	// pixels disagree wildly and the blur below turns that high-frequency
+	// disagreement into low-frequency BLOTCHES - which is exactly how it was
+	// reported, as patches in the character's shadows.
+	//
+	// An ordered dither fixes it by construction: each 4x4 block of pixels
+	// covers 16 evenly spaced rotations, so a denoise averaging over that
+	// neighbourhood reconstructs the full angular integral instead of whatever
+	// biased subset white noise happened to pick. This is the same scheme the
+	// SSAO pass in this file already uses, and SSAO is the one that does not
+	// blotch.
+	float ditherJitter = dot(floor(mod(gl_FragCoord.xy, 4.0) + 0.1), vec2(0.0625, 0.25)) + 0.0625;
+	float rot = ditherJitter * 3.14159265;
 	vec3 bounce = vec3(0.0);
 	float wsum = 0.0;
+	// Sum of the per-sample depth-similarity weights, independent of whether
+	// the horizon rose. Used only to scale the divisor floor - see below.
+	float wPotential = 0.0;
 	float relScale = max(viewZ * relThreshold, 1e-5);
 	const int FARO_GI_DIRS = 6;
 	const int FARO_GI_STEPS = 8;
@@ -2578,12 +2716,34 @@ void outputShader()
 		float maxSin = 0.0;
 		for (int s = 1; s <= FARO_GI_STEPS; s++)
 		{
-			float t = (float(s) - 0.5) / float(FARO_GI_STEPS);
+			// Jittered, non-uniformly spaced steps - both from Stachowiak's
+			// parameter set (jitter, linear_march_exponent).
+			//
+			// Uniform un-jittered steps put every pixel's samples at the same
+			// radii, so the gather produces concentric rings. Offsetting the
+			// first step by the same ordered dither that rotates the kernel
+			// spreads those radii across the 4x4 block, and the exponent packs
+			// more steps near the centre, where contact-range bounce light
+			// actually lives.
+			float t = (float(s) - 1.0 + ditherJitter) / float(FARO_GI_STEPS);
+			t = pow(clamp(t, 0.0, 1.0), 1.5);
 			vec2 suv = passUV + dirPx * (t * marchPx) / outRes;
-			float sd = min(max(texture(textureDepth, suv).x, 0.0), 1.0);
-			float sz = GiLinearize(sd);
-			if (sz >= viewZ)
+			float sdLinear = min(max(texture(textureDepth, suv).x, 0.0), 1.0);
+			float sdPoint = GiPointDepth(suv, outRes);
+			// Both readings have to agree this sample sits in FRONT of the
+			// centre before it is allowed to contribute. On a silhouette the
+			// bilinear read is a blend of character and background, so it
+			// disagrees with the point read and the sample is dropped instead
+			// of being treated as a surface that is not there. Inside a
+			// surface the two agree and nothing changes, which is how the
+			// bilinear smoothing is kept where it helps.
+			float szLinear = GiLinearize(sdLinear);
+			float szPoint = GiLinearize(sdPoint);
+			if (szLinear >= viewZ || szPoint >= viewZ)
 				continue;
+			// The point reading is the one that exists in the scene, so the
+			// geometry is reconstructed from it.
+			float sz = szPoint;
 			vec3 samplePos = GiReconstructPos(suv, sz, aspect);
 			vec3 toSample = samplePos - centerPos;
 			float dist = length(toSample);
@@ -2602,10 +2762,39 @@ void outputShader()
 			float delta = rise * riseWeight * w;
 			bounce += texture(textureSrc, suv).rgb * delta;
 			wsum += delta;
+			// Accumulated separately to give the divisor floor below something
+			// at the RIGHT SCALE to compare against. wsum sums
+			// rise*riseWeight*w, and rise is a small difference of sines, so
+			// wsum can never approach DIRS*STEPS the way the SSAO pass's own
+			// weight sum can. Flooring against that count crushed the result
+			// by several times over - the blotches went away and so did most
+			// of the effect.
+			wPotential += w;
 			maxSin = max(maxSin, sinAngle);
 		}
 	}
-	vec3 giColor = wsum > 1e-4 ? bounce / wsum : vec3(0.0);
+	// Divisor floor, the second half of the blotch fix.
+	//
+	// bounce/wsum alone is a weighted mean, so it stays in range - but in a
+	// shadowed area almost every sample fails the gates above (behind the
+	// surface, or below the horizon), leaving wsum tiny. Dividing by a tiny
+	// weight lets the one or two samples that did get through decide the whole
+	// pixel, and that is why the patches showed up in shadow specifically.
+	//
+	// With the floor, a pixel whose evidence is scarce is pulled smoothly
+	// towards "no indirect light" instead of towards whatever single sample
+	// survived. Where samples are plentiful this changes nothing. The SSAO
+	// pass carries the same floor for the same reason - see its own comment
+	// about what normalizing by wsum alone did.
+	//
+	// The floor is a fraction of wPotential, NOT of DIRS*STEPS. The first
+	// attempt used the sample count, copying SSAO - but SSAO's weight sum is
+	// built from w alone and really can approach that count, while this one is
+	// built from rise*riseWeight*w and cannot. Flooring against the count
+	// divided every pixel by a constant far larger than its own weight sum,
+	// which fixed the blotches and simultaneously crushed the effect to almost
+	// nothing. Comparing like with like keeps both properties.
+	vec3 giColor = bounce / max(wsum, 0.15 * wPotential + 1e-4);
 	colorOut0 = vec4(giColor, 1.0);
 }
 )";
@@ -2798,6 +2987,8 @@ void RendererOutputShader::InitializeStatic()
 
     	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
+    	s_lanczos_shader = new RendererOutputShader(vertex_source, s_lanczos_shader_source);
+    	s_lanczos_shader_ud = new RendererOutputShader(vertex_source_ud, s_lanczos_shader_source);
 		break;
     }
 #endif
@@ -2817,6 +3008,8 @@ void RendererOutputShader::InitializeStatic()
 
     	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
+    	s_lanczos_shader = new RendererOutputShader(vertex_source, s_lanczos_shader_source);
+    	s_lanczos_shader_ud = new RendererOutputShader(vertex_source_ud, s_lanczos_shader_source);
 
     	s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
     	s_fsr1_easu_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr1_easu_shader_source);
@@ -2863,6 +3056,8 @@ void RendererOutputShader::ShutdownStatic()
 
 	delete s_hermit_shader;
 	delete s_hermit_shader_ud;
+	delete s_lanczos_shader;
+	delete s_lanczos_shader_ud;
 
 	delete s_fsr1_easu_shader;
 	delete s_fsr1_easu_shader_ud;
@@ -2904,6 +3099,8 @@ void RendererOutputShader::ShutdownStatic()
 	s_bicubic_shader_ud = nullptr;
 	s_hermit_shader = nullptr;
 	s_hermit_shader_ud = nullptr;
+	s_lanczos_shader = nullptr;
+	s_lanczos_shader_ud = nullptr;
 	s_fsr1_easu_shader = nullptr;
 	s_fsr1_easu_shader_ud = nullptr;
 	s_fsr1_rcas_shader = nullptr;

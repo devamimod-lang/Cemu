@@ -4487,7 +4487,207 @@ bool VulkanRenderer::RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, 
 	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent,
 	VkFormat scratchFormat)
 {
-	return false;
+	// Every bail-out below says WHY, once. The first version of this returned
+	// silently from eight places, and the first report was "I turn GI on and
+	// off and nothing happens" with no way to tell whether the pass had
+	// declined or had never been called at all. One line each is worth it -
+	// the motion estimator needed exactly the same treatment.
+	auto bailOnce = [&](const char* reason) -> bool
+	{
+		if (!m_faroGiLoggedBail)
+		{
+			m_faroGiLoggedBail = true;
+			cemuLog_log(LogType::Force, "Anubis GI: not running ({})", reason);
+		}
+		return false;
+	};
+
+	if (!GetConfig().faro_postfx_enabled || !GetConfig().faro_gi_enabled)
+		return false; // not a fault - the user turned it off
+	// Depth is the whole input: positions and normals are reconstructed from
+	// it (see s_gi_shader_body). Shares the captured scene depth with SSAO,
+	// read-only - nothing else is shared between the two.
+	if (!HasCapturedDepth())
+		return bailOnce("no scene depth captured");
+	LatteTextureView* depthView = GetCapturedDepthView();
+	if (!depthView || !depthView->baseTexture)
+		return bailOnce("depth view gone");
+	LatteTC_MarkTextureStillInUse(depthView->baseTexture);
+
+	RendererOutputShader* giShader = RendererOutputShader::s_gi_shader;
+	RendererOutputShader* giBlurShader = RendererOutputShader::s_gi_blur_shader;
+	if (!giShader || !giBlurShader)
+		return bailOnce("shaders not compiled");
+
+	auto* depthViewVk = static_cast<LatteTextureViewVk*>(depthView);
+	auto* depthTexVk = static_cast<LatteTextureVk*>(depthView->baseTexture);
+	VKRObjectTextureView* sampledDepthView = depthViewVk->GetViewRGBA();
+	if (!sampledDepthView || sampledDepthView->m_textureImageView == VK_NULL_HANDLE)
+		return bailOnce("depth not samplable");
+
+	// GI's OWN depth sampler, not GTAO's. m_gtaoDepthSampler is created lazily
+	// inside the SSAO pass, so borrowing it would make GI silently depend on
+	// SSAO being enabled and having run first.
+	if (m_giDepthSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_giDepthSampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Faro GI: failed to create depth sampler");
+			return false;
+		}
+	}
+
+	// The scratch target is NOT created here. EnsureGiScratchTarget has to
+	// WaitDeviceIdle and tears the render pass down, which retires cached
+	// pipelines - doing that at this point, with the chain's passes already
+	// recorded, is the exact shape of the hang this feature was disabled for.
+	// The caller creates it before recording anything; this only verifies it
+	// matches and otherwise declines for the frame.
+	if (m_giScratchImage == VK_NULL_HANDLE ||
+		m_giScratchExtent.width != (uint32)passWidth ||
+		m_giScratchExtent.height != (uint32)passHeight ||
+		m_giScratchFormat != scratchFormat)
+		return bailOnce("scratch target not ready for this size/format");
+
+	const bool useDepthSnapshot = m_faroDepthSnapshotValid && m_faroDepthSnapshotView != VK_NULL_HANDLE;
+	VkImageView depthSampleView = useDepthSnapshot ? m_faroDepthSnapshotView : sampledDepthView->m_textureImageView;
+	VkSampler depthSampleSampler = useDepthSnapshot ? m_faroDepthSnapshotSampler : m_giDepthSampler;
+
+	VkDescriptorSet giSet = GetFaroEffectDescriptorSet(colorInputView, colorInputSampler, depthSampleView, depthSampleSampler);
+	if (giSet == VK_NULL_HANDLE)
+		return bailOnce("gather descriptor set unavailable");
+	// Blur reads three images: the raw GI, the depth, and the untouched scene
+	// colour it has to add the bounce light back onto.
+	VkDescriptorSet giBlurSet = GetFaroEffectDescriptorSet(m_giScratchView, m_giScratchSampler,
+		depthSampleView, depthSampleSampler, colorInputView, colorInputSampler);
+	if (giBlurSet == VK_NULL_HANDLE)
+		return bailOnce("blur descriptor set unavailable");
+
+	for (sint32 mip = 0; !useDepthSnapshot && mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_WRITE, IMAGE_READ>(depthTexVk, depthLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
+	auto giPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, giShader, m_giScratchRenderPass);
+	auto giBlurPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, giBlurShader, outputRenderPass);
+
+	// The pass feeding colorInputView may not have a trailing barrier at every
+	// call site, so this pass makes its own input visibility self-contained.
+	VkMemoryBarrier inputBarrier{};
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &inputBarrier, 0, nullptr, 0, nullptr);
+
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)passWidth;
+	viewport.height = (float)passHeight;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+
+	// Shared by both draws: the blur reads the same intensity and the same
+	// depth-similarity threshold the gather used.
+	//
+	// These land in faroGtaoParams, which GTAO also uses. That is not shared
+	// state: every pass uploads its own copy of the uniform block and binds it
+	// with its own dynamic offset, so GI's values live only in GI's draws.
+	// Reusing the field rather than adding one keeps the std140 layout - and
+	// therefore the SSAO path - untouched.
+	auto giUniforms = giShader->FillUniformBlockBuffer(*texView, { passWidth, passHeight }, padView);
+	giUniforms.applySRGBEncoding = false;
+	giUniforms.targetGamma = giUniforms.displayGamma;
+	giUniforms.faroGtaoParams[0] = (float)std::clamp(GetConfig().faro_gi_intensity.GetValue(), 0, 100) / 100.0f;
+	giUniforms.faroGtaoParams[1] = 0.04f;   // depth-similarity threshold, relative to view depth
+	giUniforms.faroGtaoParams[2] = 48.0f;   // gather radius in pixels - wider than AO's, bounce light travels further
+	giUniforms.faroGtaoParams[3] = 1000.0f; // far plane used to linearize depth
+	auto giUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&giUniforms, sizeof(decltype(giUniforms)) });
+
+	// === draw 1: scene colour + depth -> m_giScratch (raw, noisy gather) ===
+	{
+		VkRenderPassBeginInfo rpInfo{};
+		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		rpInfo.renderPass = m_giScratchRenderPass;
+		rpInfo.framebuffer = m_giScratchFramebuffer;
+		rpInfo.renderArea.offset = { 0, 0 };
+		rpInfo.renderArea.extent = m_giScratchExtent;
+		rpInfo.clearValueCount = 0;
+		VkRect2D scissor{};
+		scissor.extent = m_giScratchExtent;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, giPipeline);
+		m_state.currentPipeline = giPipeline;
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &giSet, 1, &giUniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	}
+
+	// === draw 2: depth-aware blur of the raw GI, added onto the scene ===
+	{
+		VkMemoryBarrier scratchBarrier{};
+		scratchBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		scratchBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		scratchBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &scratchBarrier, 0, nullptr, 0, nullptr);
+
+		VkRenderPassBeginInfo rpInfo{};
+		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		rpInfo.renderPass = outputRenderPass;
+		rpInfo.framebuffer = outputFramebuffer;
+		rpInfo.renderArea.offset = { 0, 0 };
+		rpInfo.renderArea.extent = outputExtent;
+		rpInfo.clearValueCount = 0;
+		VkRect2D scissor{};
+		scissor.extent = outputExtent;
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, giBlurPipeline);
+		m_state.currentPipeline = giBlurPipeline;
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &giBlurSet, 1, &giUniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	}
+
+	VkMemoryBarrier outputBarrier{};
+	outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	outputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	outputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &outputBarrier, 0, nullptr, 0, nullptr);
+
+	for (sint32 mip = 0; !useDepthSnapshot && mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_READ, IMAGE_WRITE>(depthTexVk, depthLayers, depthTexVk->GetDefaultLayout());
+	}
+	return true;
 }
 
 void VulkanRenderer::DestroyGiScratchTarget()
@@ -4527,11 +4727,142 @@ void VulkanRenderer::DestroyGiScratchTarget()
 	m_giScratchFormat = VK_FORMAT_UNDEFINED;
 }
 
+// GI's own intermediate buffer, holding the raw (noisy) gather before the
+// depth-aware blur folds it into the scene. Modelled on CreateFaroAoTarget,
+// which is the SSAO path's verified equivalent - that function is deliberately
+// left untouched, this is a separate target with its own image, view, sampler,
+// render pass and framebuffer so the two features share nothing writable.
+//
+// WaitDeviceIdle() below, and DestroyGiScratchTarget's call to
+// InvalidateBackbufferBlitPipelineCache(), mean this may ONLY run before any
+// command has been recorded for the frame. See the call site at the top of
+// DrawBackbufferQuadTaa, and RunFaroMotionEstimation for the full account of
+// what happens when a function like this is called mid-recording.
 bool VulkanRenderer::EnsureGiScratchTarget(VkFormat format, uint32 width, uint32 height)
 {
-	// Never actually called - RunFaroGiPass returns false before reaching
-	// this. Kept as a safe stub matching the header declaration.
-	return false;
+	if (width == 0 || height == 0 || format == VK_FORMAT_UNDEFINED)
+		return false;
+	if (m_giScratchImage != VK_NULL_HANDLE && m_giScratchExtent.width == width &&
+		m_giScratchExtent.height == height && m_giScratchFormat == format)
+		return true;
+
+	WaitDeviceIdle();
+	DestroyGiScratchTarget();
+
+	// The caller's own swapchain colour format, so the blur pass can sample
+	// this and write into the caller's framebuffer without a format mismatch.
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent = { width, height, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = format;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_giScratchImage) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro GI: failed to create scratch image");
+		DestroyGiScratchTarget();
+		return false;
+	}
+	m_giScratchAllocation = memoryManager->imageMemoryAllocate(m_giScratchImage);
+
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = m_giScratchImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.baseMipLevel = 0;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.baseArrayLayer = 0;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_giScratchView) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro GI: failed to create scratch image view");
+		DestroyGiScratchTarget();
+		return false;
+	}
+
+	VkSamplerCreateInfo samplerInfo{};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_LINEAR;
+	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.mipLodBias = 0.0f;
+	samplerInfo.compareOp = VK_COMPARE_OP_NEVER;
+	samplerInfo.minLod = 0.0f;
+	samplerInfo.maxLod = 0.0f;
+	samplerInfo.maxAnisotropy = 1.0f;
+	samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+	if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_giScratchSampler) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro GI: failed to create scratch sampler");
+		DestroyGiScratchTarget();
+		return false;
+	}
+
+	VkAttachmentDescription colorAttachment = {};
+	colorAttachment.format = format;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkAttachmentReference colorAttachmentRef = {};
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkSubpassDescription subpass = {};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VkRenderPassCreateInfo renderPassInfo = {};
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &colorAttachment;
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass;
+	if (vkCreateRenderPass(m_logicalDevice, &renderPassInfo, nullptr, &m_giScratchRenderPass) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro GI: failed to create scratch render pass");
+		DestroyGiScratchTarget();
+		return false;
+	}
+
+	VkImageView attachments[1] = { m_giScratchView };
+	VkFramebufferCreateInfo framebufferInfo = {};
+	framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	framebufferInfo.renderPass = m_giScratchRenderPass;
+	framebufferInfo.attachmentCount = 1;
+	framebufferInfo.pAttachments = attachments;
+	framebufferInfo.width = width;
+	framebufferInfo.height = height;
+	framebufferInfo.layers = 1;
+	if (vkCreateFramebuffer(m_logicalDevice, &framebufferInfo, nullptr, &m_giScratchFramebuffer) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro GI: failed to create scratch framebuffer");
+		DestroyGiScratchTarget();
+		return false;
+	}
+
+	m_giScratchExtent = { width, height };
+	m_giScratchFormat = format;
+	return true;
 }
 
 void VulkanRenderer::DestroyGiTargets()
@@ -7637,6 +7968,18 @@ bool VulkanRenderer::DrawBackbufferQuadFsr1Taa(LatteTextureView* texView, Render
 		gtaoQualityProbe = 1;
 	bool wantGtao = GetConfig().faro_postfx_enabled && GetConfig().faro_ssao_enabled &&
 		HasCapturedDepth() && RendererOutputShader::s_gtao_shader[gtaoQualityProbe] != nullptr;
+
+	// Anubis GI has no insertion point in THIS chain. The surviving call site
+	// is in DrawBackbufferQuadTaa (TAA without FSR1), so with FSR 1.0 as the
+	// upscale filter the GI setting does nothing at all: the pass is never
+	// reached, which from the outside looks identical to it being broken. Say
+	// so once rather than letting the setting appear to be silently ignored.
+	if (GetConfig().faro_postfx_enabled && GetConfig().faro_gi_enabled && !m_faroGiLoggedNoFsr1Path)
+	{
+		m_faroGiLoggedNoFsr1Path = true;
+		cemuLog_log(LogType::Force, "Anubis GI: enabled, but this chain is FSR1+TAA and has no GI pass - choose a non-FSR1 upscale filter to use GI");
+	}
+
 	// TEMP DEBUG (Faro GTAO diagnostic): log once, right before the
 	// EnsureFxaaIntermediateTarget gate, which sub-condition (if any) is false.
 	{
@@ -8149,6 +8492,16 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 		!EnsureTaaHistoryTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight))
 		return false;
 
+	// Anubis GI: the scratch target is created HERE, before a single command is
+	// recorded for this frame, and never from inside RunFaroGiPass. Creating it
+	// means WaitDeviceIdle plus tearing down a render pass, which retires
+	// cached pipelines - and doing that with the chain's passes already
+	// recorded is the shape of the hang this feature was originally disabled
+	// for. A failure is not fatal: RunFaroGiPass checks the target and declines
+	// for the frame, leaving the chain exactly as it is without GI.
+	if (GetConfig().faro_postfx_enabled && GetConfig().faro_gi_enabled)
+		EnsureGiScratchTarget(chainInfo.m_surfaceFormat.format, (uint32)nativeWidth, (uint32)nativeHeight);
+
 	draw_endRenderPass();
 
 	// binding 0 (the game's own native texture) changes from draw to draw -
@@ -8466,14 +8819,26 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 		chainInB = true;
 	}
 
-	// === Faro GI (optional, non-FSR1 TAA path): DISABLED - hard-gated to
-	// false regardless of faro_gi_enabled (RunFaroGiPass itself is also a
-	// no-op stub - see its own comment) after being implicated in a hang/
-	// crash reproduced right in this function under a downscaling+TAA
-	// graphic-pack combo. Kept as dead code (never taken) instead of
-	// removing the call site entirely, so re-enabling it later is a
-	// one-line change once/if the underlying implementation is revisited.
-	bool wantGi = false;
+	// === Anubis GI (optional, non-FSR1 TAA path) ===
+	//
+	// Re-enabled, driven by its own setting. It had been hard-gated off after a
+	// hang reproduced in this very function under a downscaling+TAA graphic
+	// pack combination. Two pieces of infrastructure that were implicated in
+	// that shape of failure have since been fixed, which is why it is worth
+	// retrying rather than reconstructing blindly:
+	//
+	//  - InvalidateBackbufferBlitPipelineCache used to DESTROY cached
+	//    pipelines. DestroyGiScratchTarget calls it, so recreating the scratch
+	//    on a resolution change freed pipelines the caller still held in
+	//    locals. It now moves them to a graveyard instead.
+	//  - Creating the scratch target mid-recording (WaitDeviceIdle with the
+	//    frame half-recorded) is now impossible here: the target is created at
+	//    the top of this function and RunFaroGiPass only verifies it.
+	//
+	// That is a reasoned retry, not a guarantee. The setting exists precisely
+	// so it can be turned off and compared without a rebuild, and the
+	// combination to test first is downscaling with TAA.
+	bool wantGi = GetConfig().faro_postfx_enabled && GetConfig().faro_gi_enabled;
 	if (wantGi)
 	{
 		VkRenderPass giOutRP = chainInB ? m_taaNativeResolveRenderPass : m_taaFxaaRenderPass;

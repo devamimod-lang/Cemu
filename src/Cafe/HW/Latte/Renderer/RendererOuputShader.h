@@ -93,6 +93,11 @@ public:
 
 	static RendererOutputShader* s_hermit_shader;
 	static RendererOutputShader* s_hermit_shader_ud;
+	// Anubis: ratio-aware Lanczos2, for downscaling (supersampling resolve).
+	// See s_lanczos_shader_source for why the fixed-footprint filters above
+	// undersample above a ratio of about 2.
+	static RendererOutputShader* s_lanczos_shader;
+	static RendererOutputShader* s_lanczos_shader_ud;
 
 	// Not available under Metal - AMD's FSR1 reference has no Metal/MSL port and
 	// Cemu's Metal output-shader path skips the shared GLSL preamble entirely
@@ -241,6 +246,7 @@ private:
 	static const std::string s_copy_shader_source;
 	static const std::string s_bicubic_shader_source;
 	static const std::string s_hermite_shader_source;
+	static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;
 	static const std::string s_fsr1_rcas_shader_source;
 	static const std::string s_fxaa_shader_source;

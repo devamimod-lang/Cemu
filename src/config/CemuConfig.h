@@ -643,6 +643,21 @@ struct CemuConfig
 	// gating it off, per user request.
 	ConfigValue<bool> faro_gi_enabled{false};
 	ConfigValue<sint32> faro_gi_intensity{50};
+
+	// Anubis: load higher-resolution replacement textures from disk - see
+	// LatteTextureReplacement.h for the workflow and the key it matches on.
+	// Off by default: it reads files on the texture load path, and a pack built
+	// from a dump of a different run can miss entirely.
+	ConfigValue<bool> texture_replacement_enabled{false};
+
+	// Anubis: real-time texture upscaling - 1 (off), 2, 3 or 4.
+	// See LatteTextureScaling.h for what this can and cannot deliver.
+	ConfigValue<sint32> texture_scaling_factor{1};
+	// Largest scaled dimension allowed, in texels. 0 = no limit. Exists so one
+	// build suits an 8 GB card and a 24 GB one: scaling multiplies texture VRAM
+	// by the factor squared, so the sensible ceiling depends on the GPU, not on
+	// the developer's machine.
+	ConfigValue<sint32> texture_scaling_max_size{2048};
 	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio

@@ -755,6 +755,37 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 		});
 		box_sizer->Add(giRow, 0, wxEXPAND | wxALL, 5);
 
+		// Anubis: real-time texture scaling. Two controls, because the factor
+		// and the VRAM ceiling are different decisions: the factor is how much
+		// sharper you want it, the ceiling is what your card can hold. Scaling
+		// multiplies texture memory by the factor squared, so a value that is
+		// right on a 24 GB card is wrong on an 8 GB one - baking in one budget
+		// would make this unusable for half the people who get this build.
+		{
+			auto* texScaleRow = new wxBoxSizer(wxHORIZONTAL);
+			texScaleRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Texture scaling")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+			wxString texScaleChoices[] = { _("Off"), _("2x"), _("3x"), _("4x") };
+			m_texture_scaling = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(texScaleChoices), texScaleChoices);
+			m_texture_scaling->SetToolTip(_("Upscales the game's own textures as they load, so textures look sharper with nothing to download.\nThis cannot invent detail that was never in the texture - what it buys is a better reconstruction than the simple one the GPU does for free. Costs CPU on the texture load path, so expect brief hitches when entering a new area. Takes effect on the next game launch."));
+			m_texture_scaling->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+				// Index 0 is Off, which is a factor of 1.
+				GetConfig().texture_scaling_factor = event.GetSelection() + 1;
+			});
+			texScaleRow->Add(m_texture_scaling, 1, wxEXPAND | wxALL, 5);
+			box_sizer->Add(texScaleRow, 0, wxEXPAND);
+
+			auto* texCapRow = new wxBoxSizer(wxHORIZONTAL);
+			texCapRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Scaled texture limit")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+			wxString texCapChoices[] = { _("1024"), _("2048"), _("4096"), _("8192"), _("No limit") };
+			m_texture_scaling_cap = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(texCapChoices), texCapChoices);
+			m_texture_scaling_cap->SetToolTip(_("Largest size a scaled texture is allowed to reach. A texture that would end up bigger is left at its original resolution instead.\nLower this if you run out of video memory; raise it if your card has plenty."));
+			m_texture_scaling_cap->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+				GetConfig().texture_scaling_max_size = TextureCapSelectionToSize(event.GetSelection());
+			});
+			texCapRow->Add(m_texture_scaling_cap, 1, wxEXPAND | wxALL, 5);
+			box_sizer->Add(texCapRow, 0, wxEXPAND);
+		}
+
 		// Faro SSR removed. It never actually ran - instrumentation showed
 		// "SSR ran 0/600 frames" throughout - and the approach it took
 		// (raymarching with no material information, so every surface
@@ -1392,6 +1423,35 @@ wxPanel* GeneralSettings2::AddDebugPage(wxBookCtrlBase* notebook)
 	panel->SetSizerAndFit(debug_panel_sizer);
 
 	return panel;
+}
+
+// Maps the scaled-texture cap dropdown to a size in texels. A plain index
+// would not do: the last entry means "no limit", which is stored as 0.
+sint32 GeneralSettings2::TextureCapSelectionToSize(int selection)
+{
+	switch (selection)
+	{
+	case 0: return 1024;
+	case 1: return 2048;
+	case 2: return 4096;
+	case 3: return 8192;
+	default: return 0; // no limit
+	}
+}
+
+int GeneralSettings2::TextureCapSizeToSelection(sint32 size)
+{
+	switch (size)
+	{
+	case 1024: return 0;
+	case 2048: return 1;
+	case 4096: return 2;
+	case 8192: return 3;
+	case 0: return 4;
+	// An unrecognised value (hand-edited settings.xml) shows as the 2048
+	// default rather than leaving the control blank.
+	default: return 1;
+	}
 }
 
 // The downscale radio box's index is not its stored value.
@@ -2387,6 +2447,8 @@ void GeneralSettings2::ApplyConfig()
 	m_faro_postfx->SetValue(config.faro_postfx_enabled);
 	m_faro_ssao->SetValue(config.faro_ssao_enabled);
 	m_faro_gi->SetValue(config.faro_gi_enabled);
+	m_texture_scaling->SetSelection(std::clamp<sint32>(config.texture_scaling_factor, 1, 4) - 1);
+	m_texture_scaling_cap->SetSelection(TextureCapSizeToSelection(config.texture_scaling_max_size));
 	m_faro_gi_intensity->SetValue(std::clamp<sint32>(config.faro_gi_intensity, 0, 100));
 	// Label refreshed with the slider, not after it - see the FSR sharpness
 	// readout for what happens when only one of the two is updated here.

@@ -4,6 +4,7 @@
 #include "Cafe/HW/Latte/Core/LatteDraw.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/LatteAsyncCommands.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "Cafe/GameProfile/GameProfile.h"
 #include "Cafe/GraphicPack/GraphicPack2.h"
 #include "WindowSystem.h"
@@ -124,6 +125,9 @@ int Latte_ThreadEntry()
 
 	LatteTiming_Init();
 	LatteTexture_init();
+	// Anubis: indexes the on-disk replacement pack for this title. Returns
+	// immediately when the feature is off, which is the default.
+	LatteTexReplace_Init();
 	LatteTC_Init();
 	LatteBufferCache_init(164 * 1024 * 1024);
 	LatteQuery_Init();

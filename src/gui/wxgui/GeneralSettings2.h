@@ -109,6 +109,11 @@ private:
 	wxCheckBox* m_faro_gi;
 	wxSlider* m_faro_gi_intensity;
 	wxStaticText* m_faro_gi_intensity_text;
+	// Anubis real-time texture scaling: factor and the VRAM ceiling.
+	wxChoice* m_texture_scaling;
+	wxChoice* m_texture_scaling_cap;
+	static sint32 TextureCapSelectionToSize(int selection);
+	static int TextureCapSizeToSelection(sint32 size);
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;
 	wxCheckBox *m_overlay_fps, *m_overlay_drawcalls, *m_overlay_cpu, *m_overlay_cpu_per_core,*m_overlay_ram, *m_overlay_vram, *m_overlay_debug;

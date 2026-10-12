@@ -1,5 +1,6 @@
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+#include "Cafe/HW/Latte/Core/LatteTextureScaling.h"
 #include "config/ActiveSettings.h"
 #include "Cafe/CafeSystem.h"
 
@@ -578,6 +579,35 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
 		cemu_assert_debug(depth == hostTexture->depth);
 	}
 	cemu_assert_debug(mipLevels == hostTexture->mipLevels);
+	// Anubis: real-time texture scaling. This is the branch upstream left with
+	// "todo - ideally, we should scale/convert the data" - a texture whose
+	// resolution is overridden got its slice CLEARED rather than filled,
+	// because nothing produced data at the new size. Scaling produces exactly
+	// that, so it belongs here.
+	//
+	// Only mip 0 is scaled. The smaller mips are the game's own and are already
+	// correct for their own level; a scaled mip 0 plus untouched mips means the
+	// chain is no longer a halving sequence, which is why the host texture is
+	// created with the scaled size for every level and the rest fall back to
+	// the clear below. Fixing that properly means generating the whole chain
+	// from the scaled base, which is a separate step.
+	if (hostTexture->overwriteInfo.hasResolutionOverwrite && !hostTexture->overwriteInfo.hasFormatOverwrite && mipIndex == 0)
+	{
+		sint32 scaledW = 0, scaledH = 0;
+		size_t scaledSize = 0;
+		const uint8* scaled = LatteTexScale_ScaleSlice(pixelData, hostTexture->format, width, height,
+			hostTexture->pitch, scaledW, scaledH, scaledSize);
+		if (scaled && scaledW == hostTexture->overwriteInfo.width && scaledH == hostTexture->overwriteInfo.height)
+		{
+			g_renderer->texture_loadSlice(hostTexture, scaledW, scaledH, depth, (void*)scaled, sliceIndex, mipIndex, (uint32)scaledSize);
+			return;
+		}
+		// Falls through to the clear when scaling declined or produced a size
+		// that does not match what the host texture was created at. Uploading a
+		// mismatched size would be undefined behaviour in the renderer, so a
+		// cleared slice is the safe outcome even though it is visibly wrong -
+		// and the stats line reports it rather than hiding it.
+	}
 	if (hostTexture->overwriteInfo.hasResolutionOverwrite || hostTexture->overwriteInfo.hasFormatOverwrite)
 	{
 		// todo - ideally, we should scale/convert the data to the new format and resolution

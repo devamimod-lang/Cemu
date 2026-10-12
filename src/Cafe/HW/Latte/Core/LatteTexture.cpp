@@ -2,6 +2,7 @@
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
+#include "Cafe/HW/Latte/Core/LatteTextureScaling.h"
 
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
@@ -1318,6 +1319,26 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
 			}
 		}
 	}
+	// Anubis real-time texture scaling. Applied AFTER the graphic pack rules
+	// and only when none of them set a resolution for this texture: a pack that
+	// states a resolution explicitly knows something about this texture that we
+	// do not, so it wins. Same precedence the forced anisotropic level follows.
+	//
+	// This has to happen here, at creation, because the host texture is
+	// allocated from these dimensions - deciding to scale later, once slices
+	// are being uploaded, would mean uploading data that does not fit.
+	if (!this->overwriteInfo.hasResolutionOverwrite && !this->overwriteInfo.hasFormatOverwrite)
+	{
+		sint32 scaledW = 0, scaledH = 0;
+		if (LatteTexScale_ShouldScale(this->format, this->isDepth, width, height, scaledW, scaledH))
+		{
+			this->overwriteInfo.hasResolutionOverwrite = true;
+			this->overwriteInfo.width = scaledW;
+			this->overwriteInfo.height = scaledH;
+			this->overwriteInfo.depth = depth;
+		}
+	}
+
 	// determine if this texture should ever be mirrored to CPU RAM
 	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
 	{

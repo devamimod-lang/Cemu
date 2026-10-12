@@ -455,6 +455,7 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
 	else if(srcTexture->overwriteInfo.hasFormatOverwrite && srcTexture->overwriteInfo.format != dstTexture->overwriteInfo.format)
 		return; // both are overwritten but with different formats
 
+
 	if (srcMipIndex == 0 && dstMipIndex == 0 && (srcTexture->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED || srcTexture->tileMode == Latte::E_HWTILEMODE::TM_1D_TILED_THIN1) && srcTexture->height > dstTexture->height && (srcTexture->height % dstTexture->height) == 0)
 	{
 		bool isMatch = srcTexture->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED;
@@ -1319,25 +1320,25 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
 			}
 		}
 	}
-	// Anubis real-time texture scaling. Applied AFTER the graphic pack rules
-	// and only when none of them set a resolution for this texture: a pack that
-	// states a resolution explicitly knows something about this texture that we
-	// do not, so it wins. Same precedence the forced anisotropic level follows.
+	// Texture upscaling deliberately does NOT touch overwriteInfo any more.
 	//
-	// This has to happen here, at creation, because the host texture is
-	// allocated from these dimensions - deciding to scale later, once slices
-	// are being uploaded, would mean uploading data that does not fit.
-	if (!this->overwriteInfo.hasResolutionOverwrite && !this->overwriteInfo.hasFormatOverwrite)
-	{
-		sint32 scaledW = 0, scaledH = 0;
-		if (LatteTexScale_ShouldScale(this->format, this->isDepth, width, height, scaledW, scaledH))
-		{
-			this->overwriteInfo.hasResolutionOverwrite = true;
-			this->overwriteInfo.width = scaledW;
-			this->overwriteInfo.height = scaledH;
-			this->overwriteInfo.depth = depth;
-		}
-	}
+	// Overriding the host texture's resolution here was the wrong mechanism,
+	// and the failures were not bad luck. Cemu's texture cache assumes the host
+	// texture's dimensions match the guest's, and several subsystems depend on
+	// that: syncing pixels between textures that share guest memory, updates
+	// from dynamic textures, readback to RAM, view creation, mip counts.
+	// Overriding the resolution breaks that invariant in all of those at once,
+	// and each patch only surfaced the next consumer.
+	//
+	// The reason the graphic pack resolution override can use this field is
+	// that those textures are render targets: the game draws into them, their
+	// guest-side data is meant to be discarded, and Cemu clears it. The
+	// consistency question never arises. It does arise for a sampled texture
+	// with real data.
+	//
+	// Upscaling now happens on the GPU, into a separate image, with the cache
+	// left exactly 1:1 with guest memory - see VulkanRenderer's upscaled
+	// texture cache and the single substitution point in VulkanRendererCore.
 
 	// determine if this texture should ever be mirrored to CPU RAM
 	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)

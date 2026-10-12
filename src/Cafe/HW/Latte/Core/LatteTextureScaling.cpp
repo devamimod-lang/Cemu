@@ -68,6 +68,53 @@ namespace
 		return 0.0f;
 	}
 
+	// Splits a row range across the idle cores and waits for all of it.
+	//
+	// Deliberately NOT "move the work to a worker thread". The upload needs the
+	// scaled result, so handing the serial work to one other thread and
+	// blocking on it only changes which thread waits - the stall is the same
+	// length. What shortens it is doing the rows at the same time, and there is
+	// headroom for that: the process was measured using 20 percent of 16
+	// hardware threads while one PPC core sat at 98 percent.
+	//
+	// Threads are created per call rather than pooled. At ~50us of creation
+	// against tens of milliseconds of work this does not show up, and a pool
+	// would mean owning thread lifetime across emulator shutdown for no
+	// measurable gain.
+	template<typename TFunc>
+	void AnubisParallelFor(sint32 count, TFunc&& body)
+	{
+		if (count <= 0)
+			return;
+		// One core is left for the emulator itself, which is the thing actually
+		// bottlenecking the frame - taking every core would trade texture
+		// stutter for frame stutter.
+		static const sint32 maxThreads = std::max<sint32>(1, (sint32)std::thread::hardware_concurrency() - 1);
+		const sint32 threadCount = std::min(maxThreads, count);
+		if (threadCount <= 1)
+		{
+			for (sint32 i = 0; i < count; i++)
+				body(i);
+			return;
+		}
+		std::vector<std::thread> workers;
+		workers.reserve(threadCount - 1);
+		// Interleaved rather than chunked: block rows are not equally
+		// expensive (a flat row encodes faster than a detailed one), so
+		// striding keeps the threads from finishing at wildly different times.
+		for (sint32 t = 1; t < threadCount; t++)
+		{
+			workers.emplace_back([&, t]() {
+				for (sint32 i = t; i < count; i += threadCount)
+					body(i);
+			});
+		}
+		for (sint32 i = 0; i < count; i += threadCount)
+			body(i);
+		for (auto& w : workers)
+			w.join();
+	}
+
 	inline const uint8* SampleClamped(const uint8* src, sint32 srcPitchBytes, sint32 w, sint32 h, sint32 x, sint32 y)
 	{
 		x = std::clamp(x, 0, w - 1);
@@ -118,7 +165,11 @@ namespace
 		b = (b5 << 3) | (b5 >> 2);
 	}
 
-	void EncodeBC1Block(const uint8* rgba16, uint8* out)
+	// allowTransparency must be FALSE for BC3's colour block: there the alpha
+	// lives in its own 8-byte block, and a colour block in 3-colour mode would
+	// make the renderer treat index 3 as transparent on top of that - double
+	// alpha, and the texture comes out with holes.
+	void EncodeBC1Block(const uint8* rgba16, uint8* out, bool allowTransparency)
 	{
 		// Endpoints from the block's colour bounding box. This is the fast
 		// path every practical encoder starts from: the two corners of the box
@@ -148,34 +199,83 @@ namespace
 		minG += insetG; maxG -= insetG;
 		minB += insetB; maxB -= insetB;
 
+		// Does this block carry BC1's one-bit alpha?
+		//
+		// BC1 has two modes, chosen by the endpoint ordering. With c0 > c1 the
+		// palette is 4 opaque colours; with c0 <= c1 it is 3 colours plus a
+		// fully transparent entry. The first version of this encoder always
+		// produced the opaque mode, which silently threw the transparency away -
+		// that is what made waterfall water lose its transparency, smoke read as
+		// solid blocks, and some textures come out black: every cut-out texel
+		// became opaque colour instead of nothing.
+		bool hasTransparent = false;
+		if (allowTransparency)
+		{
+			for (sint32 i = 0; i < 16; i++)
+			{
+				if (rgba16[i * 4 + 3] < 128)
+				{
+					hasTransparent = true;
+					break;
+				}
+			}
+		}
+
 		uint16 c0 = PackRGB565(maxR, maxG, maxB);
 		uint16 c1 = PackRGB565(minR, minG, minB);
-		// 4-colour mode requires c0 > c1. When they come out equal the block is
-		// flat, and either ordering gives the same single colour.
-		if (c0 < c1)
-			std::swap(c0, c1);
+		const sint32 paletteSize = hasTransparent ? 3 : 4;
+		if (hasTransparent)
+		{
+			// 3-colour + transparent mode needs c0 <= c1. Index 3 is then the
+			// transparent entry.
+			if (c0 > c1)
+				std::swap(c0, c1);
+		}
+		else
+		{
+			// 4-colour mode requires c0 > c1. Equal endpoints mean a flat block
+			// and either ordering yields the same single colour.
+			if (c0 < c1)
+				std::swap(c0, c1);
+		}
 
 		sint32 pr[4], pg[4], pb[4];
 		UnpackRGB565(c0, pr[0], pg[0], pb[0]);
 		UnpackRGB565(c1, pr[1], pg[1], pb[1]);
-		// The two interpolated palette entries, at one third and two thirds
-		// between the endpoints - the 4-colour mode's definition.
-		pr[2] = (2 * pr[0] + pr[1]) / 3;
-		pg[2] = (2 * pg[0] + pg[1]) / 3;
-		pb[2] = (2 * pb[0] + pb[1]) / 3;
-		pr[3] = (pr[0] + 2 * pr[1]) / 3;
-		pg[3] = (pg[0] + 2 * pg[1]) / 3;
-		pb[3] = (pb[0] + 2 * pb[1]) / 3;
+		if (hasTransparent)
+		{
+			// One interpolated entry at the midpoint, per the 3-colour mode.
+			pr[2] = (pr[0] + pr[1]) / 2;
+			pg[2] = (pg[0] + pg[1]) / 2;
+			pb[2] = (pb[0] + pb[1]) / 2;
+		}
+		else
+		{
+			// Two entries at one third and two thirds between the endpoints.
+			pr[2] = (2 * pr[0] + pr[1]) / 3;
+			pg[2] = (2 * pg[0] + pg[1]) / 3;
+			pb[2] = (2 * pb[0] + pb[1]) / 3;
+			pr[3] = (pr[0] + 2 * pr[1]) / 3;
+			pg[3] = (pg[0] + 2 * pg[1]) / 3;
+			pb[3] = (pb[0] + 2 * pb[1]) / 3;
+		}
 
 		uint32 indices = 0;
 		for (sint32 i = 0; i < 16; i++)
 		{
+			// In 3-colour mode a texel below the alpha threshold must take
+			// index 3, the transparent entry - its colour is irrelevant.
+			if (hasTransparent && rgba16[i * 4 + 3] < 128)
+			{
+				indices |= 3u << (i * 2);
+				continue;
+			}
 			const sint32 r = rgba16[i * 4 + 0];
 			const sint32 g = rgba16[i * 4 + 1];
 			const sint32 b = rgba16[i * 4 + 2];
 			sint32 best = 0;
 			sint32 bestErr = INT32_MAX;
-			for (sint32 p = 0; p < 4; p++)
+			for (sint32 p = 0; p < paletteSize; p++)
 			{
 				const sint32 dr = r - pr[p];
 				const sint32 dg = g - pg[p];
@@ -260,9 +360,14 @@ namespace
 		const sint32 blockBytes = bc3 ? 16 : 8;
 		out.resize((size_t)blocksX * blocksY * blockBytes);
 
-		uint8 blockPixels[16 * 4];
-		for (sint32 by = 0; by < blocksY; by++)
+		// Parallel across block ROWS. Moving this work to one other thread would
+		// not help - the upload needs the result, so something still waits for it.
+		// What helps is using the cores that are already idle: the process was
+		// measured using 20 percent of 16 hardware threads, with one PPC core
+		// saturated. Rows are independent, so there is no sharing to guard.
+		AnubisParallelFor(blocksY, [&](sint32 by)
 		{
+			uint8 blockPixels[16 * 4];
 			for (sint32 bx = 0; bx < blocksX; bx++)
 			{
 				// Gather the 4x4, clamping at the edges. Scaled dimensions are
@@ -284,14 +389,14 @@ namespace
 				if (bc3)
 				{
 					EncodeBC3AlphaBlock(blockPixels, dstBlock);
-					EncodeBC1Block(blockPixels, dstBlock + 8);
+					EncodeBC1Block(blockPixels, dstBlock + 8, false);
 				}
 				else
 				{
-					EncodeBC1Block(blockPixels, dstBlock);
+					EncodeBC1Block(blockPixels, dstBlock, true);
 				}
 			}
-		}
+		});
 	}
 }
 
@@ -348,7 +453,7 @@ sint32 LatteTexScale_GetFactor()
 	return std::min(f, 4);
 }
 
-bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 width, sint32 height, sint32& outWidth, sint32& outHeight)
+bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 mipLevels, Latte::E_HWTILEMODE tileMode, sint32 width, sint32 height, sint32& outWidth, sint32& outHeight)
 {
 	const sint32 factor = LatteTexScale_GetFactor();
 	if (factor <= 1)
@@ -360,6 +465,22 @@ bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 
 	if (!IsScalableFormat(format))
 		return false;
 	if (width < kMinSideToScale || height < kMinSideToScale)
+		return false;
+
+	// Requires a real mip chain. This is the guard that keeps the in-game map
+	// from vanishing on zoom: textures the GPU renders into are created
+	// without mips, and overriding their resolution means the game's own draws
+	// into them no longer match the allocation. Asset textures - terrain,
+	// characters, materials, the ones worth scaling - ship with mips almost
+	// without exception. In a Breath of the Wild dump 1460 of 2284 textures had
+	// a chain and 824 did not, and the dynamic ones are in that second group.
+	if (mipLevels <= 1)
+		return false;
+
+	// Linear-tiled textures get mirrored back to CPU RAM (see enableReadback in
+	// LatteTexture): the game reads them, so the size it finds has to be the
+	// size it wrote.
+	if (tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
 		return false;
 
 	const sint32 scaledW = width * factor;
@@ -378,14 +499,29 @@ bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 
 	return true;
 }
 
-const uint8* LatteTexScale_ScaleSlice(const void* srcPixels, Latte::E_GX2SURFFMT format, sint32 srcWidth, sint32 srcHeight, sint32 srcPitch, sint32& outWidth, sint32& outHeight, size_t& outSizeBytes)
+const uint8* LatteTexScale_ScaleSliceTo(const void* srcPixels, Latte::E_GX2SURFFMT format, sint32 srcWidth, sint32 srcHeight, sint32 srcPitch, sint32 dstWidth, sint32 dstHeight, size_t& outSizeBytes)
 {
-	sint32 scaledW = 0, scaledH = 0;
-	if (!srcPixels || !LatteTexScale_ShouldScale(format, false, srcWidth, srcHeight, scaledW, scaledH))
+	if (!srcPixels || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0)
 	{
 		s_skippedCount++;
 		return nullptr;
 	}
+	if (!IsScalableFormat(format))
+	{
+		s_skippedCount++;
+		return nullptr;
+	}
+	// Compressed output is written as whole 4x4 blocks, so a target that is not
+	// a multiple of 4 cannot be represented. Declining is correct here: the
+	// caller falls back to leaving the mip as the game supplied it.
+	const bool compressedOut = IsBC1(format) || IsBC3(format);
+	if (compressedOut && ((dstWidth & 3) || (dstHeight & 3)))
+	{
+		s_skippedCount++;
+		return nullptr;
+	}
+	const sint32 scaledW = dstWidth;
+	const sint32 scaledH = dstHeight;
 
 	const uint8* src = (const uint8*)srcPixels;
 	sint32 srcPitchBytes;
@@ -414,7 +550,8 @@ const uint8* LatteTexScale_ScaleSlice(const void* srcPixels, Latte::E_GX2SURFFMT
 	const float invScaleX = (float)srcWidth / (float)scaledW;
 	const float invScaleY = (float)srcHeight / (float)scaledH;
 
-	for (sint32 dy = 0; dy < scaledH; dy++)
+	// Same reasoning as the encode loop: destination rows are independent.
+	AnubisParallelFor(scaledH, [&](sint32 dy)
 	{
 		// Centre of the destination pixel mapped back into source space.
 		const float sy = ((float)dy + 0.5f) * invScaleY - 0.5f;
@@ -461,10 +598,8 @@ const uint8* LatteTexScale_ScaleSlice(const void* srcPixels, Latte::E_GX2SURFFMT
 			for (sint32 c = 0; c < 4; c++)
 				o[c] = (uint8)std::clamp(acc[c] * inv + 0.5f, 0.0f, 255.0f);
 		}
-	}
+	});
 
-	outWidth = scaledW;
-	outHeight = scaledH;
 	s_scaledCount++;
 
 	// Re-encode to the format the texture started in. Without this step the
@@ -475,6 +610,61 @@ const uint8* LatteTexScale_ScaleSlice(const void* srcPixels, Latte::E_GX2SURFFMT
 	{
 		EncodeRGBAToBC(dst, scaledW, scaledH, format, t_encoded);
 		outSizeBytes = t_encoded.size();
+
+		// Round-trip check on the first few textures, then never again.
+		//
+		// Added because the counters said 12345 textures were being scaled
+		// "successfully" while the ground rendered black - so the question was
+		// never whether the path ran, it was whether the bytes it produced mean
+		// what the GPU will read. Decoding the result back and comparing it to
+		// what went in answers that directly, instead of inferring an encoder
+		// bug from what the screen looks like.
+		//
+		// A mean error in the low single digits is normal for BC. Anything
+		// above about 40 means the encoder is wrong, and an error near 128
+		// with a near-zero alpha mean means it is emitting transparent blocks.
+		// Only textures whose input actually varies are worth measuring.
+		//
+		// The first run of this reported a mean error of exactly 0.0 six times,
+		// which looked like a perfect encoder and is impossible - BC is lossy.
+		// What it actually meant was that the input was flat: at startup the
+		// game has not written its textures yet, so Cemu loads whatever is in
+		// that memory, and encoding a uniform block round-trips exactly. The
+		// measurement was taken too early to say anything.
+		static uint32 s_verified = 0;
+		bool inputVaries = false;
+		if (s_verified < 6)
+		{
+			const size_t probeCount = (size_t)scaledW * scaledH;
+			const uint8 first = dst[0];
+			for (size_t i = 1; i < probeCount; i += 97) // sparse probe, enough to spot a flat buffer
+			{
+				if (dst[i * 4] != first)
+				{
+					inputVaries = true;
+					break;
+				}
+			}
+		}
+		if (s_verified < 6 && inputVaries)
+		{
+			s_verified++;
+			std::vector<uint8> roundTrip;
+			DecodeBlocksToRGBA(t_encoded.data(), format, scaledW, scaledH, roundTrip);
+			uint64 errSum = 0, alphaSum = 0;
+			const size_t count = (size_t)scaledW * scaledH;
+			for (size_t i = 0; i < count; i++)
+			{
+				for (sint32 c = 0; c < 3; c++)
+					errSum += (uint64)abs((sint32)roundTrip[i * 4 + c] - (sint32)dst[i * 4 + c]);
+				alphaSum += roundTrip[i * 4 + 3];
+			}
+			cemuLog_log(LogType::Force,
+				"Anubis texscale verify #{}: fmt={:04x} {}x{} -> {}x{} | mean RGB error {:.1f} | mean alpha out {:.1f} (in {:.1f})",
+				s_verified, (uint32)format, srcWidth, srcHeight, scaledW, scaledH,
+				(double)errSum / (double)(count * 3), (double)alphaSum / (double)count,
+				[&]{ uint64 a = 0; for (size_t i = 0; i < count; i++) a += dst[i * 4 + 3]; return (double)a / (double)count; }());
+		}
 		return t_encoded.data();
 	}
 	outSizeBytes = dstSize;

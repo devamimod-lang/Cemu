@@ -1,11 +1,18 @@
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "WindowSystem.h"
+#include "Cafe/HW/Latte/Core/LatteTextureScaling.h"
 
 performanceMonitor_t performanceMonitor{};
 
 void LattePerformanceMonitor_frameEnd()
 {
+	// Anubis: texture scaling counters. These were written and then never
+	// called from anywhere, which is how a build shipped with no way to tell
+	// whether scaling was running at all - and left the first report of black
+	// textures with no data to narrow it down.
+	LatteTexScale_LogStats();
+
 	// per-frame stats
 	performanceMonitor.gpuTime_shaderCreate.frameFinished();
 	performanceMonitor.gpuTime_frameTime.frameFinished();

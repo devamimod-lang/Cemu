@@ -34,12 +34,21 @@ sint32 LatteTexScale_GetFactor();
 // True when this texture should be scaled, and fills the scaled dimensions.
 // Called at texture creation, before any slice is uploaded, because the host
 // texture has to be created at the larger size.
-bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 width, sint32 height, sint32& outWidth, sint32& outHeight);
+bool LatteTexScale_ShouldScale(Latte::E_GX2SURFFMT format, bool isDepth, sint32 mipLevels, Latte::E_HWTILEMODE tileMode, sint32 width, sint32 height, sint32& outWidth, sint32& outHeight);
 
-// Produces the scaled pixels for one slice/mip. Returns nullptr when this
-// texture is not eligible, which is the common case and stays cheap.
-// The returned buffer is owned by this module and valid until the next call on
-// the same thread.
-const uint8* LatteTexScale_ScaleSlice(const void* srcPixels, Latte::E_GX2SURFFMT format, sint32 srcWidth, sint32 srcHeight, sint32 srcPitch, sint32& outWidth, sint32& outHeight, size_t& outSizeBytes);
+// Produces scaled pixels for one slice/mip at an EXPLICIT target size.
+//
+// The target is passed in rather than derived from the scale factor, and that
+// is not a detail: the host texture's mip N is (scaledWidth >> N), while
+// multiplying the game's own mip N by the factor gives (width >> N) * factor.
+// Those two disagree once a mip gets small enough for the shifts to round
+// differently, and the first version of this uploaded nothing in that case -
+// which left every small mip CLEARED. That is what made distant surfaces show
+// corrupt colours and some textures come out entirely black.
+//
+// Returns nullptr when the texture is not eligible, which must stay cheap
+// because it is the common case. The buffer is owned by this module and valid
+// until the next call on the same thread.
+const uint8* LatteTexScale_ScaleSliceTo(const void* srcPixels, Latte::E_GX2SURFFMT format, sint32 srcWidth, sint32 srcHeight, sint32 srcPitch, sint32 dstWidth, sint32 dstHeight, size_t& outSizeBytes);
 
 void LatteTexScale_LogStats();

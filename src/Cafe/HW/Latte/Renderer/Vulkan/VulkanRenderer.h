@@ -697,6 +697,31 @@ private:
 	bool ImguiBegin(bool mainWindow) override;
 	void ImguiEnd() override;
 	ImTextureID GenerateTexture(const std::vector<uint8>& data, const Vector2i& size) override;
+	// ===== Anubis GPU texture upscaling =====
+	//
+	// Builds a larger copy of a game texture by rendering it through a filter
+	// shader, and substitutes that copy where game shaders sample the original.
+	// The texture cache is left strictly 1:1 with guest memory - nothing here
+	// alters a texture's dimensions, format, mip count or upload path, which is
+	// what makes this safe where overriding the host resolution was not.
+	//
+	// Every entry point fails soft: on any problem the caller keeps the original
+	// view and the frame renders exactly as it would without the feature.
+
+	// Returns the upscaled view when one is ready and current, otherwise null,
+	// and queues the texture for upscaling at the next frame boundary. Called
+	// from the one place game textures are bound for sampling.
+public:
+	VkImageView AnubisGetUpscaledView(class LatteTextureVk* tex);
+	// Creates the images and runs the filter passes for everything queued.
+	// Frame boundary ONLY: it allocates images and records render passes, and
+	// doing either inside a half-recorded frame is what cost this codebase a
+	// device loss before - see RunFaroMotionEstimation.
+	void AnubisProcessPendingUpscales();
+	void AnubisNotifyUpscaledTextureReleased(class LatteTextureVk* tex);
+	bool AnubisBuildUpscaledTexture(class LatteTextureVk* tex, sint32 scaledW, sint32 scaledH, class RendererOutputShader* upscaleShader);
+private:
+
 	void DeleteTexture(ImTextureID id) override;
 	void DeleteFontTextures() override;
 	bool BeginFrame(bool mainWindow) override;
@@ -983,6 +1008,18 @@ private:
 	// (see wantGi in VulkanRenderer.cpp) but kept implemented - see that
 	// declaration's own comment.
 	VkDescriptorSet m_giDescriptorSet = VK_NULL_HANDLE;
+	// Anubis texture upscaling state. The copies themselves live on the
+	// textures that own them; this is only the queue and the budget.
+	std::vector<class LatteTextureVk*> m_anubisUpscaleQueue;
+	uint64 m_anubisUpscaleBytes = 0;
+	VkSampler m_anubisUpscaleSampler = VK_NULL_HANDLE;
+	uint32 m_anubisUpscaledCount = 0;
+	uint32 m_anubisUpscaleRejected = 0;
+	VkRenderPass m_anubisUpscaleRenderPassSrgb = VK_NULL_HANDLE;
+	VkRenderPass m_anubisUpscaleRenderPassUnorm = VK_NULL_HANDLE;
+	// Destroyed at a frame boundary, never at the point of use.
+	std::vector<VkFramebuffer> m_anubisUpscaleFramebufferGraveyard;
+
 	VkSampler m_giDepthSampler = VK_NULL_HANDLE;
 	// One-shot so a per-frame bail does not flood the log. "I turn GI on and
 	// off and nothing happens" was indistinguishable from a broken pass while

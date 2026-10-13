@@ -89,6 +89,32 @@ public:
 
 	bool m_isAlternateFormat{}; // true if host pixel format does not 1:1 match the emulated guest texture pixel format
 private:
+	public:
+	// Anubis GPU texture upscaling: a larger copy of this texture, rendered
+	// from it with a filter shader and substituted when game shaders sample it.
+	//
+	// Owned by the texture rather than tracked in a side map, so the copy dies
+	// with its source and there is no dangling-pointer problem. Both are
+	// VKRDestructibleObject, so release is deferred the same way the main image
+	// is - the copy may still be referenced by an in-flight command buffer.
+	//
+	// The cache itself stays 1:1 with guest memory: nothing here changes the
+	// texture's own dimensions, format, mip count or upload path. That is the
+	// whole point of doing it this way.
+	VKRObjectTexture* m_anubisUpscaledTex{};
+	VKRObjectTextureView* m_anubisUpscaledView{};
+	uint32 m_anubisUpscaledMipLevels{};
+	// reloadCount the copy was built from. When the game overwrites the source,
+	// reloadCount moves and the copy is known to be stale.
+	uint32 m_anubisUpscaledFromReload{ 0xFFFFFFFF };
+	// Scale factor the copy was built at. Without this, changing the factor
+	// left the old copies in place and the setting looked like it did nothing -
+	// which made the feature impossible to judge, because comparing it against
+	// itself is all you could do.
+	sint32 m_anubisUpscaledFactor{ 0 };
+	bool m_anubisUpscaleFailed{ false };
+
+private:
 	class VulkanRenderer* m_vkr{};
 
 	VKRObjectTexture* vkObjTex{};

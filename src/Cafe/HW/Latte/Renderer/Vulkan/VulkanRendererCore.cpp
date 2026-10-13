@@ -736,6 +736,23 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 		info.imageView = imageViewObj->m_textureImageView;
 		vkObjDS->addRef(imageViewObj);
 
+		// Anubis GPU texture upscaling: the single substitution point.
+		//
+		// Everything else - the texture cache, the upload path, guest memory
+		// tracking, mip counts - is untouched and still describes the game's
+		// own texture. Only what a shader READS is swapped, and only when a
+		// current upscaled copy exists. Null means "not available", in which
+		// case the original view stays bound and the frame is identical to one
+		// rendered without the feature.
+		if (VkImageView upscaledView = AnubisGetUpscaledView(baseTexture))
+		{
+			info.imageView = upscaledView;
+			// The copy is created with finalLayout SHADER_READ_ONLY_OPTIMAL, so
+			// it does not follow the source texture's own default layout.
+			info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			vkObjDS->addRef(baseTexture->m_anubisUpscaledView);
+		}
+
 		// track relation between view and descriptor set
 		vectorAppendUnique(dsInfo->list_referencedViews, textureView);
 		textureView->AddDescriptorSetReference(dsInfo);

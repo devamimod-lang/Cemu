@@ -168,6 +168,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	texture_replacement_enabled = graphic.get("TextureReplacement", false);
 	texture_scaling_factor = std::clamp<sint32>(graphic.get("TextureScaling", 1), 1, 4);
 	texture_scaling_max_size = graphic.get("TextureScalingMaxSize", 2048);
+	texture_scaling_vram_budget_mb = graphic.get("TextureScalingVramBudgetMB", 1024);
 	faro_shadow_scale = graphic.get("FaroShadowScale", 1);
 	async_compile = graphic.get("AsyncCompile", async_compile);
 	vk_accurate_barriers = graphic.get("vkAccurateBarriers", true); // this used to be "VulkanAccurateBarriers" but because we changed the default to true in 1.27.1 the option name had to be changed
@@ -420,6 +421,7 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("TextureReplacement", texture_replacement_enabled);
 	graphic.set("TextureScaling", texture_scaling_factor);
 	graphic.set("TextureScalingMaxSize", texture_scaling_max_size);
+	graphic.set("TextureScalingVramBudgetMB", texture_scaling_vram_budget_mb);
 	graphic.set("FaroShadowScale", faro_shadow_scale);
 	graphic.set("AsyncCompile", async_compile.GetValue());
 	graphic.set("vkAccurateBarriers", vk_accurate_barriers);

@@ -209,6 +209,66 @@ void outputShader(){
 // stays small: 3x3 fetches at ratio 1, 5x5 at ratio 2, 7x7 at ratio 3, capped
 // there. The maths is textbook signal processing, implemented from the
 // definition - no third-party code.
+// Anubis: the filter used when upscaling a game texture on the GPU.
+//
+// Catmull-Rom, which is the only reason doing this is worth anything: the
+// hardware already magnifies with a 2x2 bilinear tent at sample time, so
+// reproducing bilinear here would cost a pass and change nothing. Catmull-Rom
+// is a wider, mildly sharpening reconstruction over 4x4 taps.
+//
+// Alpha is filtered alongside colour. Cut-out textures - foliage, smoke - carry
+// their shape in alpha, and filtering only RGB would leave the silhouette at
+// the original resolution while the colour got sharper.
+const std::string RendererOutputShader::s_texture_upscale_shader_source =
+R"(
+float AnubisTexCatmullRom(float x)
+{
+	x = abs(x);
+	if (x < 1.0)
+		return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+	if (x < 2.0)
+		return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+	return 0.0;
+}
+
+void outputShader()
+{
+	vec2 srcRes = max(textureSrcResolution, vec2(1.0));
+	vec2 st = passUV * srcRes - 0.5;
+	vec2 f = fract(st);
+	vec2 base = floor(st);
+
+	float wx[4];
+	float wy[4];
+	for (int k = 0; k < 4; k++)
+	{
+		wx[k] = AnubisTexCatmullRom(float(k - 1) - f.x);
+		wy[k] = AnubisTexCatmullRom(float(k - 1) - f.y);
+	}
+
+	vec4 acc = vec4(0.0);
+	float wsum = 0.0;
+	for (int ky = 0; ky < 4; ky++)
+	{
+		for (int kx = 0; kx < 4; kx++)
+		{
+			float w = wx[kx] * wy[ky];
+			// Clamped to the edge so the border does not pull in wrapped or
+			// undefined texels, which would show as a seam on every tile.
+			vec2 tapUV = (base + vec2(float(kx - 1), float(ky - 1)) + 0.5) / srcRes;
+			tapUV = clamp(tapUV, vec2(0.0), vec2(1.0));
+			acc += texture(textureSrc, tapUV) * w;
+			wsum += w;
+		}
+	}
+
+	// Catmull-Rom weights are signed, so the result overshoots on a hard edge.
+	// Clamping is what stops that wrapping round into the opposite value.
+	vec4 result = wsum != 0.0 ? acc / wsum : texture(textureSrc, passUV);
+	colorOut0 = clamp(result, vec4(0.0), vec4(1.0));
+}
+)";
+
 const std::string RendererOutputShader::s_lanczos_shader_source =
 R"(
 float AnubisLanczos2(float x)
@@ -1648,6 +1708,7 @@ RendererOutputShader* RendererOutputShader::s_bicubic_shader_ud;
 
 RendererOutputShader* RendererOutputShader::s_hermit_shader;
 RendererOutputShader* RendererOutputShader::s_hermit_shader_ud;
+RendererOutputShader* RendererOutputShader::s_texture_upscale_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader_ud;
 
@@ -2989,6 +3050,7 @@ void RendererOutputShader::InitializeStatic()
     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
     	s_lanczos_shader = new RendererOutputShader(vertex_source, s_lanczos_shader_source);
     	s_lanczos_shader_ud = new RendererOutputShader(vertex_source_ud, s_lanczos_shader_source);
+    	s_texture_upscale_shader = new RendererOutputShader(vertex_source, s_texture_upscale_shader_source);
 		break;
     }
 #endif
@@ -3010,6 +3072,7 @@ void RendererOutputShader::InitializeStatic()
     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
     	s_lanczos_shader = new RendererOutputShader(vertex_source, s_lanczos_shader_source);
     	s_lanczos_shader_ud = new RendererOutputShader(vertex_source_ud, s_lanczos_shader_source);
+    	s_texture_upscale_shader = new RendererOutputShader(vertex_source, s_texture_upscale_shader_source);
 
     	s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
     	s_fsr1_easu_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr1_easu_shader_source);
@@ -3058,6 +3121,7 @@ void RendererOutputShader::ShutdownStatic()
 	delete s_hermit_shader_ud;
 	delete s_lanczos_shader;
 	delete s_lanczos_shader_ud;
+	delete s_texture_upscale_shader;
 
 	delete s_fsr1_easu_shader;
 	delete s_fsr1_easu_shader_ud;
@@ -3101,6 +3165,7 @@ void RendererOutputShader::ShutdownStatic()
 	s_hermit_shader_ud = nullptr;
 	s_lanczos_shader = nullptr;
 	s_lanczos_shader_ud = nullptr;
+	s_texture_upscale_shader = nullptr;
 	s_fsr1_easu_shader = nullptr;
 	s_fsr1_easu_shader_ud = nullptr;
 	s_fsr1_rcas_shader = nullptr;

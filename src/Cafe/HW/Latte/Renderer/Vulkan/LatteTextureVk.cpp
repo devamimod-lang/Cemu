@@ -124,6 +124,21 @@ LatteTextureVk::~LatteTextureVk()
 
 	m_vkr->surfaceCopy_notifyTextureRelease(this);
 
+	// Anubis: the upscaled copy, if one was built. Released the same deferred
+	// way as the main image, because an in-flight command buffer may still be
+	// sampling it.
+	if (m_anubisUpscaledView)
+	{
+		VulkanRenderer::GetInstance()->ReleaseDestructibleObject(m_anubisUpscaledView);
+		m_anubisUpscaledView = nullptr;
+	}
+	if (m_anubisUpscaledTex)
+	{
+		VulkanRenderer::GetInstance()->AnubisNotifyUpscaledTextureReleased(this);
+		VulkanRenderer::GetInstance()->ReleaseDestructibleObject(m_anubisUpscaledTex);
+		m_anubisUpscaledTex = nullptr;
+	}
+
 	VulkanRenderer::GetInstance()->ReleaseDestructibleObject(vkObjTex);
 	vkObjTex = nullptr;
 }

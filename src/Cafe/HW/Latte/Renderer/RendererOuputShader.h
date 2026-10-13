@@ -96,6 +96,9 @@ public:
 	// Anubis: ratio-aware Lanczos2, for downscaling (supersampling resolve).
 	// See s_lanczos_shader_source for why the fixed-footprint filters above
 	// undersample above a ratio of about 2.
+	// Anubis: GPU texture upscaling filter - renders a larger copy of a game
+	// texture, which VulkanRendererCore substitutes when shaders sample it.
+	static RendererOutputShader* s_texture_upscale_shader;
 	static RendererOutputShader* s_lanczos_shader;
 	static RendererOutputShader* s_lanczos_shader_ud;
 
@@ -246,6 +249,7 @@ private:
 	static const std::string s_copy_shader_source;
 	static const std::string s_bicubic_shader_source;
 	static const std::string s_hermite_shader_source;
+	static const std::string s_texture_upscale_shader_source;
 	static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;
 	static const std::string s_fsr1_rcas_shader_source;

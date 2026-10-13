@@ -658,6 +658,15 @@ struct CemuConfig
 	// by the factor squared, so the sensible ceiling depends on the GPU, not on
 	// the developer's machine.
 	ConfigValue<sint32> texture_scaling_max_size{2048};
+	// Anubis: VRAM ceiling for upscaled texture copies, in MB.
+	//
+	// A copy is RGBA8 because the GPU cannot render straight to a
+	// block-compressed format, so a 1024x1024 BC1 at 2x becomes 16 MB against
+	// the original 512 KB. Without a ceiling this exhausts any card; with one,
+	// the textures actually in use get upscaled and the rest keep their
+	// original resolution. The right value depends on the GPU, not on the
+	// developer's machine, which is why it is a setting.
+	ConfigValue<sint32> texture_scaling_vram_budget_mb{1024};
 	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio

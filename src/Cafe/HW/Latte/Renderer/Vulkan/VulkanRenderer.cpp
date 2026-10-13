@@ -6,6 +6,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/CocoaSurface.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
 #include "Cafe/HW/Latte/Renderer/SMAALookupTextures.h"
+#include "Cafe/HW/Latte/Core/LatteTextureScaling.h"
 
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
@@ -7046,6 +7047,32 @@ bool VulkanRenderer::EnsureFaroDepthSnapshotTarget(VkFormat format, uint32 width
 // it also keeps its contents until the next copy replaces them.
 void VulkanRenderer::OnFaroFrameBoundary()
 {
+	// Anubis texture upscaling: allocate images and record the filter passes
+	// here, never at the point of request. Both allocating and recording are
+	// unsafe inside a half-recorded frame.
+	AnubisProcessPendingUpscales();
+	// Report what the upscaler is actually doing. Written at the same time as
+	// the counters this time: shipping counters that nothing reads has already
+	// cost this feature two debugging rounds with no data to go on.
+	{
+		static uint32 s_statFrames = 0;
+		static uint32 s_lastReported = 0xFFFFFFFF;
+		if (++s_statFrames >= 600)
+		{
+			s_statFrames = 0;
+			// Only when something changed, so a steady state does not fill the log.
+			if (m_anubisUpscaledCount != s_lastReported)
+			{
+				s_lastReported = m_anubisUpscaledCount;
+				cemuLog_log(LogType::Force, "Anubis texture upscale: {} copies built, {} declined for budget, {} MB of copies held, {} queued",
+					m_anubisUpscaledCount, m_anubisUpscaleRejected, m_anubisUpscaleBytes / (1024ull * 1024ull), m_anubisUpscaleQueue.size());
+			}
+		}
+	}
+	for (VkFramebuffer fb : m_anubisUpscaleFramebufferGraveyard)
+		vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+	m_anubisUpscaleFramebufferGraveyard.clear();
+
 	ProcessDeferredFaroTargets();
 
 	// Staleness guard. The validity flag is kept across frames on purpose -
@@ -9988,4 +10015,347 @@ VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
 	auto vkr = VulkanRenderer::GetInstance();
 	vkFreeDescriptorSets(vkr->GetLogicalDevice(), vkr->GetDescriptorPool(), 1, &descriptorSet);
 	performanceMonitor.vk.numDescriptorSets.decrement();
+}
+
+// ======================= Anubis GPU texture upscaling =======================
+//
+// See the declarations in VulkanRenderer.h for why this lives beside the
+// texture cache rather than inside it.
+
+void VulkanRenderer::AnubisNotifyUpscaledTextureReleased(LatteTextureVk* tex)
+{
+	// Give the budget its bytes back, and drop any queued request - the texture
+	// is going away and the pointer must not survive in the queue.
+	if (tex->m_anubisUpscaledTex)
+	{
+		const sint32 f = LatteTexScale_GetFactor();
+		const uint64 bytes = (uint64)tex->width * tex->height * (uint64)f * (uint64)f * 4ull;
+		m_anubisUpscaleBytes = (bytes > m_anubisUpscaleBytes) ? 0 : (m_anubisUpscaleBytes - bytes);
+	}
+	auto it = std::find(m_anubisUpscaleQueue.begin(), m_anubisUpscaleQueue.end(), tex);
+	if (it != m_anubisUpscaleQueue.end())
+		m_anubisUpscaleQueue.erase(it);
+}
+
+VkImageView VulkanRenderer::AnubisGetUpscaledView(LatteTextureVk* tex)
+{
+	const sint32 factor = LatteTexScale_GetFactor();
+	if (factor <= 1)
+		return VK_NULL_HANDLE;
+	if (tex->m_anubisUpscaleFailed)
+		return VK_NULL_HANDLE;
+
+	// Ready and still current? reloadCount moves whenever the game overwrites
+	// the source, which is exactly when the copy stops being valid.
+	// A copy is current only if it was built from this version of the source AND
+	// at the factor in force right now. The second half is what lets the
+	// setting respond without relaunching the game - and being able to toggle it
+	// live is the only way to judge whether it is doing anything, since
+	// comparing it against itself is otherwise all that is possible.
+	if (tex->m_anubisUpscaledView && tex->m_anubisUpscaledFromReload == tex->reloadCount
+		&& tex->m_anubisUpscaledFactor == factor)
+		return tex->m_anubisUpscaledView->m_textureImageView;
+
+	sint32 scaledW = 0, scaledH = 0;
+	if (!LatteTexScale_ShouldScale(tex->format, tex->isDepth, (sint32)tex->mipLevels, tex->tileMode,
+		tex->width, tex->height, scaledW, scaledH))
+	{
+		// Not a candidate - remember it so the check does not run again for
+		// this texture on every single draw that samples it.
+		tex->m_anubisUpscaleFailed = true;
+		return VK_NULL_HANDLE;
+	}
+
+	// Queue it and use the original this frame. Creating the image here would
+	// mean allocating and recording mid-frame, from inside descriptor setup.
+	if (std::find(m_anubisUpscaleQueue.begin(), m_anubisUpscaleQueue.end(), tex) == m_anubisUpscaleQueue.end())
+		m_anubisUpscaleQueue.emplace_back(tex);
+	// A stale copy is still better than none while the new one is pending: it
+	// is the same image at a slightly older point in time.
+	if (tex->m_anubisUpscaledView)
+		return tex->m_anubisUpscaledView->m_textureImageView;
+	return VK_NULL_HANDLE;
+}
+
+void VulkanRenderer::AnubisProcessPendingUpscales()
+{
+	if (m_anubisUpscaleQueue.empty())
+		return;
+	// Taken by move so a texture released while this runs cannot leave a
+	// dangling entry behind.
+	std::vector<LatteTextureVk*> queue;
+	queue.swap(m_anubisUpscaleQueue);
+
+	const sint32 factor = LatteTexScale_GetFactor();
+	if (factor <= 1)
+		return;
+	RendererOutputShader* upscaleShader = RendererOutputShader::s_texture_upscale_shader;
+	if (!upscaleShader)
+		return;
+
+	// Budget in bytes. An upscaled copy is RGBA8 because the GPU cannot render
+	// straight to a block-compressed format, so a 1024x1024 BC1 at 2x becomes
+	// 16 MB against the original 512 KB. Without a ceiling this would exhaust
+	// any card; with one, the textures in use get scaled and the rest keep
+	// their original resolution.
+	const uint64 budgetBytes = (uint64)std::max(GetConfig().texture_scaling_vram_budget_mb.GetValue(), 0) * 1024ull * 1024ull;
+
+	if (m_anubisUpscaleSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_anubisUpscaleSampler) != VK_SUCCESS)
+		{
+			cemuLog_log(LogType::Force, "Anubis upscale: failed to create sampler");
+			return;
+		}
+	}
+
+	for (LatteTextureVk* tex : queue)
+	{
+		if (tex->m_anubisUpscaleFailed)
+			continue;
+		sint32 scaledW = 0, scaledH = 0;
+		if (!LatteTexScale_ShouldScale(tex->format, tex->isDepth, (sint32)tex->mipLevels, tex->tileMode,
+			tex->width, tex->height, scaledW, scaledH))
+			continue;
+
+		const uint64 wantBytes = (uint64)scaledW * scaledH * 4ull;
+		const bool alreadyOwns = tex->m_anubisUpscaledTex != nullptr;
+		if (!alreadyOwns && budgetBytes > 0 && m_anubisUpscaleBytes + wantBytes > budgetBytes)
+		{
+			// Over budget. Declining is the whole mechanism: this texture stays
+			// at its original resolution, which is correct, just not sharper.
+			m_anubisUpscaleRejected++;
+			continue;
+		}
+
+		if (!AnubisBuildUpscaledTexture(tex, scaledW, scaledH, upscaleShader))
+		{
+			// Marked so a texture that cannot be built is not retried forever.
+			tex->m_anubisUpscaleFailed = true;
+			continue;
+		}
+		if (!alreadyOwns)
+			m_anubisUpscaleBytes += wantBytes;
+		tex->m_anubisUpscaledFromReload = tex->reloadCount;
+		tex->m_anubisUpscaledFactor = factor;
+		m_anubisUpscaledCount++;
+	}
+}
+
+// Builds (or rebuilds) one texture's upscaled copy and renders into it.
+// Returns false on any failure, in which case the caller keeps using the
+// original texture and nothing is left half-built.
+bool VulkanRenderer::AnubisBuildUpscaledTexture(LatteTextureVk* tex, sint32 scaledW, sint32 scaledH, RendererOutputShader* upscaleShader)
+{
+	auto* srcView = static_cast<LatteTextureViewVk*>(tex->GetOrCreateView(Latte::E_DIM::DIM_2D, tex->format, 0, 1, 0, 1));
+	if (!srcView)
+		return false;
+	VKRObjectTextureView* srcViewObj = srcView->GetViewRGBA();
+	if (!srcViewObj || srcViewObj->m_textureImageView == VK_NULL_HANDLE)
+		return false;
+
+	// The copy keeps the source's sRGB-ness. A game shader sampling an SRGB
+	// texture gets sRGB->linear conversion from the hardware; if the copy were
+	// UNORM that conversion would stop happening and everything sampled through
+	// it would come out wrong. Writing into an SRGB target also converts
+	// linear->sRGB, so read and write cancel and the stored values match.
+	// The SRGB bit is part of the format enum - see FMT_BIT_SRGB in LatteReg.h.
+	const bool isSrgb = ((uint32)tex->format & 0x400) != 0;
+	const VkFormat dstFormat = isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+
+	// Only mip 0 is produced, and the copy carries a single level.
+	//
+	// That is deliberate rather than a shortcut: a half-built mip chain is
+	// exactly what made the CPU-side attempt render distant surfaces corrupt
+	// and some textures black. Here there is no chain to get wrong. Distant
+	// geometry keeps sampling the ORIGINAL texture through its own view with
+	// its own mips, so nothing is lost; only magnified surfaces, where the
+	// base level is what gets read, take the upscaled path.
+	// A factor change makes the existing image the wrong SIZE, not merely out
+	// of date, so it has to go rather than be re-rendered into. Released the
+	// deferred way, because a command buffer in flight may still sample it.
+	if (tex->m_anubisUpscaledTex && tex->m_anubisUpscaledFactor != LatteTexScale_GetFactor())
+	{
+		AnubisNotifyUpscaledTextureReleased(tex);
+		if (tex->m_anubisUpscaledView)
+		{
+			ReleaseDestructibleObject(tex->m_anubisUpscaledView);
+			tex->m_anubisUpscaledView = nullptr;
+		}
+		ReleaseDestructibleObject(tex->m_anubisUpscaledTex);
+		tex->m_anubisUpscaledTex = nullptr;
+		tex->m_anubisUpscaledFactor = 0;
+	}
+
+	if (tex->m_anubisUpscaledTex == nullptr)
+	{
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent = { (uint32)scaledW, (uint32)scaledH, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = dstFormat;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+
+		auto* texObj = new VKRObjectTexture();
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &texObj->m_image) != VK_SUCCESS)
+		{
+			delete texObj;
+			return false;
+		}
+		texObj->m_format = dstFormat;
+		texObj->m_imageAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+		texObj->m_allocation = memoryManager->imageMemoryAllocate(texObj->m_image);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = texObj->m_image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = dstFormat;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		VkImageView view = VK_NULL_HANDLE;
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &view) != VK_SUCCESS)
+		{
+			ReleaseDestructibleObject(texObj);
+			return false;
+		}
+		tex->m_anubisUpscaledTex = texObj;
+		tex->m_anubisUpscaledView = new VKRObjectTextureView(texObj, view);
+		tex->m_anubisUpscaledMipLevels = 1;
+	}
+
+	// One render pass per format, created once and shared. Building one per
+	// texture would churn the backbuffer-blit pipeline cache, which is keyed on
+	// the render pass handle.
+	VkRenderPass& cachedRP = isSrgb ? m_anubisUpscaleRenderPassSrgb : m_anubisUpscaleRenderPassUnorm;
+	if (cachedRP == VK_NULL_HANDLE)
+	{
+		VkAttachmentDescription colorAttachment{};
+		colorAttachment.format = dstFormat;
+		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkAttachmentReference colorRef{};
+		colorRef.attachment = 0;
+		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef;
+		VkRenderPassCreateInfo rpInfo{};
+		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		rpInfo.attachmentCount = 1;
+		rpInfo.pAttachments = &colorAttachment;
+		rpInfo.subpassCount = 1;
+		rpInfo.pSubpasses = &subpass;
+		if (vkCreateRenderPass(m_logicalDevice, &rpInfo, nullptr, &cachedRP) != VK_SUCCESS)
+		{
+			cachedRP = VK_NULL_HANDLE;
+			return false;
+		}
+	}
+
+	VkImageView attachments[1] = { tex->m_anubisUpscaledView->m_textureImageView };
+	VkFramebufferCreateInfo fbInfo{};
+	fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fbInfo.renderPass = cachedRP;
+	fbInfo.attachmentCount = 1;
+	fbInfo.pAttachments = attachments;
+	fbInfo.width = (uint32)scaledW;
+	fbInfo.height = (uint32)scaledH;
+	fbInfo.layers = 1;
+	VkFramebuffer fb = VK_NULL_HANDLE;
+	if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
+		return false;
+
+	auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, false, upscaleShader, cachedRP);
+	VkDescriptorSet descriptorSet = GetFaroEffectDescriptorSet(srcViewObj->m_textureImageView, m_anubisUpscaleSampler,
+		srcViewObj->m_textureImageView, m_anubisUpscaleSampler);
+	if (pipeline == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+		return false;
+	}
+
+	draw_endRenderPass();
+
+	// The source has to be shader-readable for the pass, then put back. Leaving
+	// its layout changed would break the next draw that samples it directly.
+	VkImageSubresourceLayers srcLayers{};
+	srcLayers.aspectMask = tex->GetImageAspect();
+	srcLayers.mipLevel = 0;
+	srcLayers.baseArrayLayer = 0;
+	srcLayers.layerCount = 1;
+	barrier_image<IMAGE_WRITE | ANY_TRANSFER, IMAGE_READ>(tex, srcLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	VkRenderPassBeginInfo rpBegin{};
+	rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpBegin.renderPass = cachedRP;
+	rpBegin.framebuffer = fb;
+	rpBegin.renderArea.offset = { 0, 0 };
+	rpBegin.renderArea.extent = { (uint32)scaledW, (uint32)scaledH };
+	rpBegin.clearValueCount = 0;
+
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)scaledW;
+	viewport.height = (float)scaledH;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	VkRect2D scissor{};
+	scissor.offset = { 0, 0 };
+	scissor.extent = { (uint32)scaledW, (uint32)scaledH };
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	m_state.currentPipeline = pipeline;
+
+	// textureSrcResolution has to describe the SOURCE: the filter works in
+	// source texel space, because that is where its 4x4 footprint is defined.
+	auto uniforms = upscaleShader->FillUniformBlockBuffer(*srcView, { scaledW, scaledH }, false);
+	uniforms.applySRGBEncoding = false;
+	uniforms.targetGamma = uniforms.displayGamma;
+	auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &descriptorSet, 1, &uniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	barrier_image<IMAGE_READ, IMAGE_WRITE | ANY_TRANSFER>(tex, srcLayers, tex->GetDefaultLayout());
+
+	VkMemoryBarrier doneBarrier{};
+	doneBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	doneBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	doneBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &doneBarrier, 0, nullptr, 0, nullptr);
+
+	// A framebuffer cannot be destroyed while the command buffer using it is
+	// still in flight - that exact mistake crashed the fullscreen transition
+	// earlier in this codebase. Parked and destroyed at a frame boundary.
+	m_anubisUpscaleFramebufferGraveyard.emplace_back(fb);
+	return true;
 }

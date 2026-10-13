@@ -766,7 +766,7 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			texScaleRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Texture scaling")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
 			wxString texScaleChoices[] = { _("Off"), _("2x"), _("3x"), _("4x") };
 			m_texture_scaling = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(texScaleChoices), texScaleChoices);
-			m_texture_scaling->SetToolTip(_("Upscales the game's own textures as they load, so textures look sharper with nothing to download.\nThis cannot invent detail that was never in the texture - what it buys is a better reconstruction than the simple one the GPU does for free. Costs CPU on the texture load path, so expect brief hitches when entering a new area. Takes effect on the next game launch."));
+			m_texture_scaling->SetToolTip(_("Upscales the game's own textures as they load, so textures look sharper with nothing to download.\nThis cannot invent detail that was never in the texture - what it buys is a better reconstruction than the simple one the GPU does for free. The upscaling runs on the GPU, so it costs no CPU time and takes effect immediately - switch it while playing to compare."));
 			m_texture_scaling->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 				// Index 0 is Off, which is a factor of 1.
 				GetConfig().texture_scaling_factor = event.GetSelection() + 1;

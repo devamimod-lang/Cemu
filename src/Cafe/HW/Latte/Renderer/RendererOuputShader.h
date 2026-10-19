@@ -99,6 +99,8 @@ public:
 	// Anubis: GPU texture upscaling filter - renders a larger copy of a game
 	// texture, which VulkanRendererCore substitutes when shaders sample it.
 	static RendererOutputShader* s_texture_upscale_shader;
+	// Anime4K Restore CNN passes - see the sources for the upstream licence.
+	static RendererOutputShader* s_a4k_restore_pass[4];
 	static RendererOutputShader* s_lanczos_shader;
 	static RendererOutputShader* s_lanczos_shader_ud;
 
@@ -250,6 +252,12 @@ private:
 	static const std::string s_bicubic_shader_source;
 	static const std::string s_hermite_shader_source;
 	static const std::string s_texture_upscale_shader_source;
+	// Anime4K Restore CNN (S), four convolution passes. Generated from upstream
+	// by tools/anime4k/gen_a4k.py - regenerate, never hand-edit.
+	static const std::string s_a4k_restore_pass0_source;
+	static const std::string s_a4k_restore_pass1_source;
+	static const std::string s_a4k_restore_pass2_source;
+	static const std::string s_a4k_restore_pass3_source;
 	static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;
 	static const std::string s_fsr1_rcas_shader_source;

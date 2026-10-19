@@ -358,7 +358,16 @@ wxPanel* GeneralSettings2::AddGeneralPage(wxBookCtrlBase* notebook)
 wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 {
 	// Graphics page
-	auto graphics_panel = new wxPanel(notebook);
+	//
+	// A wxScrolledWindow rather than a plain wxPanel: this page has grown past
+	// what fits on screen (upscaling filter, downscale filter, anisotropic,
+	// antialiasing, VSync, async compile, GI with its intensity, texture
+	// upscaling with its factor and VRAM budget), and without scrolling the
+	// controls below the fold were simply unreachable.
+	auto graphics_panel = new wxScrolledWindow(notebook);
+	// Vertical only. A horizontal scrollbar on a settings page means the labels
+	// go off-screen sideways, which is worse than the problem being fixed.
+	graphics_panel->SetScrollRate(0, FromDIP(10));
 	auto graphics_panel_sizer = new wxBoxSizer(wxVERTICAL);
 
 	// Faro: two group boxes for what used to be nine loose controls added
@@ -784,6 +793,31 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			});
 			texCapRow->Add(m_texture_scaling_cap, 1, wxEXPAND | wxALL, 5);
 			box_sizer->Add(texCapRow, 0, wxEXPAND);
+
+			// VRAM budget for the scaled copies, with Auto as the first entry.
+			//
+			// A control is needed rather than a config-file-only value, and the
+			// reason is concrete: the emulator rewrites settings.xml on exit
+			// from the values it holds in memory, so editing the file by hand
+			// while it is running is silently undone. Auto was never actually
+			// in effect during testing because of exactly that.
+			auto* texBudgetRow = new wxBoxSizer(wxHORIZONTAL);
+			texBudgetRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Scaling memory budget")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+			wxString texBudgetChoices[] = { _("Auto (from video memory)"), _("512 MB"), _("1 GB"), _("2 GB"), _("4 GB"), _("8 GB") };
+			m_texture_scaling_budget = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(texBudgetChoices), texBudgetChoices);
+			m_texture_scaling_budget->SetToolTip(_("How much video memory scaled texture copies may use in total. Once it is full, the least recently used copies are replaced, and textures that do not fit keep their original resolution.\nA copy is uncompressed, because the GPU cannot render to a compressed format, so a 1024x1024 texture at 4x needs about 64 MB on its own. Auto derives the budget from your card."));
+			m_texture_scaling_budget->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+				GetConfig().texture_scaling_vram_budget_mb = TextureBudgetSelectionToMB(event.GetSelection());
+			});
+			texBudgetRow->Add(m_texture_scaling_budget, 1, wxEXPAND | wxALL, 5);
+			box_sizer->Add(texBudgetRow, 0, wxEXPAND);
+
+			m_texture_scaling_restore = new wxCheckBox(graphics_panel, wxID_ANY, _("Reconstruct texture detail (neural)"));
+			m_texture_scaling_restore->SetToolTip(_("Runs a small convolutional network over each texture before scaling it, to rebuild detail that compression and low resolution flattened.\nUnlike plain scaling, this can add detail that is not in the texture file - a filter can only interpolate between the pixels that already exist. It costs four extra GPU passes per texture, once, as the texture loads.\nUses Anime4K (MIT), trained on animation rather than game textures, so results vary by material."));
+			m_texture_scaling_restore->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
+				GetConfig().texture_scaling_restore_cnn = event.IsChecked();
+			});
+			box_sizer->Add(m_texture_scaling_restore, 0, wxALL, 5);
 		}
 
 		// Faro SSR removed. It never actually ran - instrumentation showed
@@ -833,7 +867,20 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 		scalingSizer->Add(m_fullscreen_scaling, 0, wxALL | wxEXPAND, 5);
 	}
 
-	graphics_panel->SetSizerAndFit(graphics_panel_sizer);
+	// SetSizer plus FitInside, NOT SetSizerAndFit.
+	//
+	// FitInside sets the VIRTUAL size from the content, which is what makes the
+	// scrollbar appear and span the whole page. SetSizerAndFit would instead
+	// resize the window itself to the content - the page would be as tall as
+	// its contents again and the scrollbar would never engage.
+	graphics_panel->SetSizer(graphics_panel_sizer);
+	graphics_panel->FitInside();
+
+	// Caps the height the page reports to the dialog. The dialog calls
+	// SetSizerAndFit on itself, which sizes it to its tallest page, so without
+	// a cap it would still open taller than the screen and scrolling would
+	// have fixed nothing. DIP-relative so it holds at any display scaling.
+	graphics_panel->SetMinSize(wxSize(-1, FromDIP(540)));
 	return graphics_panel;
 }
 
@@ -1427,6 +1474,34 @@ wxPanel* GeneralSettings2::AddDebugPage(wxBookCtrlBase* notebook)
 
 // Maps the scaled-texture cap dropdown to a size in texels. A plain index
 // would not do: the last entry means "no limit", which is stored as 0.
+// 0 means Auto: the renderer derives the budget from the device-local VRAM.
+sint32 GeneralSettings2::TextureBudgetSelectionToMB(int selection)
+{
+	switch (selection)
+	{
+	case 1: return 512;
+	case 2: return 1024;
+	case 3: return 2048;
+	case 4: return 4096;
+	case 5: return 8192;
+	default: return 0;
+	}
+}
+
+int GeneralSettings2::TextureBudgetMBToSelection(sint32 mb)
+{
+	switch (mb)
+	{
+	case 512: return 1;
+	case 1024: return 2;
+	case 2048: return 3;
+	case 4096: return 4;
+	case 8192: return 5;
+	// Anything else, including 0 and any hand-edited value, reads as Auto.
+	default: return 0;
+	}
+}
+
 sint32 GeneralSettings2::TextureCapSelectionToSize(int selection)
 {
 	switch (selection)
@@ -2449,6 +2524,8 @@ void GeneralSettings2::ApplyConfig()
 	m_faro_gi->SetValue(config.faro_gi_enabled);
 	m_texture_scaling->SetSelection(std::clamp<sint32>(config.texture_scaling_factor, 1, 4) - 1);
 	m_texture_scaling_cap->SetSelection(TextureCapSizeToSelection(config.texture_scaling_max_size));
+	m_texture_scaling_budget->SetSelection(TextureBudgetMBToSelection(config.texture_scaling_vram_budget_mb));
+	m_texture_scaling_restore->SetValue(config.texture_scaling_restore_cnn);
 	m_faro_gi_intensity->SetValue(std::clamp<sint32>(config.faro_gi_intensity, 0, 100));
 	// Label refreshed with the slider, not after it - see the FSR sharpness
 	// readout for what happens when only one of the two is updated here.

@@ -112,6 +112,8 @@ private:
 	// which made the feature impossible to judge, because comparing it against
 	// itself is all you could do.
 	sint32 m_anubisUpscaledFactor{ 0 };
+	// Frame this copy was last sampled in, for LRU eviction.
+	uint32 m_anubisUpscaledLastUsedFrame{ 0 };
 	bool m_anubisUpscaleFailed{ false };
 
 private:

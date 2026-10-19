@@ -720,6 +720,10 @@ public:
 	void AnubisProcessPendingUpscales();
 	void AnubisNotifyUpscaledTextureReleased(class LatteTextureVk* tex);
 	bool AnubisBuildUpscaledTexture(class LatteTextureVk* tex, sint32 scaledW, sint32 scaledH, class RendererOutputShader* upscaleShader);
+	uint64 AnubisGetUpscaleBudgetBytes();
+	bool AnubisEvictOneUpscaledCopy(class LatteTextureVk* protectTex);
+	bool AnubisEnsureRestoreScratch();
+	VkImageView AnubisRunRestoreChain(class LatteTextureViewVk* srcView, class VKRObjectTextureView* srcViewObj, sint32 width, sint32 height);
 private:
 
 	void DeleteTexture(ImTextureID id) override;
@@ -1015,10 +1019,28 @@ private:
 	VkSampler m_anubisUpscaleSampler = VK_NULL_HANDLE;
 	uint32 m_anubisUpscaledCount = 0;
 	uint32 m_anubisUpscaleRejected = 0;
+	uint32 m_anubisUpscaleEvictions = 0;
+	// Latched once the working set is proven not to fit - see the thrash guard.
+	bool m_anubisUpscaleThrashing = false;
+	uint32 m_anubisThrashWindowBuilt = 0;
+	uint32 m_anubisThrashWindowEvicted = 0;
+	uint32 m_anubisFrameCounter = 0;
+	// Textures that currently hold a copy. Needed because the copies live on the
+	// textures themselves, so LRU has no other way to see the whole set.
+	std::vector<class LatteTextureVk*> m_anubisUpscaledRegistry;
+	// Anime4K restore chain. Fixed-size scratch, allocated once - see
+	// AnubisEnsureRestoreScratch for why it is never resized.
+	static constexpr uint32 kAnubisRestoreScratchDim = 2048;
+	VkImage m_a4kScratchImage[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+	struct VkImageMemAllocation* m_a4kScratchAllocation[3] = { nullptr, nullptr, nullptr };
+	VkImageView m_a4kScratchView[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+	VkSampler m_a4kScratchSampler = VK_NULL_HANDLE;
+	VkRenderPass m_a4kRestoreRenderPass = VK_NULL_HANDLE;
+	bool m_a4kScratchReady = false;
+	bool m_a4kScratchFailed = false;
+	uint32 m_a4kRestoreCount = 0;
 	VkRenderPass m_anubisUpscaleRenderPassSrgb = VK_NULL_HANDLE;
 	VkRenderPass m_anubisUpscaleRenderPassUnorm = VK_NULL_HANDLE;
-	// Destroyed at a frame boundary, never at the point of use.
-	std::vector<VkFramebuffer> m_anubisUpscaleFramebufferGraveyard;
 
 	VkSampler m_giDepthSampler = VK_NULL_HANDLE;
 	// One-shot so a per-frame bail does not flood the log. "I turn GI on and

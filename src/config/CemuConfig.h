@@ -666,7 +666,14 @@ struct CemuConfig
 	// the textures actually in use get upscaled and the rest keep their
 	// original resolution. The right value depends on the GPU, not on the
 	// developer's machine, which is why it is a setting.
-	ConfigValue<sint32> texture_scaling_vram_budget_mb{1024};
+	// 0 = Auto: derived from the device-local VRAM at runtime. A hand-picked
+	// default was wrong - at 4x, 1024 MB held about sixteen large textures and
+	// refused thousands. What fits depends on the card, so the card decides.
+	ConfigValue<sint32> texture_scaling_vram_budget_mb{0};
+	// Anime4K Restore CNN before upscaling. Four convolution passes at the
+	// texture's native resolution, which is what the network was trained for
+	// and far cheaper than running it on the enlarged image.
+	ConfigValue<bool> texture_scaling_restore_cnn{false};
 	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio

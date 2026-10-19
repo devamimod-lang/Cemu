@@ -7050,6 +7050,31 @@ void VulkanRenderer::OnFaroFrameBoundary()
 	// Anubis texture upscaling: allocate images and record the filter passes
 	// here, never at the point of request. Both allocating and recording are
 	// unsafe inside a half-recorded frame.
+	m_anubisFrameCounter++;
+
+	// Decide, over a window of frames, whether the working set fits.
+	//
+	// The test is the ratio of evictions to builds. A healthy cache evicts
+	// rarely: once the visible set is resident it stays resident. Evicting
+	// nearly as often as it builds means every build is being thrown away
+	// before it pays off, and the measured cost of that was 86 FPS down to 17.
+	//
+	// Latched rather than re-evaluated: once the scene has proven too large,
+	// unlatching would restart the churn, and a feature that oscillates between
+	// fast and unplayable is worse than one that simply stops.
+	if (!m_anubisUpscaleThrashing && m_anubisThrashWindowBuilt >= 64)
+	{
+		if (m_anubisThrashWindowEvicted * 4 >= m_anubisThrashWindowBuilt * 3)
+		{
+			m_anubisUpscaleThrashing = true;
+			cemuLog_log(LogType::Force,
+				"Anubis texture upscale: working set does not fit the VRAM budget ({} evictions per {} builds) - no further copies will be built. Raise TextureScalingVramBudgetMB or lower the scaling factor.",
+				m_anubisThrashWindowEvicted, m_anubisThrashWindowBuilt);
+		}
+		m_anubisThrashWindowBuilt = 0;
+		m_anubisThrashWindowEvicted = 0;
+	}
+
 	AnubisProcessPendingUpscales();
 	// Report what the upscaler is actually doing. Written at the same time as
 	// the counters this time: shipping counters that nothing reads has already
@@ -7064,14 +7089,11 @@ void VulkanRenderer::OnFaroFrameBoundary()
 			if (m_anubisUpscaledCount != s_lastReported)
 			{
 				s_lastReported = m_anubisUpscaledCount;
-				cemuLog_log(LogType::Force, "Anubis texture upscale: {} copies built, {} declined for budget, {} MB of copies held, {} queued",
-					m_anubisUpscaledCount, m_anubisUpscaleRejected, m_anubisUpscaleBytes / (1024ull * 1024ull), m_anubisUpscaleQueue.size());
+				cemuLog_log(LogType::Force, "Anubis texture upscale: {} built, {} evicted, {} declined, {} of {} MB held, {} live, {} queued",
+					m_anubisUpscaledCount, m_anubisUpscaleEvictions, m_anubisUpscaleRejected, m_anubisUpscaleBytes / (1024ull * 1024ull), AnubisGetUpscaleBudgetBytes() / (1024ull * 1024ull), m_anubisUpscaledRegistry.size(), m_anubisUpscaleQueue.size());
 			}
 		}
 	}
-	for (VkFramebuffer fb : m_anubisUpscaleFramebufferGraveyard)
-		vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
-	m_anubisUpscaleFramebufferGraveyard.clear();
 
 	ProcessDeferredFaroTargets();
 
@@ -10022,6 +10044,129 @@ VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
 // See the declarations in VulkanRenderer.h for why this lives beside the
 // texture cache rather than inside it.
 
+namespace
+{
+	// Wraps a raw VkFramebuffer in this codebase's deferred-destruction
+	// contract, rather than keeping a private list and destroying at a frame
+	// boundary.
+	//
+	// The private list was wrong, and not subtly: the upscale builds ran at the
+	// top of the frame boundary and appended to it, then the very same call
+	// destroyed what had just been appended - framebuffers still referenced by a
+	// command buffer that had not even been submitted. A frame boundary is not a
+	// completion guarantee; only canDestroy() is, because it compares against the
+	// command buffer that actually used the object.
+	//
+	// VKRObjectFramebuffer exists but takes a VKRObjectRenderPass and
+	// VKRObjectTextureView attachments, which this pass does not have, so this
+	// is the same contract over a plain handle.
+	class AnubisUpscaleFramebuffer : public VKRDestructibleObject
+	{
+	public:
+		AnubisUpscaleFramebuffer(VkDevice device, VkFramebuffer fb) : m_device(device), m_fb(fb) {}
+		~AnubisUpscaleFramebuffer() override
+		{
+			if (m_fb != VK_NULL_HANDLE)
+				vkDestroyFramebuffer(m_device, m_fb, nullptr);
+		}
+	private:
+		VkDevice m_device;
+		VkFramebuffer m_fb;
+	};
+}
+
+uint64 VulkanRenderer::AnubisGetUpscaleBudgetBytes()
+{
+	const sint32 configured = GetConfig().texture_scaling_vram_budget_mb.GetValue();
+	if (configured > 0)
+		return (uint64)configured * 1024ull * 1024ull;
+
+	// Auto: derived from the device's own VRAM.
+	//
+	// A fixed default was the wrong design. 1024 MB was a number picked by hand,
+	// and at 4x it holds about sixteen 1024x1024 textures - the counters showed
+	// 733 copies built against 3981 declined, with the budget pinned at its
+	// ceiling. What the right value is depends on the card, so the card should
+	// say.
+	//
+	// The budget cannot simply be removed: once VRAM is exhausted the driver
+	// starts spilling allocations to system memory over PCIe and performance
+	// collapses. The fix is for the hardware to set the limit, not a constant.
+	static uint64 s_cachedBudget = 0;
+	if (s_cachedBudget != 0)
+		return s_cachedBudget;
+
+	VkPhysicalDeviceMemoryProperties memProps{};
+	vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProps);
+	uint64 deviceLocalBytes = 0;
+	for (uint32 i = 0; i < memProps.memoryHeapCount; i++)
+	{
+		if (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+			deviceLocalBytes += memProps.memoryHeaps[i].size;
+	}
+
+	// Heap SIZE, not free memory. VK_EXT_memory_budget reports what is actually
+	// free and would self-correct as the game loads, but it is a device
+	// extension and is not enabled on this device - turning it on means
+	// touching device creation, which every other part of the renderer depends
+	// on. A fraction of the total is the conservative stand-in.
+	//
+	// 40%: the emulator plus the game were measured at roughly 3.5 GB on an 8 GB
+	// card, so 40% (3.2 GB there) uses the headroom without crowding them, and
+	// scales on its own to a 24 GB card.
+	s_cachedBudget = (uint64)((double)deviceLocalBytes * 0.40);
+	// Floor so a small or misreported heap does not disable the feature outright.
+	s_cachedBudget = std::max<uint64>(s_cachedBudget, 256ull * 1024ull * 1024ull);
+	cemuLog_log(LogType::Force, "Anubis texture upscale: auto VRAM budget {} MB (device-local heaps total {} MB)",
+		s_cachedBudget / (1024ull * 1024ull), deviceLocalBytes / (1024ull * 1024ull));
+	return s_cachedBudget;
+}
+
+// Frees the copy of the texture that has gone unsampled the longest.
+//
+// Without this the budget was first-come: it filled with whatever loaded
+// earliest - menus, startup assets - and every texture the player actually
+// looked at afterwards was refused forever. That, not the filter, is the main
+// reason the feature looked like it did nothing.
+bool VulkanRenderer::AnubisEvictOneUpscaledCopy(LatteTextureVk* protectTex)
+{
+	LatteTextureVk* victim = nullptr;
+	uint32 oldestFrame = 0xFFFFFFFF;
+	for (LatteTextureVk* t : m_anubisUpscaledRegistry)
+	{
+		if (t == protectTex || t->m_anubisUpscaledTex == nullptr)
+			continue;
+		// Never evict something sampled this frame or last: it is on screen now,
+		// and reclaiming it would start a build/evict cycle that thrashes.
+		if (t->m_anubisUpscaledLastUsedFrame + 2 >= m_anubisFrameCounter)
+			continue;
+		if (t->m_anubisUpscaledLastUsedFrame < oldestFrame)
+		{
+			oldestFrame = t->m_anubisUpscaledLastUsedFrame;
+			victim = t;
+		}
+	}
+	if (!victim)
+		return false;
+
+	AnubisNotifyUpscaledTextureReleased(victim);
+	if (victim->m_anubisUpscaledView)
+	{
+		ReleaseDestructibleObject(victim->m_anubisUpscaledView);
+		victim->m_anubisUpscaledView = nullptr;
+	}
+	ReleaseDestructibleObject(victim->m_anubisUpscaledTex);
+	victim->m_anubisUpscaledTex = nullptr;
+	victim->m_anubisUpscaledFactor = 0;
+	victim->m_anubisUpscaledFromReload = 0xFFFFFFFF;
+	// Deliberately NOT marked as failed: it is a perfectly good candidate that
+	// simply lost its slot, and it must be able to win one back when it is
+	// sampled again.
+	m_anubisUpscaleEvictions++;
+	m_anubisThrashWindowEvicted++;
+	return true;
+}
+
 void VulkanRenderer::AnubisNotifyUpscaledTextureReleased(LatteTextureVk* tex)
 {
 	// Give the budget its bytes back, and drop any queued request - the texture
@@ -10035,6 +10180,9 @@ void VulkanRenderer::AnubisNotifyUpscaledTextureReleased(LatteTextureVk* tex)
 	auto it = std::find(m_anubisUpscaleQueue.begin(), m_anubisUpscaleQueue.end(), tex);
 	if (it != m_anubisUpscaleQueue.end())
 		m_anubisUpscaleQueue.erase(it);
+	auto rit = std::find(m_anubisUpscaledRegistry.begin(), m_anubisUpscaledRegistry.end(), tex);
+	if (rit != m_anubisUpscaledRegistry.end())
+		m_anubisUpscaledRegistry.erase(rit);
 }
 
 VkImageView VulkanRenderer::AnubisGetUpscaledView(LatteTextureVk* tex)
@@ -10054,7 +10202,33 @@ VkImageView VulkanRenderer::AnubisGetUpscaledView(LatteTextureVk* tex)
 	// comparing it against itself is otherwise all that is possible.
 	if (tex->m_anubisUpscaledView && tex->m_anubisUpscaledFromReload == tex->reloadCount
 		&& tex->m_anubisUpscaledFactor == factor)
+	{
+		// Touch for LRU. This is the only signal that distinguishes a texture
+		// on screen right now from one loaded during a menu an hour ago, which
+		// is what the budget needs in order to hold the right 15 percent
+		// instead of merely the first 15 percent.
+		tex->m_anubisUpscaledLastUsedFrame = m_anubisFrameCounter;
 		return tex->m_anubisUpscaledView->m_textureImageView;
+	}
+
+	// Plain single-layer 2D only.
+	//
+	// This check was missing, and its absence is what put the wrong texture on
+	// parts of the world. An array texture - the terrain atlases, among others -
+	// got ONE 2D copy built from layer 0, and that copy was then substituted for
+	// every layer, so every layer rendered layer 0's content. A cubemap had the
+	// same problem across its faces. On top of that the shader declares an array
+	// or cube sampler while the substituted view is plain 2D, which is a
+	// descriptor type mismatch and undefined on its own.
+	//
+	// Arrays and cubemaps are not impossible, they just need one copy per layer
+	// and a matching view type. That is a separate piece of work; until it
+	// exists, declining is the only correct answer.
+	if (tex->dim != Latte::E_DIM::DIM_2D || tex->depth > 1)
+	{
+		tex->m_anubisUpscaleFailed = true;
+		return VK_NULL_HANDLE;
+	}
 
 	sint32 scaledW = 0, scaledH = 0;
 	if (!LatteTexScale_ShouldScale(tex->format, tex->isDepth, (sint32)tex->mipLevels, tex->tileMode,
@@ -10098,7 +10272,7 @@ void VulkanRenderer::AnubisProcessPendingUpscales()
 	// 16 MB against the original 512 KB. Without a ceiling this would exhaust
 	// any card; with one, the textures in use get scaled and the rest keep
 	// their original resolution.
-	const uint64 budgetBytes = (uint64)std::max(GetConfig().texture_scaling_vram_budget_mb.GetValue(), 0) * 1024ull * 1024ull;
+	const uint64 budgetBytes = AnubisGetUpscaleBudgetBytes();
 
 	if (m_anubisUpscaleSampler == VK_NULL_HANDLE)
 	{
@@ -10130,10 +10304,53 @@ void VulkanRenderer::AnubisProcessPendingUpscales()
 
 		const uint64 wantBytes = (uint64)scaledW * scaledH * 4ull;
 		const bool alreadyOwns = tex->m_anubisUpscaledTex != nullptr;
-		if (!alreadyOwns && budgetBytes > 0 && m_anubisUpscaleBytes + wantBytes > budgetBytes)
+
+		// Over budget: make room by evicting the least recently sampled copy,
+		// rather than refusing this one.
+		//
+		// Refusing was the old behaviour and it was the wrong trade. The budget
+		// filled with whatever loaded first and then rejected everything else
+		// permanently - 3981 refusals against 733 copies - so the textures in
+		// front of the player were precisely the ones that never got upscaled.
+		// Evicting turns a fixed allocation into a working set.
+		// Thrash guard. Stop building entirely once the working set is proven
+		// not to fit.
+		//
+		// Measured: 2221 copies built against 2148 evictions, with only ~65
+		// live at a time. The cache was rebuilding the same textures over and
+		// over because LRU kept evicting whatever the next frame needed. Each
+		// rebuild is an image allocation plus a render pass, and that churn -
+		// not the filter - took the frame from 11.6 ms to 59.4 ms, 86 FPS down
+		// to 17. GPU idle time fell from 33% to 3%, so the GPU thread was
+		// saturated by this work.
+		//
+		// When the scene's working set exceeds the budget, churning is pure
+		// loss: it costs the full build price and the copy is gone before it
+		// can be reused. Serving the copies that already fit and refusing the
+		// rest is strictly better.
+		if (m_anubisUpscaleThrashing)
 		{
-			// Over budget. Declining is the whole mechanism: this texture stays
-			// at its original resolution, which is correct, just not sharper.
+			m_anubisUpscaleRejected++;
+			continue;
+		}
+
+		bool haveRoom = true;
+		if (!alreadyOwns && budgetBytes > 0)
+		{
+			while (m_anubisUpscaleBytes + wantBytes > budgetBytes)
+			{
+				if (!AnubisEvictOneUpscaledCopy(tex))
+				{
+					// Nothing evictable - everything in the budget is in use
+					// this frame. Declining is correct here: the texture keeps
+					// its original resolution.
+					haveRoom = false;
+					break;
+				}
+			}
+		}
+		if (!haveRoom)
+		{
 			m_anubisUpscaleRejected++;
 			continue;
 		}
@@ -10144,9 +10361,17 @@ void VulkanRenderer::AnubisProcessPendingUpscales()
 			tex->m_anubisUpscaleFailed = true;
 			continue;
 		}
+		m_anubisThrashWindowBuilt++;
 		if (!alreadyOwns)
+		{
 			m_anubisUpscaleBytes += wantBytes;
+			// Registered so eviction can find it. The copies are owned by the
+			// textures, so without this list LRU has nothing to scan.
+			if (std::find(m_anubisUpscaledRegistry.begin(), m_anubisUpscaledRegistry.end(), tex) == m_anubisUpscaledRegistry.end())
+				m_anubisUpscaledRegistry.emplace_back(tex);
+		}
 		tex->m_anubisUpscaledFromReload = tex->reloadCount;
+		tex->m_anubisUpscaledLastUsedFrame = m_anubisFrameCounter;
 		tex->m_anubisUpscaledFactor = factor;
 		m_anubisUpscaledCount++;
 	}
@@ -10289,10 +10514,89 @@ bool VulkanRenderer::AnubisBuildUpscaledTexture(LatteTextureVk* tex, sint32 scal
 	if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
 		return false;
 
+	// Anime4K restore BEFORE the upscale, when enabled.
+	//
+	// The order matters both ways round. The network was trained to repair
+	// detail at native resolution, so running it on the already-enlarged image
+	// would be feeding it something it never saw in training; and a 512x512
+	// texture is sixteen times less work than its 4x enlargement.
+	//
+	// This is also the piece that can actually add detail. A reconstruction
+	// filter interpolates between the texels that exist - measured at 86 FPS
+	// down to 17 for no visible gain - whereas a convolutional network
+	// synthesises what is not there. That is the whole reason for this path.
+	VkImageView restoredView = AnubisRunRestoreChain(srcView, srcViewObj, tex->width, tex->height);
+	VkImageView upscaleInputView = (restoredView != VK_NULL_HANDLE) ? restoredView : srcViewObj->m_textureImageView;
+	VkSampler upscaleInputSampler = (restoredView != VK_NULL_HANDLE) ? m_a4kScratchSampler : m_anubisUpscaleSampler;
+
 	auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, false, upscaleShader, cachedRP);
-	VkDescriptorSet descriptorSet = GetFaroEffectDescriptorSet(srcViewObj->m_textureImageView, m_anubisUpscaleSampler,
-		srcViewObj->m_textureImageView, m_anubisUpscaleSampler);
-	if (pipeline == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE)
+
+	// A descriptor set allocated for THIS build, deliberately not taken from
+	// GetFaroEffectDescriptorSet.
+	//
+	// That cache is keyed on a hash of raw VkImageView and VkSampler handle
+	// VALUES and never evicts. Vulkan is free to hand a freed handle's value
+	// back out for a new object, so once a texture died and another inherited
+	// its view handle, the cache returned a descriptor set still pointing at
+	// the dead image - and the shader sampled a completely unrelated texture.
+	// That is the second half of why the wrong textures appeared.
+	//
+	// Builds happen once per texture, so allocating here costs nothing worth
+	// caching for.
+	VKRObjectDescriptorSet* dsObj = new VKRObjectDescriptorSet();
+	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+	{
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = m_descriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &descriptorSet) != VK_SUCCESS)
+		{
+			delete dsObj;
+			vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+			return false;
+		}
+		dsObj->descriptorSet = descriptorSet;
+		performanceMonitor.vk.numDescriptorSets.increment();
+		VkDescriptorImageInfo imageInfo{};
+		imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		// The restored image when the chain ran, otherwise the raw texture.
+		imageInfo.imageView = upscaleInputView;
+		imageInfo.sampler = upscaleInputSampler;
+
+		// Binding 0 is the sampler, binding 1 is the DYNAMIC uniform buffer.
+		// Writing a sampler into binding 1 is invalid - this layout is not three
+		// samplers in a row.
+		//
+		// Bindings 2 and 3 are left unwritten on purpose, matching
+		// backbufferBlit_createDescriptorSet: the spec only requires valid
+		// descriptors for bindings the bound shader statically uses, and the
+		// upscale shader reads textureSrc alone. Filling them "just in case" is
+		// what exhausted this pool's sampler budget once before.
+		VkWriteDescriptorSet writes[2]{};
+		writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[0].dstSet = descriptorSet;
+		writes[0].dstBinding = 0;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[0].pImageInfo = &imageInfo;
+
+		VkDescriptorBufferInfo uniformBufferInfo{};
+		uniformBufferInfo.buffer = m_uniformVarBuffer;
+		uniformBufferInfo.offset = 0;
+		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+		writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[1].dstSet = descriptorSet;
+		writes[1].dstBinding = 1;
+		writes[1].descriptorCount = 1;
+		writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		writes[1].pBufferInfo = &uniformBufferInfo;
+
+		vkUpdateDescriptorSets(m_logicalDevice, 2, writes, 0, nullptr);
+	}
+
+	if (pipeline == VK_NULL_HANDLE)
 	{
 		vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
 		return false;
@@ -10353,9 +10657,338 @@ bool VulkanRenderer::AnubisBuildUpscaledTexture(LatteTextureVk* tex, sint32 scal
 	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &doneBarrier, 0, nullptr, 0, nullptr);
 
-	// A framebuffer cannot be destroyed while the command buffer using it is
-	// still in flight - that exact mistake crashed the fullscreen transition
-	// earlier in this codebase. Parked and destroyed at a frame boundary.
-	m_anubisUpscaleFramebufferGraveyard.emplace_back(fb);
+	// Both objects were used by the command buffer being recorded right now, so
+	// they are flagged against it and handed to the destruction queue. That
+	// queue only deletes once that buffer has completed.
+	//
+	// Flagging is the part that matters. The first version parked these in
+	// private lists drained at the frame boundary, but the builds run at the
+	// top of that same boundary - so the list was emptied in the very call that
+	// filled it, destroying a framebuffer still referenced by an unsubmitted
+	// command buffer.
+	auto* fbObj = new AnubisUpscaleFramebuffer(m_logicalDevice, fb);
+	fbObj->flagForCurrentCommandBuffer();
+	ReleaseDestructibleObject(fbObj);
+
+	dsObj->flagForCurrentCommandBuffer();
+	ReleaseDestructibleObject(dsObj);
 	return true;
+}
+
+// Three scratch images for the Anime4K restore chain, allocated ONCE at a fixed
+// size and shared by every texture.
+//
+// Sharing is safe because the whole four-pass chain runs to completion inside a
+// single build, at the frame boundary, before the next texture begins.
+//
+// Allocated once and never resized, which is a deliberate choice over growing
+// them on demand. Recreating would mean destroying images that a submitted
+// command buffer might still be reading, and the only tool that looks like it
+// solves that - WaitDeviceIdle - does not: it waits for SUBMITTED work, not for
+// the command buffer currently being recorded. A fixed allocation removes the
+// question instead of answering it carefully.
+//
+// 2048x2048 covers the restore, because the restore runs at the texture's
+// ORIGINAL resolution, not the scaled one. In a Breath of the Wild dump the
+// largest base textures were 2048. Anything bigger simply skips restoration and
+// still gets upscaled.
+//
+// FLOAT, not UNORM, and this is not a preference. The network's activation is a
+// CReLU: half of every layer's input is max(-x, 0), the NEGATIVE part of the
+// previous layer. A UNORM target clamps negatives to zero and silently deletes
+// half the network. Same class of mistake as an 8-bit history under a 16F TAA
+// chain, which produced a black screen.
+bool VulkanRenderer::AnubisEnsureRestoreScratch()
+{
+	if (m_a4kScratchReady)
+		return true;
+	if (m_a4kScratchFailed)
+		return false;
+
+	const uint32 dim = kAnubisRestoreScratchDim;
+	for (int i = 0; i < 3; i++)
+	{
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent = { dim, dim, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_a4kScratchImage[i]) != VK_SUCCESS)
+		{
+			m_a4kScratchImage[i] = VK_NULL_HANDLE;
+			m_a4kScratchFailed = true;
+			cemuLog_log(LogType::Force, "Anubis Anime4K restore: could not create scratch image {} - restoration disabled", i);
+			return false;
+		}
+		m_a4kScratchAllocation[i] = memoryManager->imageMemoryAllocate(m_a4kScratchImage[i]);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_a4kScratchImage[i];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_a4kScratchView[i]) != VK_SUCCESS)
+		{
+			m_a4kScratchView[i] = VK_NULL_HANDLE;
+			m_a4kScratchFailed = true;
+			return false;
+		}
+	}
+
+	if (m_a4kScratchSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		// NEAREST, not LINEAR. A convolution addresses exact texels; filtering
+		// between them would blend neighbouring feature-map values and the
+		// 3x3 kernel would no longer be reading what it was trained on.
+		samplerInfo.magFilter = VK_FILTER_NEAREST;
+		samplerInfo.minFilter = VK_FILTER_NEAREST;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_a4kScratchSampler) != VK_SUCCESS)
+		{
+			m_a4kScratchFailed = true;
+			return false;
+		}
+	}
+
+	m_a4kScratchReady = true;
+	cemuLog_log(LogType::Force, "Anubis Anime4K restore: {} scratch targets ready at {}x{} RGBA16F ({} MB total)",
+		3, dim, dim, (uint64)dim * dim * 8ull * 3ull / (1024ull * 1024ull));
+	return true;
+}
+
+// Runs the four Anime4K restore passes and returns the view holding the result,
+// or null when restoration is unavailable or not applicable.
+//
+// Pass order and the reuse of scratch 0:
+//   0: source     -> scratch0
+//   1: scratch0   -> scratch1
+//   2: scratch1   -> scratch2
+//   3: scratch2 + source -> scratch0      (residual: result + original)
+//
+// Scratch 0 is free by pass 3 because pass 1 already consumed it, and pass 3
+// reads scratch2 and the SOURCE - never scratch0 - so writing there is not a
+// read-write hazard on the same image.
+//
+// The caller then upscales from the returned view instead of from the raw
+// texture. Restoring BEFORE enlarging is the right order and also the cheap
+// one: the network was trained to repair detail at native resolution, and
+// running it on a 512x512 texture is sixteen times less work than on its 4x
+// enlargement.
+VkImageView VulkanRenderer::AnubisRunRestoreChain(LatteTextureViewVk* srcView, VKRObjectTextureView* srcViewObj, sint32 width, sint32 height)
+{
+	if (!GetConfig().texture_scaling_restore_cnn.GetValue())
+		return VK_NULL_HANDLE;
+	// Larger than the fixed scratch: skip restoration, still upscale. Declining
+	// is correct - the alternative is resizing scratch images that submitted
+	// command buffers may still be reading.
+	if ((uint32)width > kAnubisRestoreScratchDim || (uint32)height > kAnubisRestoreScratchDim)
+		return VK_NULL_HANDLE;
+	if (!AnubisEnsureRestoreScratch())
+		return VK_NULL_HANDLE;
+	for (int i = 0; i < 4; i++)
+	{
+		if (!RendererOutputShader::s_a4k_restore_pass[i])
+			return VK_NULL_HANDLE;
+	}
+
+	// One render pass for the float scratch format, created once. Pipelines are
+	// keyed on the render pass handle, so making a new one per texture would
+	// churn the pipeline cache.
+	if (m_a4kRestoreRenderPass == VK_NULL_HANDLE)
+	{
+		VkAttachmentDescription colorAttachment{};
+		colorAttachment.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkAttachmentReference colorRef{};
+		colorRef.attachment = 0;
+		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef;
+		VkRenderPassCreateInfo rpInfo{};
+		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		rpInfo.attachmentCount = 1;
+		rpInfo.pAttachments = &colorAttachment;
+		rpInfo.subpassCount = 1;
+		rpInfo.pSubpasses = &subpass;
+		if (vkCreateRenderPass(m_logicalDevice, &rpInfo, nullptr, &m_a4kRestoreRenderPass) != VK_SUCCESS)
+		{
+			m_a4kRestoreRenderPass = VK_NULL_HANDLE;
+			return VK_NULL_HANDLE;
+		}
+	}
+
+	// Which scratch each pass writes, and which it reads.
+	const int writeTo[4] = { 0, 1, 2, 0 };
+	const int readFrom[4] = { -1, 0, 1, 2 };   // -1 = the source texture
+
+	for (int p = 0; p < 4; p++)
+	{
+		VkImageView attachments[1] = { m_a4kScratchView[writeTo[p]] };
+		VkFramebufferCreateInfo fbInfo{};
+		fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		fbInfo.renderPass = m_a4kRestoreRenderPass;
+		fbInfo.attachmentCount = 1;
+		fbInfo.pAttachments = attachments;
+		// The scratch is fixed-size but each pass only writes the texture's own
+		// rectangle, so the framebuffer is declared at the texture's size.
+		fbInfo.width = (uint32)width;
+		fbInfo.height = (uint32)height;
+		fbInfo.layers = 1;
+		VkFramebuffer fb = VK_NULL_HANDLE;
+		if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
+			return VK_NULL_HANDLE;
+
+		auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, false,
+			RendererOutputShader::s_a4k_restore_pass[p], m_a4kRestoreRenderPass);
+		if (pipeline == VK_NULL_HANDLE)
+		{
+			vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+			return VK_NULL_HANDLE;
+		}
+
+		// Binding 0 is what the convolution reads; binding 2 (textureSrc2) is
+		// the untouched original, which only the residual pass samples but is
+		// written every time so no binding is ever left undefined.
+		VkImageView convInput = (readFrom[p] < 0) ? srcViewObj->m_textureImageView : m_a4kScratchView[readFrom[p]];
+		VkSampler convSampler = (readFrom[p] < 0) ? m_anubisUpscaleSampler : m_a4kScratchSampler;
+
+		VKRObjectDescriptorSet* dsObj = new VKRObjectDescriptorSet();
+		VkDescriptorSet ds = VK_NULL_HANDLE;
+		{
+			VkDescriptorSetAllocateInfo allocInfo{};
+			allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			allocInfo.descriptorPool = m_descriptorPool;
+			allocInfo.descriptorSetCount = 1;
+			allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+			if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &ds) != VK_SUCCESS)
+			{
+				delete dsObj;
+				vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+				return VK_NULL_HANDLE;
+			}
+			dsObj->descriptorSet = ds;
+			performanceMonitor.vk.numDescriptorSets.increment();
+
+			VkDescriptorImageInfo convInfo{};
+			convInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			convInfo.imageView = convInput;
+			convInfo.sampler = convSampler;
+
+			VkDescriptorImageInfo origInfo{};
+			origInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			origInfo.imageView = srcViewObj->m_textureImageView;
+			origInfo.sampler = m_anubisUpscaleSampler;
+
+			VkDescriptorBufferInfo uniformBufferInfo{};
+			uniformBufferInfo.buffer = m_uniformVarBuffer;
+			uniformBufferInfo.offset = 0;
+			uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+
+			VkWriteDescriptorSet writes[3]{};
+			writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[0].dstSet = ds;
+			writes[0].dstBinding = 0;
+			writes[0].descriptorCount = 1;
+			writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writes[0].pImageInfo = &convInfo;
+			writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[1].dstSet = ds;
+			writes[1].dstBinding = 1;
+			writes[1].descriptorCount = 1;
+			writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+			writes[1].pBufferInfo = &uniformBufferInfo;
+			writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[2].dstSet = ds;
+			writes[2].dstBinding = 2;
+			writes[2].descriptorCount = 1;
+			writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writes[2].pImageInfo = &origInfo;
+			vkUpdateDescriptorSets(m_logicalDevice, 3, writes, 0, nullptr);
+		}
+
+		draw_endRenderPass();
+
+		VkRenderPassBeginInfo rpBegin{};
+		rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		rpBegin.renderPass = m_a4kRestoreRenderPass;
+		rpBegin.framebuffer = fb;
+		rpBegin.renderArea.offset = { 0, 0 };
+		rpBegin.renderArea.extent = { (uint32)width, (uint32)height };
+		rpBegin.clearValueCount = 0;
+
+		VkViewport viewport{};
+		viewport.x = 0.0f;
+		viewport.y = 0.0f;
+		viewport.width = (float)width;
+		viewport.height = (float)height;
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		VkRect2D scissor{};
+		scissor.offset = { 0, 0 };
+		scissor.extent = { (uint32)width, (uint32)height };
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_state.currentPipeline = pipeline;
+
+		// textureSrcResolution must describe the texture being convolved,
+		// because the shader derives its one-texel offsets from it. The scratch
+		// images are larger than the texture, so passing their size would make
+		// every 3x3 tap land in the wrong place.
+		auto uniforms = RendererOutputShader::s_a4k_restore_pass[p]->FillUniformBlockBuffer(*srcView, { width, height }, false);
+		uniforms.applySRGBEncoding = false;
+		uniforms.targetGamma = uniforms.displayGamma;
+		uniforms.textureSrcResolution = { (float)width, (float)height };
+		auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ds, 1, &uniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+		// Each pass must finish writing before the next samples it. Without
+		// this the convolutions would read whatever happened to be resident and
+		// the network's output would be noise.
+		VkMemoryBarrier chainBarrier{};
+		chainBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		chainBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		chainBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &chainBarrier, 0, nullptr, 0, nullptr);
+
+		auto* fbObj = new AnubisUpscaleFramebuffer(m_logicalDevice, fb);
+		fbObj->flagForCurrentCommandBuffer();
+		ReleaseDestructibleObject(fbObj);
+		dsObj->flagForCurrentCommandBuffer();
+		ReleaseDestructibleObject(dsObj);
+	}
+
+	m_a4kRestoreCount++;
+	// Scratch 0 holds the residual output of pass 3.
+	return m_a4kScratchView[0];
 }

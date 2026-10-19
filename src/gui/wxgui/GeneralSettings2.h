@@ -112,7 +112,11 @@ private:
 	// Anubis real-time texture scaling: factor and the VRAM ceiling.
 	wxChoice* m_texture_scaling;
 	wxChoice* m_texture_scaling_cap;
+	wxChoice* m_texture_scaling_budget;
+	wxCheckBox* m_texture_scaling_restore;
 	static sint32 TextureCapSelectionToSize(int selection);
+	static sint32 TextureBudgetSelectionToMB(int selection);
+	static int TextureBudgetMBToSelection(sint32 mb);
 	static int TextureCapSizeToSelection(sint32 size);
 	wxChoice* m_overlay_position, *m_notification_position, *m_overlay_scale, *m_notification_scale;
 	wxCheckBox* m_controller_profile_name, *m_controller_low_battery, *m_shader_compiling, *m_friends_data;

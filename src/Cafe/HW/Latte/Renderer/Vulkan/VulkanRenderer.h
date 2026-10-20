@@ -724,6 +724,8 @@ public:
 	bool AnubisEvictOneUpscaledCopy(class LatteTextureVk* protectTex);
 	bool AnubisEnsureRestoreScratch();
 	VkImageView AnubisRunRestoreChain(class LatteTextureViewVk* srcView, class VKRObjectTextureView* srcViewObj, sint32 width, sint32 height);
+	bool AnubisEnsureFsrcnnScratch();
+	bool AnubisRunFsrcnnChain(class LatteTextureViewVk* srcView, class VKRObjectTextureView* srcViewObj, sint32 width, sint32 height, VkFramebuffer dstFramebuffer, VkRenderPass dstRenderPass, sint32 dstWidth, sint32 dstHeight);
 private:
 
 	void DeleteTexture(ImTextureID id) override;
@@ -773,7 +775,11 @@ private:
 	// misc
 	void CreatePipelineCache();
 	VkPipelineShaderStageCreateInfo CreatePipelineShaderStageCreateInfo(VkShaderStageFlagBits stage, VkShaderModule& module, const char* entryName) const;
-	VkPipeline backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader, VkRenderPass renderPass = VK_NULL_HANDLE);
+	// additiveBlend defaults to false, so every existing caller (FSR1, SMAA,
+	// TAA, GI, the backbuffer blit) is unaffected. It exists for the FSRCNN
+	// accumulation passes, where a 1x1 convolution is summed across several
+	// draws into one target.
+	VkPipeline backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader, VkRenderPass renderPass = VK_NULL_HANDLE, bool additiveBlend = false);
 	// See the implementation's own comment: required whenever a render pass
 	// these pipelines were built against is destroyed, because the cache key
 	// includes the render pass handle and Vulkan may recycle handle values.
@@ -1039,6 +1045,19 @@ private:
 	bool m_a4kScratchReady = false;
 	bool m_a4kScratchFailed = false;
 	uint32 m_a4kRestoreCount = 0;
+	// FSRCNN-small x2. Thirteen float targets at a fixed size, allocated once -
+	// see AnubisEnsureFsrcnnScratch for why they are never resized.
+	static constexpr uint32 kAnubisFsrcnnDim = 1024;
+	static constexpr int kAnubisFsrcnnTargets = 13;
+	VkImage m_fsrcnnImage[kAnubisFsrcnnTargets] = {};
+	struct VkImageMemAllocation* m_fsrcnnAllocation[kAnubisFsrcnnTargets] = {};
+	VkImageView m_fsrcnnView[kAnubisFsrcnnTargets] = {};
+	VkSampler m_fsrcnnSampler = VK_NULL_HANDLE;
+	VkRenderPass m_fsrcnnRenderPass = VK_NULL_HANDLE;
+	bool m_fsrcnnScratchReady = false;
+	bool m_fsrcnnScratchFailed = false;
+	bool m_fsrcnnTargetsInitialised = false;
+	uint32 m_fsrcnnRunCount = 0;
 	VkRenderPass m_anubisUpscaleRenderPassSrgb = VK_NULL_HANDLE;
 	VkRenderPass m_anubisUpscaleRenderPassUnorm = VK_NULL_HANDLE;
 

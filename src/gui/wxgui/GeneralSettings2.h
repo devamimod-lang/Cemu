@@ -113,6 +113,14 @@ private:
 	wxChoice* m_texture_scaling;
 	wxChoice* m_texture_scaling_cap;
 	wxChoice* m_texture_scaling_budget;
+	wxCheckBox* m_faro_bitmask_ao;
+	wxSlider* m_faro_bitmask_ao_intensity;
+	wxStaticText* m_faro_bitmask_ao_intensity_text;
+	wxSlider* m_faro_bitmask_ao_distance;
+	wxStaticText* m_faro_bitmask_ao_distance_text;
+	wxSlider* m_faro_bitmask_ao_radius;
+	wxStaticText* m_faro_bitmask_ao_radius_text;
+	wxChoice* m_texture_scaling_upscaler;
 	wxCheckBox* m_texture_scaling_restore;
 	static sint32 TextureCapSelectionToSize(int selection);
 	static sint32 TextureBudgetSelectionToMB(int selection);

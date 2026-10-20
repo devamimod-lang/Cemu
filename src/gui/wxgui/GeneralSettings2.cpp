@@ -690,6 +690,11 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			m_faro_ssao_quality->Enable(on && GetConfig().faro_ssao_enabled);
 			m_faro_gi->Enable(on);
 			m_faro_gi_intensity->Enable(on && GetConfig().faro_gi_enabled);
+			// Shares the GI pass, so it cannot run without it.
+			m_faro_bitmask_ao->Enable(on && GetConfig().faro_gi_enabled);
+			m_faro_bitmask_ao_intensity->Enable(on && GetConfig().faro_gi_enabled && GetConfig().faro_bitmask_ao_enabled);
+			m_faro_bitmask_ao_distance->Enable(on && GetConfig().faro_gi_enabled && GetConfig().faro_bitmask_ao_enabled);
+			m_faro_bitmask_ao_radius->Enable(on && GetConfig().faro_gi_enabled && GetConfig().faro_bitmask_ao_enabled);
 			m_faro_depth_snapshot->Enable(on);
 		};
 
@@ -764,6 +769,72 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 		});
 		box_sizer->Add(giRow, 0, wxEXPAND | wxALL, 5);
 
+		// Bitmask ambient occlusion, independent of SSAO on purpose.
+		//
+		// Both can be on at once because they are different estimators, not two
+		// settings for one effect. SSAO is horizon-based, and the visibility
+		// bitmask paper names that family's limitation directly: it cannot let
+		// light pass behind thin surfaces. This one can, so they disagree
+		// exactly where thin geometry is - which is where comparing them is
+		// worth something.
+		m_faro_bitmask_ao = new wxCheckBox(graphics_panel, wxID_ANY, _("Bitmask ambient occlusion"));
+		m_faro_bitmask_ao->SetToolTip(_("A second ambient occlusion, computed from the visibility bit field the global illumination pass already builds, so it costs almost nothing extra.\nIndependent of SSAO - both can be enabled together, with separate strengths. Unlike SSAO it lets light pass behind thin objects such as railings and foliage, instead of darkening everything behind them.\nRequires global illumination to be enabled, since it shares that pass."));
+		m_faro_bitmask_ao->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_bitmask_ao_enabled = event.IsChecked();
+			updateFaroEnables();
+		});
+		box_sizer->Add(m_faro_bitmask_ao, 0, wxALL, 5);
+
+		auto bmAoRow = new wxBoxSizer(wxHORIZONTAL);
+		bmAoRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Bitmask AO intensity")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_bitmask_ao_intensity = new wxSlider(graphics_panel, wxID_ANY,
+			GetConfig().faro_bitmask_ao_intensity.GetValue(), 0, 100, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_bitmask_ao_intensity->SetToolTip(_("How much this occlusion darkens the image, 0-100. Separate from the SSAO strength."));
+		bmAoRow->Add(m_faro_bitmask_ao_intensity, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+		m_faro_bitmask_ao_intensity_text = new wxStaticText(graphics_panel, wxID_ANY,
+			wxString::Format("%d%%", GetConfig().faro_bitmask_ao_intensity.GetValue()));
+		SetSliderValueWidth(m_faro_bitmask_ao_intensity_text);
+		bmAoRow->Add(m_faro_bitmask_ao_intensity_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+		m_faro_bitmask_ao_intensity->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+			GetConfig().faro_bitmask_ao_intensity = event.GetInt();
+			m_faro_bitmask_ao_intensity_text->SetLabel(wxString::Format("%d%%", event.GetInt()));
+		});
+		box_sizer->Add(bmAoRow, 0, wxEXPAND | wxALL, 5);
+
+		// Reach and radius, the two things that decide whether this reads on a
+		// building rather than only on a character standing nearby.
+		auto bmAoDistRow = new wxBoxSizer(wxHORIZONTAL);
+		bmAoDistRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Bitmask AO distance")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_bitmask_ao_distance = new wxSlider(graphics_panel, wxID_ANY,
+			GetConfig().faro_bitmask_ao_distance.GetValue(), 50, 1000, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_bitmask_ao_distance->SetToolTip(_("How far from the camera this occlusion still applies. Raise it if buildings and terrain look unshaded while nearby characters look right - that is this limit, not the effect failing."));
+		bmAoDistRow->Add(m_faro_bitmask_ao_distance, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+		m_faro_bitmask_ao_distance_text = new wxStaticText(graphics_panel, wxID_ANY,
+			wxString::Format("%d", GetConfig().faro_bitmask_ao_distance.GetValue()));
+		SetSliderValueWidth(m_faro_bitmask_ao_distance_text);
+		bmAoDistRow->Add(m_faro_bitmask_ao_distance_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+		m_faro_bitmask_ao_distance->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+			GetConfig().faro_bitmask_ao_distance = event.GetInt();
+			m_faro_bitmask_ao_distance_text->SetLabel(wxString::Format("%d", event.GetInt()));
+		});
+		box_sizer->Add(bmAoDistRow, 0, wxEXPAND | wxALL, 5);
+
+		auto bmAoRadRow = new wxBoxSizer(wxHORIZONTAL);
+		bmAoRadRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Bitmask AO radius")), 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 20);
+		m_faro_bitmask_ao_radius = new wxSlider(graphics_panel, wxID_ANY,
+			GetConfig().faro_bitmask_ao_radius.GetValue(), 25, 400, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+		m_faro_bitmask_ao_radius->SetToolTip(_("How wide an area each pixel looks over, as a percentage of the default.\n100 keeps the radius the global illumination uses. Larger reaches the big recesses and gaps that shade a building, rather than only the small creases that shade a character - which is what makes the effect read at structure scale.\nNote this also widens the global illumination gather, since both share one set of samples."));
+		bmAoRadRow->Add(m_faro_bitmask_ao_radius, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+		m_faro_bitmask_ao_radius_text = new wxStaticText(graphics_panel, wxID_ANY,
+			wxString::Format("%d%%", GetConfig().faro_bitmask_ao_radius.GetValue()));
+		SetSliderValueWidth(m_faro_bitmask_ao_radius_text);
+		bmAoRadRow->Add(m_faro_bitmask_ao_radius_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+		m_faro_bitmask_ao_radius->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+			GetConfig().faro_bitmask_ao_radius = event.GetInt();
+			m_faro_bitmask_ao_radius_text->SetLabel(wxString::Format("%d%%", event.GetInt()));
+		});
+		box_sizer->Add(bmAoRadRow, 0, wxEXPAND | wxALL, 5);
+
 		// Anubis: real-time texture scaling. Two controls, because the factor
 		// and the VRAM ceiling are different decisions: the factor is how much
 		// sharper you want it, the ceiling is what your card can hold. Scaling
@@ -811,6 +882,17 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			});
 			texBudgetRow->Add(m_texture_scaling_budget, 1, wxEXPAND | wxALL, 5);
 			box_sizer->Add(texBudgetRow, 0, wxEXPAND);
+
+			auto* texUpscalerRow = new wxBoxSizer(wxHORIZONTAL);
+			texUpscalerRow->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Texture upscaler")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+			wxString texUpscalerChoices[] = { _("Filter (Catmull-Rom)"), _("Neural (FSRCNN, 2x only)") };
+			m_texture_scaling_upscaler = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(texUpscalerChoices), texUpscalerChoices);
+			m_texture_scaling_upscaler->SetToolTip(_("How the enlarged texture is produced.\nFilter interpolates between the pixels that already exist, so it cannot add detail - it is the cheap option and works at any factor.\nNeural runs a network trained to upscale, which reconstructs detail the filter cannot. It applies only at 2x, because the weights and the sub-pixel output layer are specific to that factor; any other factor falls back to the filter.\nNeural reconstructs brightness only - colour is interpolated - so textures whose detail lives in hue gain less."));
+			m_texture_scaling_upscaler->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
+				GetConfig().texture_scaling_upscaler = event.GetSelection();
+			});
+			texUpscalerRow->Add(m_texture_scaling_upscaler, 1, wxEXPAND | wxALL, 5);
+			box_sizer->Add(texUpscalerRow, 0, wxEXPAND);
 
 			m_texture_scaling_restore = new wxCheckBox(graphics_panel, wxID_ANY, _("Reconstruct texture detail (neural)"));
 			m_texture_scaling_restore->SetToolTip(_("Runs a small convolutional network over each texture before scaling it, to rebuild detail that compression and low resolution flattened.\nUnlike plain scaling, this can add detail that is not in the texture file - a filter can only interpolate between the pixels that already exist. It costs four extra GPU passes per texture, once, as the texture loads.\nUses Anime4K (MIT), trained on animation rather than game textures, so results vary by material."));
@@ -2522,9 +2604,17 @@ void GeneralSettings2::ApplyConfig()
 	m_faro_postfx->SetValue(config.faro_postfx_enabled);
 	m_faro_ssao->SetValue(config.faro_ssao_enabled);
 	m_faro_gi->SetValue(config.faro_gi_enabled);
+	m_faro_bitmask_ao->SetValue(config.faro_bitmask_ao_enabled);
+	m_faro_bitmask_ao_intensity->SetValue(config.faro_bitmask_ao_intensity);
+	m_faro_bitmask_ao_intensity_text->SetLabel(wxString::Format("%d%%", config.faro_bitmask_ao_intensity.GetValue()));
+	m_faro_bitmask_ao_distance->SetValue(config.faro_bitmask_ao_distance);
+	m_faro_bitmask_ao_distance_text->SetLabel(wxString::Format("%d", config.faro_bitmask_ao_distance.GetValue()));
+	m_faro_bitmask_ao_radius->SetValue(config.faro_bitmask_ao_radius);
+	m_faro_bitmask_ao_radius_text->SetLabel(wxString::Format("%d%%", config.faro_bitmask_ao_radius.GetValue()));
 	m_texture_scaling->SetSelection(std::clamp<sint32>(config.texture_scaling_factor, 1, 4) - 1);
 	m_texture_scaling_cap->SetSelection(TextureCapSizeToSelection(config.texture_scaling_max_size));
 	m_texture_scaling_budget->SetSelection(TextureBudgetMBToSelection(config.texture_scaling_vram_budget_mb));
+	m_texture_scaling_upscaler->SetSelection(std::clamp<sint32>(config.texture_scaling_upscaler, 0, 1));
 	m_texture_scaling_restore->SetValue(config.texture_scaling_restore_cnn);
 	m_faro_gi_intensity->SetValue(std::clamp<sint32>(config.faro_gi_intensity, 0, 100));
 	// Label refreshed with the slider, not after it - see the FSR sharpness

@@ -2893,7 +2893,7 @@ void VulkanRenderer::InvalidateBackbufferBlitPipelineCache()
 	m_backbufferBlitPipelineCache.clear();
 }
 
-VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader, VkRenderPass renderPass)
+VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSetLayout descriptorLayout, bool padView, RendererOutputShader* shader, VkRenderPass renderPass, bool additiveBlend)
 {
 	auto& chainInfo = GetChainInfo(!padView);
 	if (renderPass == VK_NULL_HANDLE)
@@ -2907,6 +2907,11 @@ VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSet
 	hash += (uint64)fragmentRendererShader;
 	hash += ((uint64)padView) << 1;
 	hash += (uint64)(uintptr_t)renderPass;
+	// Part of the key, not an afterthought. The FSRCNN accumulation passes use
+	// the same shader both blended and unblended - the first write overwrites,
+	// the rest add - so leaving this out of the hash would hand back whichever
+	// variant happened to be compiled first and silently break the sum.
+	hash += ((uint64)additiveBlend) << 2;
 
 	const auto it = m_backbufferBlitPipelineCache.find(hash);
 	if (it != m_backbufferBlitPipelineCache.cend())
@@ -2958,7 +2963,16 @@ VkPipeline VulkanRenderer::backbufferBlit_createGraphicsPipeline(VkDescriptorSet
 
 	VkPipelineColorBlendAttachmentState colorBlendAttachment{};
 	colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-	colorBlendAttachment.blendEnable = VK_FALSE;
+	// Additive: dst = src + dst, so each accumulation draw adds its partial sum.
+	// One over one, no alpha weighting - the values being summed are feature-map
+	// activations, not colours.
+	colorBlendAttachment.blendEnable = additiveBlend ? VK_TRUE : VK_FALSE;
+	colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+	colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
 	VkPipelineColorBlendStateCreateInfo colorBlending{};
 	colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -4621,6 +4635,23 @@ bool VulkanRenderer::RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, 
 	giUniforms.faroGtaoParams[1] = 0.04f;   // depth-similarity threshold, relative to view depth
 	giUniforms.faroGtaoParams[2] = 48.0f;   // gather radius in pixels - wider than AO's, bounce light travels further
 	giUniforms.faroGtaoParams[3] = 1000.0f; // far plane used to linearize depth
+	// Bitmask AO strength, deliberately read from its OWN setting rather than
+	// derived from the GI intensity. The two are separate effects out of the
+	// same bit field, and tying them together would mean you could not have
+	// strong occlusion with subtle bounce light, or the reverse. Zero here
+	// leaves the frame untouched even while the GI runs.
+	giUniforms.faroBitmaskAoParams[0] = GetConfig().faro_bitmask_ao_enabled.GetValue()
+		? (float)std::clamp(GetConfig().faro_bitmask_ao_intensity.GetValue(), 0, 100) / 100.0f
+		: 0.0f;
+	// Far distance for the AO's own fade. Shared with nothing: the GI keeps its
+	// 30-120 range, which suits bounce light, while the occlusion reaches much
+	// further - that fade is what confined it to whatever was nearest.
+	giUniforms.faroBitmaskAoParams[1] = (float)std::max(GetConfig().faro_bitmask_ao_distance.GetValue(), 1);
+	// Gather radius multiplier. 1.0 when the AO is off, so the GI's radius is
+	// exactly what it was and nothing about the working path moves.
+	giUniforms.faroBitmaskAoParams[2] = GetConfig().faro_bitmask_ao_enabled.GetValue()
+		? (float)std::clamp(GetConfig().faro_bitmask_ao_radius.GetValue(), 25, 400) / 100.0f
+		: 1.0f;
 	auto giUniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&giUniforms, sizeof(decltype(giUniforms)) });
 
 	// === draw 1: scene colour + depth -> m_giScratch (raw, noisy gather) ===
@@ -10514,6 +10545,27 @@ bool VulkanRenderer::AnubisBuildUpscaledTexture(LatteTextureVk* tex, sint32 scal
 	if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
 		return false;
 
+	// FSRCNN replaces the whole upscale when selected, rather than feeding it.
+	//
+	// Anime4K restores detail at native resolution and leaves the enlargement
+	// to a filter; FSRCNN was trained to do the enlargement itself, so its
+	// final sub-pixel layer IS the upscale. Running a filter after it would
+	// resample what the network already placed.
+	//
+	// Returning false falls through to the filter path below, which is what
+	// happens at any factor other than 2 or for a texture above the scratch
+	// size.
+	if (GetConfig().texture_scaling_upscaler.GetValue() == 1)
+	{
+		if (AnubisRunFsrcnnChain(srcView, srcViewObj, tex->width, tex->height, fb, cachedRP, scaledW, scaledH))
+		{
+			auto* fbObj = new AnubisUpscaleFramebuffer(m_logicalDevice, fb);
+			fbObj->flagForCurrentCommandBuffer();
+			ReleaseDestructibleObject(fbObj);
+			return true;
+		}
+	}
+
 	// Anime4K restore BEFORE the upscale, when enabled.
 	//
 	// The order matters both ways round. The network was trained to repair
@@ -10991,4 +11043,426 @@ VkImageView VulkanRenderer::AnubisRunRestoreChain(LatteTextureViewVk* srcView, V
 	m_a4kRestoreCount++;
 	// Scratch 0 holds the residual output of pass 3.
 	return m_a4kScratchView[0];
+}
+
+// ===================== Anubis FSRCNN-small x2 =====================
+//
+// Thirteen float targets at a fixed 1024x1024, allocated once:
+//   feat[0..7]   32 channels - f1's output, then reused for f4's
+//   shrink[0..1]  5 channels - f2's output
+//   map[0..1]     5 channels - f3's output
+//   subpix        4 channels - f5's output, the 2x2 block
+//
+// feat is reused for f4 because f2 has already consumed f1's output by then.
+// shrink and map cannot share, because f3 reads shrink while writing map and
+// a single target would be a read-write hazard inside one pass.
+//
+// 1024 rather than 2048: thirteen RGBA16F targets are 8 MB each at 1024 and
+// 32 MB at 2048, so 104 MB against 416 MB. Source textures above 1024 skip the
+// network - which is a cap on the SOURCE, so a 1024 texture still produces a
+// 2048 result.
+//
+// Allocated once and never resized, for the same reason as the Anime4K
+// scratch: resizing means destroying images a submitted command buffer may
+// still read, and WaitDeviceIdle does not cover that - it waits for SUBMITTED
+// work, not for the buffer being recorded.
+bool VulkanRenderer::AnubisEnsureFsrcnnScratch()
+{
+	if (m_fsrcnnScratchReady)
+		return true;
+	if (m_fsrcnnScratchFailed)
+		return false;
+
+	for (int i = 0; i < kAnubisFsrcnnTargets; i++)
+	{
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent = { kAnubisFsrcnnDim, kAnubisFsrcnnDim, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		// SFLOAT because feature-map activations are signed and unbounded. A
+		// UNORM target would clamp every negative to zero, and PReLU's whole
+		// purpose is to carry the negative side forward.
+		imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_fsrcnnImage[i]) != VK_SUCCESS)
+		{
+			m_fsrcnnImage[i] = VK_NULL_HANDLE;
+			m_fsrcnnScratchFailed = true;
+			cemuLog_log(LogType::Force, "Anubis FSRCNN: could not create target {} - disabled", i);
+			return false;
+		}
+		m_fsrcnnAllocation[i] = memoryManager->imageMemoryAllocate(m_fsrcnnImage[i]);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_fsrcnnImage[i];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_fsrcnnView[i]) != VK_SUCCESS)
+		{
+			m_fsrcnnView[i] = VK_NULL_HANDLE;
+			m_fsrcnnScratchFailed = true;
+			return false;
+		}
+	}
+
+	if (m_fsrcnnSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		// NEAREST. A convolution addresses exact texels; linear filtering would
+		// blend neighbouring feature-map values and the kernel would no longer
+		// be reading what it was trained on.
+		samplerInfo.magFilter = VK_FILTER_NEAREST;
+		samplerInfo.minFilter = VK_FILTER_NEAREST;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_fsrcnnSampler) != VK_SUCCESS)
+		{
+			m_fsrcnnScratchFailed = true;
+			return false;
+		}
+	}
+
+	m_fsrcnnScratchReady = true;
+	cemuLog_log(LogType::Force, "Anubis FSRCNN: {} targets ready at {}x{} RGBA16F ({} MB total)",
+		kAnubisFsrcnnTargets, kAnubisFsrcnnDim, kAnubisFsrcnnDim,
+		(uint64)kAnubisFsrcnnDim * kAnubisFsrcnnDim * 8ull * kAnubisFsrcnnTargets / (1024ull * 1024ull));
+	return true;
+}
+
+// The 31-pass schedule, as data rather than control flow.
+//
+// A table because the alternative - five hand-written loops with their own
+// binding rules - is where an off-by-one silently rewires the network into
+// something that still renders and is wrong. Here the wiring is readable in
+// one place and can be checked against the architecture.
+//
+// src0/src1 are indices into the target array, or kFsrcnnSrcTexture for the
+// game texture itself. dst is the target written. blend=false means this draw
+// overwrites; true means it adds. Each accumulation group's FIRST pass must
+// overwrite, because the render pass uses loadOp DONT_CARE and blending onto
+// undefined contents would sum garbage.
+namespace
+{
+	constexpr int kFsrcnnSrcTexture = -1;
+	constexpr int kFsrcnnNoSrc = -2;
+
+	struct AnubisFsrcnnStep
+	{
+		int src0;
+		int src1;
+		int dst;
+		bool blend;
+	};
+
+	// Target indices: 0-7 feat, 8-9 shrink, 10-11 map, 12 subpix.
+	constexpr int F = 0, SH = 8, MP = 10, SP = 12;
+
+	constexpr AnubisFsrcnnStep kFsrcnnSchedule[31] = {
+		// f1: luma -> 32 features. Reads the game texture, writes feat[0..7].
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 0, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 1, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 2, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 3, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 4, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 5, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 6, false },
+		{ kFsrcnnSrcTexture, kFsrcnnNoSrc, F + 7, false },
+		// f2: 32 -> 5, summed eight input channels at a time into shrink[0].
+		{ F + 0, F + 1, SH + 0, false },
+		{ F + 2, F + 3, SH + 0, true },
+		{ F + 4, F + 5, SH + 0, true },
+		{ F + 6, F + 7, SH + 0, true },
+		// ...and into shrink[1], which carries the fifth channel.
+		{ F + 0, F + 1, SH + 1, false },
+		{ F + 2, F + 3, SH + 1, true },
+		{ F + 4, F + 5, SH + 1, true },
+		{ F + 6, F + 7, SH + 1, true },
+		// f3: mapping, 5 -> 5, reading both shrink targets.
+		{ SH + 0, SH + 1, MP + 0, false },
+		{ SH + 0, SH + 1, MP + 1, false },
+		// f4: 5 -> 32, back into feat, which f2 has finished with.
+		{ MP + 0, MP + 1, F + 0, false },
+		{ MP + 0, MP + 1, F + 1, false },
+		{ MP + 0, MP + 1, F + 2, false },
+		{ MP + 0, MP + 1, F + 3, false },
+		{ MP + 0, MP + 1, F + 4, false },
+		{ MP + 0, MP + 1, F + 5, false },
+		{ MP + 0, MP + 1, F + 6, false },
+		{ MP + 0, MP + 1, F + 7, false },
+		// f5: 32 -> the four sub-pixel values, summed.
+		{ F + 0, F + 1, SP, false },
+		{ F + 2, F + 3, SP, true },
+		{ F + 4, F + 5, SP, true },
+		{ F + 6, F + 7, SP, true },
+		// Reconstruction runs at 2x and writes the upscaled copy, so its dst is
+		// handled by the caller rather than being a scratch index.
+		{ SP, kFsrcnnSrcTexture, -1, false },
+	};
+}
+
+// Runs the FSRCNN chain. Returns true when the final reconstruction was
+// recorded into dstFramebuffer; false means nothing was drawn and the caller
+// should fall back to its own upscale.
+bool VulkanRenderer::AnubisRunFsrcnnChain(LatteTextureViewVk* srcView, VKRObjectTextureView* srcViewObj,
+	sint32 width, sint32 height, VkFramebuffer dstFramebuffer, VkRenderPass dstRenderPass, sint32 dstWidth, sint32 dstHeight)
+{
+	// x2 only. The weights are FSRCNN_x2 and the sub-pixel layer emits exactly
+	// a 2x2 block; x3 and x4 are separate checkpoints with 9 and 16 outputs.
+	// Running this at any other factor would place sub-pixels wrongly.
+	if (LatteTexScale_GetFactor() != 2)
+		return false;
+	if ((uint32)width > kAnubisFsrcnnDim || (uint32)height > kAnubisFsrcnnDim)
+		return false;
+	if (!AnubisEnsureFsrcnnScratch())
+		return false;
+	for (int i = 0; i < 31; i++)
+	{
+		if (!RendererOutputShader::s_fsrcnn_pass[i])
+			return false;
+	}
+
+	// One render pass for the float targets, created once; pipelines are keyed
+	// on the render pass handle, so a per-texture one would churn the cache.
+	if (m_fsrcnnRenderPass == VK_NULL_HANDLE)
+	{
+		VkAttachmentDescription colorAttachment{};
+		colorAttachment.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		// LOAD, not DONT_CARE: the accumulation passes blend onto what the
+		// previous pass in their group wrote, so the contents must survive.
+		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkAttachmentReference colorRef{};
+		colorRef.attachment = 0;
+		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription subpass{};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef;
+		VkRenderPassCreateInfo rpInfo{};
+		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		rpInfo.attachmentCount = 1;
+		rpInfo.pAttachments = &colorAttachment;
+		rpInfo.subpassCount = 1;
+		rpInfo.pSubpasses = &subpass;
+		if (vkCreateRenderPass(m_logicalDevice, &rpInfo, nullptr, &m_fsrcnnRenderPass) != VK_SUCCESS)
+		{
+			m_fsrcnnRenderPass = VK_NULL_HANDLE;
+			return false;
+		}
+	}
+
+	// LOAD_OP_LOAD needs the targets to already be in SHADER_READ_ONLY_OPTIMAL,
+	// and a freshly created image is UNDEFINED. One transition on first use,
+	// which also makes the first accumulation group's LOAD well defined.
+	if (!m_fsrcnnTargetsInitialised)
+	{
+		for (int i = 0; i < kAnubisFsrcnnTargets; i++)
+		{
+			VkImageMemoryBarrier barrier{};
+			barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.image = m_fsrcnnImage[i];
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		}
+		m_fsrcnnTargetsInitialised = true;
+	}
+
+	for (int step = 0; step < 31; step++)
+	{
+		const AnubisFsrcnnStep& s = kFsrcnnSchedule[step];
+		const bool isRecon = (step == 30);
+
+		// Reconstruction draws at the ENLARGED size into the caller's target;
+		// every other pass draws at the source size into a scratch target.
+		const sint32 passW = isRecon ? dstWidth : width;
+		const sint32 passH = isRecon ? dstHeight : height;
+		VkRenderPass rp = isRecon ? dstRenderPass : m_fsrcnnRenderPass;
+
+		VkFramebuffer fb = dstFramebuffer;
+		if (!isRecon)
+		{
+			VkImageView attachments[1] = { m_fsrcnnView[s.dst] };
+			VkFramebufferCreateInfo fbInfo{};
+			fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+			fbInfo.renderPass = rp;
+			fbInfo.attachmentCount = 1;
+			fbInfo.pAttachments = attachments;
+			fbInfo.width = (uint32)passW;
+			fbInfo.height = (uint32)passH;
+			fbInfo.layers = 1;
+			if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
+				return false;
+		}
+
+		auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, false,
+			RendererOutputShader::s_fsrcnn_pass[step], rp, s.blend);
+		if (pipeline == VK_NULL_HANDLE)
+		{
+			if (!isRecon)
+				vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+			return false;
+		}
+
+		VKRObjectDescriptorSet* dsObj = new VKRObjectDescriptorSet();
+		VkDescriptorSet ds = VK_NULL_HANDLE;
+		{
+			VkDescriptorSetAllocateInfo allocInfo{};
+			allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			allocInfo.descriptorPool = m_descriptorPool;
+			allocInfo.descriptorSetCount = 1;
+			allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
+			if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &ds) != VK_SUCCESS)
+			{
+				delete dsObj;
+				if (!isRecon)
+					vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
+				return false;
+			}
+			dsObj->descriptorSet = ds;
+			performanceMonitor.vk.numDescriptorSets.increment();
+
+			auto resolveSrc = [&](int idx, VkDescriptorImageInfo& info) {
+				info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				if (idx == kFsrcnnSrcTexture)
+				{
+					info.imageView = srcViewObj->m_textureImageView;
+					info.sampler = m_anubisUpscaleSampler;
+				}
+				else if (idx >= 0)
+				{
+					info.imageView = m_fsrcnnView[idx];
+					info.sampler = m_fsrcnnSampler;
+				}
+				else
+				{
+					// Unused slot. Still pointed at something valid, because a
+					// descriptor the shader can reach must never be undefined.
+					info.imageView = srcViewObj->m_textureImageView;
+					info.sampler = m_anubisUpscaleSampler;
+				}
+			};
+			VkDescriptorImageInfo info0{}, info2{};
+			resolveSrc(s.src0, info0);
+			resolveSrc(s.src1, info2);
+
+			VkDescriptorBufferInfo uniformBufferInfo{};
+			uniformBufferInfo.buffer = m_uniformVarBuffer;
+			uniformBufferInfo.offset = 0;
+			uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
+
+			VkWriteDescriptorSet writes[3]{};
+			writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[0].dstSet = ds;
+			writes[0].dstBinding = 0;
+			writes[0].descriptorCount = 1;
+			writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writes[0].pImageInfo = &info0;
+			writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[1].dstSet = ds;
+			writes[1].dstBinding = 1;
+			writes[1].descriptorCount = 1;
+			writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+			writes[1].pBufferInfo = &uniformBufferInfo;
+			writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[2].dstSet = ds;
+			writes[2].dstBinding = 2;
+			writes[2].descriptorCount = 1;
+			writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writes[2].pImageInfo = &info2;
+			vkUpdateDescriptorSets(m_logicalDevice, 3, writes, 0, nullptr);
+		}
+
+		draw_endRenderPass();
+
+		VkRenderPassBeginInfo rpBegin{};
+		rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		rpBegin.renderPass = rp;
+		rpBegin.framebuffer = fb;
+		rpBegin.renderArea.offset = { 0, 0 };
+		rpBegin.renderArea.extent = { (uint32)passW, (uint32)passH };
+		rpBegin.clearValueCount = 0;
+
+		VkViewport viewport{};
+		viewport.x = 0.0f;
+		viewport.y = 0.0f;
+		viewport.width = (float)passW;
+		viewport.height = (float)passH;
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		VkRect2D scissor{};
+		scissor.offset = { 0, 0 };
+		scissor.extent = { (uint32)passW, (uint32)passH };
+		vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+
+		vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_state.currentPipeline = pipeline;
+
+		// textureSrcResolution always describes the SOURCE resolution, even for
+		// the reconstruction pass. The convolutions derive their one-texel
+		// offsets from it, and the reconstruction uses it to work out which of
+		// the four sub-pixels an output pixel is. Passing the enlarged size
+		// would break both.
+		auto uniforms = RendererOutputShader::s_fsrcnn_pass[step]->FillUniformBlockBuffer(*srcView, { passW, passH }, false);
+		uniforms.applySRGBEncoding = false;
+		uniforms.targetGamma = uniforms.displayGamma;
+		uniforms.textureSrcResolution = { (float)width, (float)height };
+		auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ds, 1, &uniformOffset);
+		vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+		// Writes must land before the next pass samples them. Without this the
+		// convolutions would read whatever was resident and the output would be
+		// noise - and it would look like a weights bug, not a sync bug.
+		VkMemoryBarrier chainBarrier{};
+		chainBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		chainBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+		chainBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0, 1, &chainBarrier, 0, nullptr, 0, nullptr);
+
+		if (!isRecon)
+		{
+			auto* fbObj = new AnubisUpscaleFramebuffer(m_logicalDevice, fb);
+			fbObj->flagForCurrentCommandBuffer();
+			ReleaseDestructibleObject(fbObj);
+		}
+		dsObj->flagForCurrentCommandBuffer();
+		ReleaseDestructibleObject(dsObj);
+	}
+
+	m_fsrcnnRunCount++;
+	return true;
 }

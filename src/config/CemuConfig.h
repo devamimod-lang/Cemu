@@ -674,6 +674,27 @@ struct CemuConfig
 	// texture's native resolution, which is what the network was trained for
 	// and far cheaper than running it on the enlarged image.
 	ConfigValue<bool> texture_scaling_restore_cnn{false};
+	// Which upscaler builds the enlarged copy.
+	//   0 = Catmull-Rom filter (measured as not worth its cost - kept because it
+	//       is the cheap fallback and works at any factor)
+	//   1 = FSRCNN-small x2, trained to upscale; falls back to 0 at any other
+	//       factor, since the weights and sub-pixel layer are x2-specific
+	ConfigValue<sint32> texture_scaling_upscaler{0};
+	// Bitmask ambient occlusion, from the same visibility bit field the GI
+	// builds (Therrien et al. 2023). Independent of the SSAO on purpose: both
+	// can be enabled, they are different estimators, and the horizon-based one
+	// cannot let light pass behind thin surfaces while this one can.
+	ConfigValue<bool> faro_bitmask_ao_enabled{false};
+	ConfigValue<sint32> faro_bitmask_ao_intensity{60};
+	// Far distance in linearized depth units where this AO reaches zero; the
+	// fade starts at half of it. 400 rather than the GI's 120, because the GI's
+	// fade is what confined the occlusion to whatever was nearest - structures
+	// generally sit further out than a character.
+	ConfigValue<sint32> faro_bitmask_ao_distance{400};
+	// Gather radius multiplier, as a percentage. 100 leaves the GI radius exactly
+	// as it is; higher reaches the larger recesses that give a building its
+	// shading, at the cost of a coarser march for the same step count.
+	ConfigValue<sint32> faro_bitmask_ao_radius{100};
 	ConfigValue<sint32> faro_shadow_scale{1};
 
 	// audio

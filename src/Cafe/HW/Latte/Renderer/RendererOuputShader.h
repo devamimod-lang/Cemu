@@ -112,6 +112,7 @@ public:
 	// FSRCNN-small x2 chain, in execution order. See AnubisRunFsrcnnChain for
 	// which target each one writes and why the order cannot change.
 	static RendererOutputShader* s_fsrcnn_pass[31];
+	static RendererOutputShader* s_anubis_water_ssr_shader;
 	static RendererOutputShader* s_lanczos_shader;
 	static RendererOutputShader* s_lanczos_shader_ud;
 
@@ -302,6 +303,9 @@ private:
 	static const std::string s_fsrcnn_f5_a2_source;
 	static const std::string s_fsrcnn_f5_a3_source;
 	static const std::string s_fsrcnn_recon_source;
+	// Anubis water reflections - see the source for why this exists and what
+	// the game's own pass does not do.
+	static const std::string s_anubis_water_ssr_source;
 
 	static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;

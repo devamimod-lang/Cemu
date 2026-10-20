@@ -7138,6 +7138,11 @@ void VulkanRenderer::OnFaroFrameBoundary()
 	// intended behaviour and turns an indefinite freeze into a fallback.
 	if (m_faroDepthSnapshotValid && ++m_faroDepthSnapshotAge > 2)
 		m_faroDepthSnapshotValid = false;
+	// Colour ages with it. A snapshot that stops refreshing must INVALIDATE
+	// rather than linger: the depth path documents what happens otherwise -
+	// readers keep using a frozen capture instead of falling back.
+	if (m_faroColourSnapshotValid && m_faroDepthSnapshotAge > 2)
+		m_faroColourSnapshotValid = false;
 
 	if (m_faroDepthSnapshotPendingFormat == VK_FORMAT_UNDEFINED)
 		return;
@@ -7148,6 +7153,16 @@ void VulkanRenderer::OnFaroFrameBoundary()
 	// not retried on every single frame.
 	m_faroDepthSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
 	EnsureFaroDepthSnapshotTarget(format, width, height);
+
+	// Colour, same deferral and for the same reason.
+	if (m_faroColourSnapshotPendingFormat != VK_FORMAT_UNDEFINED)
+	{
+		const VkFormat cFormat = m_faroColourSnapshotPendingFormat;
+		const uint32 cWidth = m_faroColourSnapshotPendingWidth;
+		const uint32 cHeight = m_faroColourSnapshotPendingHeight;
+		m_faroColourSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
+		EnsureFaroColourSnapshotTarget(cFormat, cWidth, cHeight);
+	}
 }
 
 // Deferred allocation of every Faro target that is requested from a point
@@ -11464,5 +11479,212 @@ bool VulkanRenderer::AnubisRunFsrcnnChain(LatteTextureViewVk* srcView, VKRObject
 	}
 
 	m_fsrcnnRunCount++;
+	return true;
+}
+
+// Copies the scene colour mid-frame, so a later pass can READ what the scene
+// looked like without sampling the surface it is drawing into.
+//
+// Mirrors CaptureSceneDepthSnapshot deliberately, including the part that is
+// easy to get wrong: when the size or format does not match, this records the
+// requirement and returns WITHOUT copying, leaving the recreation to the frame
+// boundary. Creating images from here - the framebuffer-bind path, mid-command-
+// buffer - is the single most intrusive thing this renderer does, and
+// WaitDeviceIdle cannot make it safe because it waits for SUBMITTED work, not
+// for the buffer being recorded.
+//
+// Why a copy is needed at all: Breath of the Wild's water reflection is
+// generated into its own 640x384 target, and improving it means reading the
+// scene colour. Reading the live colour buffer while the GPU draws into it is
+// a feedback loop, and the guest shader cannot be handed a fourth texture
+// either - the texture bind loop only walks the units the shader's
+// resourceMapping declares, which is why no graphic pack can add an input.
+// A private copy sidesteps both.
+void VulkanRenderer::CaptureSceneColourSnapshot(LatteTextureView* colourView)
+{
+	if (!GetConfig().faro_colour_snapshot)
+	{
+		// Invalidated rather than just skipped. The validity flag is sticky, so
+		// merely stopping the copies would leave readers using the LAST
+		// snapshot - frozen forever instead of falling back - which is exactly
+		// the defect the depth path documents.
+		m_faroColourSnapshotValid = false;
+		return;
+	}
+	if (!colourView || !colourView->baseTexture)
+		return;
+	auto* colourTexVk = static_cast<LatteTextureVk*>(colourView->baseTexture);
+	if (!colourTexVk->GetImageObj() || colourTexVk->GetImageObj()->m_image == VK_NULL_HANDLE)
+		return;
+	if ((colourTexVk->GetImageAspect() & VK_IMAGE_ASPECT_COLOR_BIT) == 0)
+		return;
+
+	sint32 width, height;
+	colourView->baseTexture->GetEffectiveSize(width, height, colourView->firstMip);
+	if (width <= 0 || height <= 0)
+		return;
+
+	if (m_faroColourSnapshotImage == VK_NULL_HANDLE ||
+		m_faroColourSnapshotFormat != colourTexVk->GetFormat() ||
+		m_faroColourSnapshotExtent.width != (uint32)width ||
+		m_faroColourSnapshotExtent.height != (uint32)height)
+	{
+		m_faroColourSnapshotPendingFormat = colourTexVk->GetFormat();
+		m_faroColourSnapshotPendingWidth = (uint32)width;
+		m_faroColourSnapshotPendingHeight = (uint32)height;
+		return; // no snapshot this frame; the reader falls back
+	}
+
+	draw_endRenderPass();
+	if (m_state.currentCommandBuffer == VK_NULL_HANDLE)
+		return;
+
+	VkImageSubresourceLayers srcLayers{};
+	srcLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	srcLayers.mipLevel = colourView->firstMip;
+	srcLayers.baseArrayLayer = colourView->firstSlice;
+	srcLayers.layerCount = 1;
+	barrier_image<IMAGE_WRITE | TRANSFER_WRITE, SYNC_OP::TRANSFER_READ>(colourTexVk, srcLayers, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+	VkImageSubresourceRange dstRange{};
+	dstRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	dstRange.baseMipLevel = 0;
+	dstRange.levelCount = 1;
+	dstRange.baseArrayLayer = 0;
+	dstRange.layerCount = 1;
+	barrier_image<SYNC_OP::IMAGE_READ, SYNC_OP::TRANSFER_WRITE>(m_faroColourSnapshotImage, dstRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+	VkImageCopy region{};
+	region.srcSubresource = srcLayers;
+	region.srcSubresource.layerCount = 1;
+	region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.dstSubresource.mipLevel = 0;
+	region.dstSubresource.baseArrayLayer = 0;
+	region.dstSubresource.layerCount = 1;
+	region.extent = { (uint32)width, (uint32)height, 1 };
+	vkCmdCopyImage(m_state.currentCommandBuffer,
+		colourTexVk->GetImageObj()->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		m_faroColourSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &region);
+
+	// Left ready to sample, so a reader needs no transition of its own.
+	barrier_image<SYNC_OP::TRANSFER_WRITE, SYNC_OP::IMAGE_READ>(m_faroColourSnapshotImage, dstRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	m_faroColourSnapshotValid = true;
+	m_faroColourSnapshotCount++;
+}
+
+void VulkanRenderer::DestroyFaroColourSnapshotTarget()
+{
+	if (m_faroColourSnapshotSampler != VK_NULL_HANDLE)
+	{
+		vkDestroySampler(m_logicalDevice, m_faroColourSnapshotSampler, nullptr);
+		m_faroColourSnapshotSampler = VK_NULL_HANDLE;
+	}
+	if (m_faroColourSnapshotView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_logicalDevice, m_faroColourSnapshotView, nullptr);
+		m_faroColourSnapshotView = VK_NULL_HANDLE;
+	}
+	if (m_faroColourSnapshotAllocation)
+	{
+		memoryManager->imageMemoryFree(m_faroColourSnapshotAllocation);
+		m_faroColourSnapshotAllocation = nullptr;
+	}
+	if (m_faroColourSnapshotImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_faroColourSnapshotImage, nullptr);
+		m_faroColourSnapshotImage = VK_NULL_HANDLE;
+	}
+	m_faroColourSnapshotExtent = {};
+	m_faroColourSnapshotFormat = VK_FORMAT_UNDEFINED;
+	m_faroColourSnapshotValid = false;
+}
+
+// Allocates the scene-colour snapshot. Called ONLY from the frame boundary via
+// the pending-format mechanism, never from the capture path - the capture runs
+// mid-command-buffer and creating images there is what the deferral exists to
+// avoid. The WaitDeviceIdle below is safe for that reason and only that reason.
+bool VulkanRenderer::EnsureFaroColourSnapshotTarget(VkFormat format, uint32 width, uint32 height)
+{
+	if (width == 0 || height == 0 || format == VK_FORMAT_UNDEFINED)
+		return false;
+	if (m_faroColourSnapshotImage != VK_NULL_HANDLE && m_faroColourSnapshotExtent.width == width &&
+		m_faroColourSnapshotExtent.height == height && m_faroColourSnapshotFormat == format)
+		return true;
+
+	WaitDeviceIdle();
+	DestroyFaroColourSnapshotTarget();
+
+	// Checked rather than assumed: the scene colour format comes from the game,
+	// and a format the GPU cannot both receive a transfer into and sample from
+	// would fail at copy time with nothing to explain it.
+	VkFormatProperties formatProps{};
+	vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &formatProps);
+	const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+	if ((formatProps.optimalTilingFeatures & required) != required)
+	{
+		cemuLog_log(LogType::Force, "Faro colour snapshot: format {} cannot be a sampled transfer destination on this GPU - reflections will keep using the game's own sky fallback", (uint32)format);
+		return false;
+	}
+
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent = { width, height, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = format;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_faroColourSnapshotImage) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro colour snapshot: failed to create image");
+		DestroyFaroColourSnapshotTarget();
+		return false;
+	}
+	m_faroColourSnapshotAllocation = memoryManager->imageMemoryAllocate(m_faroColourSnapshotImage);
+
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = m_faroColourSnapshotImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_faroColourSnapshotView) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro colour snapshot: failed to create view");
+		DestroyFaroColourSnapshotTarget();
+		return false;
+	}
+
+	VkSamplerCreateInfo samplerInfo{};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	// LINEAR here, unlike the convolution samplers elsewhere: a reflection ray
+	// lands between texels and wants them blended, not snapped.
+	samplerInfo.magFilter = VK_FILTER_LINEAR;
+	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.minLod = 0.0f;
+	samplerInfo.maxLod = 0.0f;
+	if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_faroColourSnapshotSampler) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "Faro colour snapshot: failed to create sampler");
+		DestroyFaroColourSnapshotTarget();
+		return false;
+	}
+
+	m_faroColourSnapshotExtent = { width, height };
+	m_faroColourSnapshotFormat = format;
+	m_faroColourSnapshotValid = false;
+	cemuLog_log(LogType::Force, "Faro colour snapshot: target ready at {}x{} format {}", width, height, (uint32)format);
 	return true;
 }

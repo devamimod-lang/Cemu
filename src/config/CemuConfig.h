@@ -585,6 +585,10 @@ struct CemuConfig
 	// path; ReShade ships its own equivalent (preserve_depth_buffers) off by
 	// default for the same kind of reason.
 	ConfigValue<bool> faro_depth_snapshot{false};
+	// Scene colour snapshot. Same opt-in reasoning as the depth one: the copy
+	// is recorded mid-frame from the framebuffer-bind path, the most intrusive
+	// place this renderer touches.
+	ConfigValue<bool> faro_colour_snapshot{false};
 
 	// Faro: output an intermediate buffer of the AO chain instead of the
 	// shaded image, to localise instability by eye. CPU counters can prove a

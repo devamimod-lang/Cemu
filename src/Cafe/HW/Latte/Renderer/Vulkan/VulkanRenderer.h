@@ -427,6 +427,9 @@ public:
 
 	// Faro scene-depth snapshot - see Renderer::CaptureSceneDepthSnapshot.
 	void CaptureSceneDepthSnapshot(LatteTextureView* depthView) override;
+	void CaptureSceneColourSnapshot(LatteTextureView* colourView) override;
+	bool EnsureFaroColourSnapshotTarget(VkFormat format, uint32 width, uint32 height);
+	void DestroyFaroColourSnapshotTarget();
 	void OnFaroFrameBoundary() override;
 	void DestroyTaaHistoryTarget();
 	// (Re)creates the native-resolution target that the TAA resolve pass
@@ -847,6 +850,23 @@ private:
 	VkFormat m_faroDepthSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
 	uint32 m_faroDepthSnapshotPendingWidth = 0;
 	uint32 m_faroDepthSnapshotPendingHeight = 0;
+
+	// Scene colour snapshot, the exact counterpart of the depth one above.
+	// Needed because improving a reflection means READING the scene, and
+	// sampling the live colour buffer while the GPU draws into it is a feedback
+	// loop - while handing the guest shader an extra texture is impossible,
+	// since the bind loop only walks the units its resourceMapping declares.
+	VkImage m_faroColourSnapshotImage = VK_NULL_HANDLE;
+	VkImageMemAllocation* m_faroColourSnapshotAllocation = nullptr;
+	VkImageView m_faroColourSnapshotView = VK_NULL_HANDLE;
+	VkSampler m_faroColourSnapshotSampler = VK_NULL_HANDLE;
+	VkExtent2D m_faroColourSnapshotExtent{};
+	VkFormat m_faroColourSnapshotFormat = VK_FORMAT_UNDEFINED;
+	bool m_faroColourSnapshotValid = false;
+	uint32 m_faroColourSnapshotCount = 0;
+	VkFormat m_faroColourSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
+	uint32 m_faroColourSnapshotPendingWidth = 0;
+	uint32 m_faroColourSnapshotPendingHeight = 0;
 
 	bool EnsureFaroDepthSnapshotTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyFaroDepthSnapshotTarget();

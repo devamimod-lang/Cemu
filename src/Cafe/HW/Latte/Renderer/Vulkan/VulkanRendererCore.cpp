@@ -736,107 +736,6 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 		info.imageView = imageViewObj->m_textureImageView;
 		vkObjDS->addRef(imageViewObj);
 
-		// Anubis water-reflection reconnaissance.
-		//
-		// Breath of the Wild's water reflection is pixel shader
-		// 340382e6fbbb3951, and reading its decompiled source settles what the
-		// effect actually is: its three inputs are a sky cubemap array, the
-		// depth buffer, and the water's normal map - unpacked with the
-		// characteristic x*2-1. There is NO scene-colour input anywhere in the
-		// 699 lines. So the water reflects the SKY, and the four depth taps
-		// only attenuate that reflection where geometry blocks it. Reflecting
-		// the world is not low-quality here, it is absent.
-		//
-		// That is also why the community "Reflection Range" mod can only move a
-		// constant: a graphic pack replaces a shader's body, not its inputs,
-		// and there is no customTexture mechanism in the pack system. The
-		// emulator can bind an extra texture; a pack cannot.
-		//
-		// What this logging is for: deciding WHICH scene colour to hand it.
-		// This frame's colour may not be complete when the water draws, and the
-		// previous frame's is complete but a frame stale. That is an empirical
-		// question about draw order in this title, not something to assume - so
-		// it records the draw index where the water appears and what the colour
-		// target looks like at that moment, and nothing else. No behaviour
-		// changes here.
-		if (shader->shaderType == LatteConst::ShaderType::Pixel && shader->baseHash == 0x340382e6fbbb3951ull)
-		{
-			// How OFTEN the pass runs, which decides the whole design.
-			//
-			// The first run logged a single line across a whole session, so
-			// either the reflection buffer is generated once and reused - in
-			// which case improving it is nearly free but the result cannot
-			// follow the camera - or the pass simply ran once because water was
-			// barely on screen. Those lead to different shaders, so counting
-			// beats assuming.
-			//
-			// Counts draws and distinct frames over a 600-frame window: draws
-			// per frame says whether it is one pass or many, and frames-with-
-			// water over 600 says whether it is per-frame or cached.
-			{
-				static uint32 s_windowFrames = 0;
-				static uint32 s_windowDraws = 0;
-				static uint32 s_windowFramesWithWater = 0;
-				static uint32 s_lastCountedFrame = 0xFFFFFFFF;
-				if (m_anubisFrameCounter != s_lastCountedFrame)
-				{
-					s_lastCountedFrame = m_anubisFrameCounter;
-					s_windowFramesWithWater++;
-				}
-				s_windowDraws++;
-				// The window is advanced by the frame counter rather than by
-				// draws, so a quiet period cannot stretch it indefinitely.
-				static uint32 s_windowStartFrame = 0;
-				if (m_anubisFrameCounter - s_windowStartFrame >= 600)
-				{
-					cemuLog_log(LogType::Force,
-						"Anubis water reflect: {} draws across {} of the last 600 frames ({:.1f} draws per water frame)",
-						s_windowDraws, s_windowFramesWithWater,
-						s_windowFramesWithWater ? (double)s_windowDraws / (double)s_windowFramesWithWater : 0.0);
-					s_windowStartFrame = m_anubisFrameCounter;
-					s_windowDraws = 0;
-					s_windowFramesWithWater = 0;
-				}
-			}
-
-			static uint32 s_waterSeenFrames = 0;
-			static uint32 s_lastLoggedFrame = 0xFFFFFFFF;
-			if (s_waterSeenFrames < 6 && m_anubisFrameCounter != s_lastLoggedFrame)
-			{
-				s_lastLoggedFrame = m_anubisFrameCounter;
-				s_waterSeenFrames++;
-				// The FBO the emulated GPU is drawing into. Its colour
-				// attachment is the candidate to read reflections from, and
-				// whether reading it is even legal is the thing to find out:
-				// if the water draws into the SAME target, sampling it is a
-				// feedback loop and the colour has to be snapshotted before
-				// the water pass instead - which is what the existing
-				// CaptureSceneDepthSnapshot already does for depth.
-				CachedFBOVk* fbo = m_state.activeFBO;
-				// The colour attachment's guest physical address, which is what
-				// identifies the target rather than a host pointer that moves
-				// between runs. The decisive question is whether this is the
-				// same surface as the main scene colour: if it is, sampling it
-				// here is a feedback loop; if it is a separate buffer - and
-				// 640x384 against a 720p scene says it is - then the scene
-				// colour can simply be bound as an extra input with no copy at
-				// all.
-				MPTR colourAddr = 0;
-				uint32 colourFmt = 0;
-				if (fbo && fbo->colorBuffer[0].texture)
-				{
-					colourAddr = fbo->colorBuffer[0].texture->baseTexture->physAddress;
-					colourFmt = (uint32)fbo->colorBuffer[0].texture->baseTexture->format;
-				}
-				cemuLog_log(LogType::Force,
-					"Anubis water reflect: aux {:016x} | frame {} | fbo size {}x{} colourAddr {:08x} fmt {:04x} | depth {} | tex unit {} dim {:#x}",
-					shader->auxHash, m_anubisFrameCounter,
-					fbo ? fbo->m_size.x : 0, fbo ? fbo->m_size.y : 0,
-					colourAddr, colourFmt,
-					(fbo && fbo->depthBuffer.texture) ? "yes" : "no",
-					hostTextureUnit, (uint32)textureDim);
-			}
-		}
 
 		// Anubis GPU texture upscaling: the single substitution point.
 		//
@@ -1292,6 +1191,7 @@ void VulkanRenderer::draw_prepareDescriptorSets(PipelineInfo* pipeline_info, VkD
 	const auto vertexShader = LatteSHRC_GetActiveVertexShader();
 	const auto geometryShader = LatteSHRC_GetActiveGeometryShader();
 	const auto pixelShader = LatteSHRC_GetActivePixelShader();
+
 
 	auto prepareShaderDescriptors = [this, &pipeline_info](LatteDecompilerShader* shader) -> VkDescriptorSetInfo* {
 		if (!shader)

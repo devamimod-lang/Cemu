@@ -156,6 +156,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	fsr_rcas_sharpness = std::clamp<sint32>(graphic.get("FsrRcasSharpness", 20), kFsrRcasSharpnessMin, kFsrRcasSharpnessMax);
 	fsr_rcas_denoise = graphic.get("FsrRcasDenoise", false);
 	faro_depth_snapshot = graphic.get("FaroDepthSnapshot", false);
+	faro_colour_snapshot = graphic.get("FaroColourSnapshot", false);
 	faro_debug_view = std::clamp<sint32>(graphic.get("FaroDebugView", 0), 0, 6);
 	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
 	// Faro Global Enhancements (see CemuConfig.h)
@@ -416,6 +417,7 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("FsrRcasSharpness", fsr_rcas_sharpness);
 	graphic.set("FsrRcasDenoise", fsr_rcas_denoise);
 	graphic.set("FaroDepthSnapshot", faro_depth_snapshot);
+	graphic.set("FaroColourSnapshot", faro_colour_snapshot);
 	graphic.set("FaroDebugView", faro_debug_view);
 	graphic.set("ForceAnisotropicLevel", force_anisotropic_level);
 	graphic.set("FaroPostFX", faro_postfx_enabled);

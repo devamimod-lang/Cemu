@@ -180,6 +180,9 @@ public:
 	// Vulkan implements it, and it always degrades to "keep sampling the live
 	// buffer" rather than failing, so nothing depends on it succeeding.
 	virtual void CaptureSceneDepthSnapshot(LatteTextureView* depthView) {}
+	// Counterpart for colour - see the Vulkan override for why a private copy
+	// is required rather than reading the live buffer.
+	virtual void CaptureSceneColourSnapshot(LatteTextureView* colourView) {}
 	// Dropped once per frame, so a frame where no snapshot was taken falls
 	// back to the live buffer rather than reusing last frame's copy.
 	virtual void OnFaroFrameBoundary() {}

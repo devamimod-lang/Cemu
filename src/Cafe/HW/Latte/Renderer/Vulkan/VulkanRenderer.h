@@ -428,6 +428,10 @@ public:
 	// Faro scene-depth snapshot - see Renderer::CaptureSceneDepthSnapshot.
 	void CaptureSceneDepthSnapshot(LatteTextureView* depthView) override;
 	void CaptureSceneColourSnapshot(LatteTextureView* colourView) override;
+	void AnubisRunWaterReflection(LatteTextureView* reflectView);
+	bool AnubisEnsureWaterScratch(VkFormat format, uint32 width, uint32 height);
+	bool AnubisAllocateWaterScratch(VkFormat format, uint32 width, uint32 height);
+	void ProcessDeferredAnubisTargets();
 	bool EnsureFaroColourSnapshotTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyFaroColourSnapshotTarget();
 	void OnFaroFrameBoundary() override;
@@ -867,6 +871,22 @@ private:
 	VkFormat m_faroColourSnapshotPendingFormat = VK_FORMAT_UNDEFINED;
 	uint32 m_faroColourSnapshotPendingWidth = 0;
 	uint32 m_faroColourSnapshotPendingHeight = 0;
+
+	// Water reflection march. The pending flag is cleared BEFORE the pass runs,
+	// because the pass calls draw_endRenderPass itself and would otherwise
+	// recurse without end.
+	bool m_waterReflectPending = false;
+	LatteTextureView* m_waterReflectView = nullptr;
+	VkImage m_waterScratchImage = VK_NULL_HANDLE;
+	struct VkImageMemAllocation* m_waterScratchAllocation = nullptr;
+	VkImageView m_waterScratchView = VK_NULL_HANDLE;
+	VkExtent2D m_waterScratchExtent{};
+	VkFormat m_waterScratchFormat = VK_FORMAT_UNDEFINED;
+	VkRenderPass m_waterScratchRenderPass = VK_NULL_HANDLE;
+	uint32 m_waterReflectionCount = 0;
+	VkFormat m_waterScratchPendingFormat = VK_FORMAT_UNDEFINED;
+	uint32 m_waterScratchPendingWidth = 0;
+	uint32 m_waterScratchPendingHeight = 0;
 
 	bool EnsureFaroDepthSnapshotTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyFaroDepthSnapshotTarget();

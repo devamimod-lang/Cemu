@@ -113,6 +113,8 @@ private:
 	wxChoice* m_texture_scaling;
 	wxChoice* m_texture_scaling_cap;
 	wxChoice* m_texture_scaling_budget;
+	wxCheckBox* m_faro_water_reflections;
+	wxCheckBox* m_faro_colour_snapshot;
 	wxCheckBox* m_faro_bitmask_ao;
 	wxSlider* m_faro_bitmask_ao_intensity;
 	wxStaticText* m_faro_bitmask_ao_intensity_text;

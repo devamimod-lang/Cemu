@@ -3271,6 +3271,54 @@ void RendererOutputShader::InitializeStatic()
     	s_lanczos_shader_ud = new RendererOutputShader(vertex_source_ud, s_lanczos_shader_source);
     	s_texture_upscale_shader = new RendererOutputShader(vertex_source, s_texture_upscale_shader_source);
 
+    	// Anime4K restore, FSRCNN and the water reflection march. These were
+    	// created in the OpenGL branch only, which meant that on Vulkan - the
+    	// backend actually in use - every one of them was a null pointer and
+    	// silently did nothing. The neural texture reconstruction was enabled and
+    	// tested in that state and its lack of effect was wrongly attributed to
+    	// the thrash guard.
+    	//
+    	// The cause was a scripted insertion anchored on text that appears in
+    	// both branches, landing in whichever came first. Worth noting because
+    	// the same anchor put s_texture_upscale_shader in BOTH by luck, which is
+    	// precisely why texture upscaling worked and these did not.
+    	s_a4k_restore_pass[0] = new RendererOutputShader(vertex_source, s_a4k_restore_pass0_source);
+    	s_a4k_restore_pass[1] = new RendererOutputShader(vertex_source, s_a4k_restore_pass1_source);
+    	s_a4k_restore_pass[2] = new RendererOutputShader(vertex_source, s_a4k_restore_pass2_source);
+    	s_a4k_restore_pass[3] = new RendererOutputShader(vertex_source, s_a4k_restore_pass3_source);
+    	s_fsrcnn_pass[0] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_0_source);
+    	s_fsrcnn_pass[1] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_1_source);
+    	s_fsrcnn_pass[2] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_2_source);
+    	s_fsrcnn_pass[3] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_3_source);
+    	s_fsrcnn_pass[4] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_4_source);
+    	s_fsrcnn_pass[5] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_5_source);
+    	s_fsrcnn_pass[6] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_6_source);
+    	s_fsrcnn_pass[7] = new RendererOutputShader(vertex_source, s_fsrcnn_f1_7_source);
+    	s_fsrcnn_pass[8] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t0_a0_source);
+    	s_fsrcnn_pass[9] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t0_a1_source);
+    	s_fsrcnn_pass[10] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t0_a2_source);
+    	s_fsrcnn_pass[11] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t0_a3_source);
+    	s_fsrcnn_pass[12] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t1_a0_source);
+    	s_fsrcnn_pass[13] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t1_a1_source);
+    	s_fsrcnn_pass[14] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t1_a2_source);
+    	s_fsrcnn_pass[15] = new RendererOutputShader(vertex_source, s_fsrcnn_f2_t1_a3_source);
+    	s_fsrcnn_pass[16] = new RendererOutputShader(vertex_source, s_fsrcnn_f3_t0_source);
+    	s_fsrcnn_pass[17] = new RendererOutputShader(vertex_source, s_fsrcnn_f3_t1_source);
+    	s_fsrcnn_pass[18] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_0_source);
+    	s_fsrcnn_pass[19] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_1_source);
+    	s_fsrcnn_pass[20] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_2_source);
+    	s_fsrcnn_pass[21] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_3_source);
+    	s_fsrcnn_pass[22] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_4_source);
+    	s_fsrcnn_pass[23] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_5_source);
+    	s_fsrcnn_pass[24] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_6_source);
+    	s_fsrcnn_pass[25] = new RendererOutputShader(vertex_source, s_fsrcnn_f4_7_source);
+    	s_fsrcnn_pass[26] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a0_source);
+    	s_fsrcnn_pass[27] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a1_source);
+    	s_fsrcnn_pass[28] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a2_source);
+    	s_fsrcnn_pass[29] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a3_source);
+    	s_fsrcnn_pass[30] = new RendererOutputShader(vertex_source, s_fsrcnn_recon_source);
+    	s_anubis_water_ssr_shader = new RendererOutputShader(vertex_source, s_anubis_water_ssr_source);
+
     	s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
     	s_fsr1_easu_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr1_easu_shader_source);
     	s_fsr1_rcas_shader = new RendererOutputShader(vertex_source, s_fsr1_rcas_shader_source);
@@ -4508,7 +4556,15 @@ void outputShader()
 {
 	vec4 gameReflection = texture(textureSrc, passUV);
 
-	float aspect = max(outputResolution.x, 1.0) / max(outputResolution.y, 1.0);
+	// Aspect from the DEPTH snapshot, not from this pass's own target.
+	//
+	// Positions are reconstructed from the scene depth, so the projection has
+	// to be the scene's. The reflection buffer is 640x384 (1.667) while the
+	// scene can be any shape the graphic pack chose, and using the wrong one
+	// skews every reconstructed position horizontally - the rays would march
+	// in a direction the geometry is not in.
+	vec2 depthRes = max(faroBitmaskAoParams.xy, vec2(1.0));
+	float aspect = depthRes.x / depthRes.y;
 	float centreDepth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
 	float centreZ = WaterLinearize(centreDepth);
 
@@ -4522,13 +4578,45 @@ void outputShader()
 
 	vec3 origin = WaterReconstruct(passUV, centreZ, aspect);
 
-	// Water is horizontal, so the reflected view direction is the view
-	// direction mirrored in Y. A normal map is available to the GAME's shader
-	// but not to this pass - which is the honest limit here: this reflects a
-	// flat surface, and the game's own normal-driven distortion still rides on
-	// top when the water surface samples this buffer.
+	// Surface normal reconstructed from the DEPTH buffer, then a real reflect().
+	//
+	// The first version mirrored the view direction in view-space Y, on the
+	// reasoning that water is horizontal. That is only true when the camera is
+	// perfectly level, because view-space Y is the camera's up axis, not the
+	// world's. Breath of the Wild is almost always looked at with the camera
+	// pitched down over the water, so every ray was deflected by exactly the
+	// pitch angle and marched into the sky or the ground instead of at the
+	// geometry. Nothing was reflected, which is precisely what was observed.
+	//
+	// Deriving the normal from depth derivatives is the standard answer when
+	// there is no normal buffer, and it needs no view matrix - which this pass
+	// has no way to obtain.
+	vec2 texel = 1.0 / depthRes;
+	float zRight = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(texel.x, 0.0)).x, 0.0), 1.0));
+	float zDown  = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(0.0, texel.y)).x, 0.0), 1.0));
+	vec3 pRight = WaterReconstruct(passUV + vec2(texel.x, 0.0), zRight, aspect);
+	vec3 pDown  = WaterReconstruct(passUV + vec2(0.0, texel.y), zDown, aspect);
+	vec3 normal = normalize(cross(pRight - origin, pDown - origin));
+	// Face the camera. The cross product's sign depends on which neighbour came
+	// first, and a flipped normal reflects rays into the surface.
 	vec3 viewDir = normalize(origin);
-	vec3 reflectDir = vec3(viewDir.x, -viewDir.y, viewDir.z);
+	if (dot(normal, viewDir) > 0.0)
+		normal = -normal;
+	vec3 reflectDir = reflect(viewDir, normal);
+
+	int waterDebug = int(faroDebugParams.x + 0.5);
+	// Normals and directions are in -1..1; mapped to 0..1 so they are visible
+	// rather than clipped to black over half their range.
+	if (waterDebug == 7)
+	{
+		colorOut0 = vec4(normal * 0.5 + 0.5, 1.0);
+		return;
+	}
+	if (waterDebug == 8)
+	{
+		colorOut0 = vec4(reflectDir * 0.5 + 0.5, 1.0);
+		return;
+	}
 
 	// Hierarchical march: coarse steps to find the crossing, then a binary
 	// refinement to place it. The game uses four fixed taps, which is why its
@@ -4595,13 +4683,25 @@ void outputShader()
 		t += stepLen;
 	}
 
+	if (waterDebug == 9)
+	{
+		// Green hit, red miss. Nothing else, so the answer is unambiguous.
+		colorOut0 = hit ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0);
+		return;
+	}
 	if (!hit)
 	{
 		colorOut0 = gameReflection;
 		return;
 	}
 
-	vec3 reflected = texture(textureSrc2, hitUV).rgb;
+	// The colour snapshot is taller than the scene by its alignment padding -
+	// 1280x736 against a 1280x720 scene, measured. Sampling it with the same UV
+	// as the depth would stretch the image over the padding and shift every
+	// reflection downward, so V is rescaled into the part that holds real
+	// pixels. faroBitmaskAoParams.z carries depthHeight/colourHeight.
+	float colourVScale = faroBitmaskAoParams.z > 0.0 ? faroBitmaskAoParams.z : 1.0;
+	vec3 reflected = texture(textureSrc2, vec2(hitUV.x, hitUV.y * colourVScale)).rgb;
 
 	// Fade towards the game's own reflection near the screen edges.
 	//

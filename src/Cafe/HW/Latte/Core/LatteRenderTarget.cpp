@@ -260,20 +260,6 @@ void LatteMRT::NotifyDepthAttachmentUsed(LatteTextureView* view)
 				{
 					s_depthSnapshotBestVertices = candidate->segment.vertices;
 					g_renderer->CaptureSceneDepthSnapshot(previous);
-					// Colour captured at the SAME moment, from the same
-					// decision, rather than through a parallel candidate
-					// tracker of its own.
-					//
-					// Two reasons, and the second is the important one. It is
-					// far less code - the depth side needs candidates, segment
-					// vertex counts and a current-view pointer to find the
-					// scene's real buffer. And it guarantees the two snapshots
-					// CORRESPOND: a reflection ray reads colour at a position
-					// it derived from depth, so colour from one instant and
-					// depth from another would reflect geometry that is not
-					// where the depth says it is. Sharing the trigger makes
-					// that impossible by construction.
-					g_renderer->CaptureSceneColourSnapshot(LatteMRT::GetColorAttachment(0));
 					g_renderer->NotifyDepthSnapshotTaken();
 				}
 				// NOT reset here. The segment is reset by a CLEAR

@@ -1193,6 +1193,21 @@ void VulkanRenderer::draw_prepareDescriptorSets(PipelineInfo* pipeline_info, VkD
 	const auto pixelShader = LatteSHRC_GetActivePixelShader();
 
 
+	// Breath of the Wild's water reflection pass is about to draw. Recorded
+	// rather than acted on, because the buffer is not finished until the render
+	// pass ends - see draw_endRenderPass.
+	//
+	// Identified by shader hash, which is the whole reason a reflection can be
+	// added here at all: the game itself decides this shader runs only on
+	// water, so the pass inherits the material information whose absence killed
+	// the previous SSR attempt ("raymarching with no material information, so
+	// every surface reflects").
+	if (pixelShader && pixelShader->baseHash == 0x340382e6fbbb3951ull && GetConfig().faro_water_reflections)
+	{
+		m_waterReflectPending = true;
+		m_waterReflectView = LatteMRT::GetColorAttachment(0);
+	}
+
 	auto prepareShaderDescriptors = [this, &pipeline_info](LatteDecompilerShader* shader) -> VkDescriptorSetInfo* {
 		if (!shader)
 			return nullptr;
@@ -1317,6 +1332,18 @@ void VulkanRenderer::draw_endRenderPass()
 		vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	sync_RenderPassStoreTextures(m_state.activeRenderpassFBO);
 	m_state.activeRenderpassFBO = nullptr;
+
+	// The game's reflection buffer is complete now, so the march can run over
+	// it. Flag and view are taken and CLEARED FIRST - AnubisRunWaterReflection
+	// calls this same function for its own pass, and leaving the flag set would
+	// recurse until the stack ran out.
+	if (m_waterReflectPending)
+	{
+		m_waterReflectPending = false;
+		LatteTextureView* view = m_waterReflectView;
+		m_waterReflectView = nullptr;
+		AnubisRunWaterReflection(view);
+	}
 }
 
 // Defined in the Common renderer

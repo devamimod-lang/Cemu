@@ -691,6 +691,8 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			m_faro_gi->Enable(on);
 			m_faro_gi_intensity->Enable(on && GetConfig().faro_gi_enabled);
 			// Shares the GI pass, so it cannot run without it.
+			m_faro_water_reflections->Enable(on);
+			m_faro_colour_snapshot->Enable(on);
 			m_faro_bitmask_ao->Enable(on && GetConfig().faro_gi_enabled);
 			m_faro_bitmask_ao_intensity->Enable(on && GetConfig().faro_gi_enabled && GetConfig().faro_bitmask_ao_enabled);
 			m_faro_bitmask_ao_distance->Enable(on && GetConfig().faro_gi_enabled && GetConfig().faro_bitmask_ao_enabled);
@@ -777,6 +779,33 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 		// light pass behind thin surfaces. This one can, so they disagree
 		// exactly where thin geometry is - which is where comparing them is
 		// worth something.
+		// Water reflections. Two checkboxes rather than one, because the march
+		// cannot work without the colour snapshot and the snapshot is the part
+		// that touches the renderer mid-frame - so it stays separately
+		// switchable, the same way the depth snapshot is.
+		m_faro_water_reflections = new wxCheckBox(graphics_panel, wxID_ANY, _("Water reflects the world (experimental)"));
+		m_faro_water_reflections->SetToolTip(_("Breath of the Wild's water reflects only the sky - its reflection shader is never given the scene's colour, so the world cannot appear in it. This marches the depth buffer and reflects actual geometry, falling back to the game's own sky wherever a ray finds nothing.\nScreen-space, so it cannot show what is off-screen or behind the camera; those areas fade to the sky rather than cutting.\nRequires the scene colour snapshot below, and currently renders at the game's own reflection resolution."));
+		m_faro_water_reflections->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
+			GetConfig().faro_water_reflections = event.IsChecked();
+			// Turning the march on without its input would do nothing at all
+			// and look like a broken feature, so the snapshot follows it.
+			if (event.IsChecked())
+			{
+				GetConfig().faro_colour_snapshot = true;
+				if (m_faro_colour_snapshot)
+					m_faro_colour_snapshot->SetValue(true);
+			}
+			updateFaroEnables();
+		});
+		box_sizer->Add(m_faro_water_reflections, 0, wxALL, 5);
+
+		m_faro_colour_snapshot = new wxCheckBox(graphics_panel, wxID_ANY, _("Use a private copy of the scene colour (experimental)"));
+		m_faro_colour_snapshot->SetToolTip(_("Copies the scene's colour while the frame is still being drawn, so reflections can read it. Reading the live buffer instead would be a feedback loop - the surface being drawn into cannot also be sampled.\nTaken at the same moment as the depth copy so the two correspond: a reflection ray reads colour at a position it worked out from depth.\nIt touches the renderer mid-frame, so turn it off if you see crashes or glitches."));
+		m_faro_colour_snapshot->Bind(wxEVT_CHECKBOX, [](wxCommandEvent& event) {
+			GetConfig().faro_colour_snapshot = event.IsChecked();
+		});
+		box_sizer->Add(m_faro_colour_snapshot, 0, wxALL, 5);
+
 		m_faro_bitmask_ao = new wxCheckBox(graphics_panel, wxID_ANY, _("Bitmask ambient occlusion"));
 		m_faro_bitmask_ao->SetToolTip(_("A second ambient occlusion, computed from the visibility bit field the global illumination pass already builds, so it costs almost nothing extra.\nIndependent of SSAO - both can be enabled together, with separate strengths. Unlike SSAO it lets light pass behind thin objects such as railings and foliage, instead of darkening everything behind them.\nRequires global illumination to be enabled, since it shares that pass."));
 		m_faro_bitmask_ao->Bind(wxEVT_CHECKBOX, [this, updateFaroEnables](wxCommandEvent& event) {
@@ -924,10 +953,11 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 		{
 			auto* dbgSizer = new wxBoxSizer(wxHORIZONTAL);
 			dbgSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Debug view")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
-			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter"), _("FSR1 sharpening lobe") };
+			// Order matters: the index IS the FaroDebugView value.
+			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter"), _("FSR1 sharpening lobe"), _("Water: surface normal"), _("Water: reflected direction"), _("Water: ray hit or miss") };
 			m_faro_debug_view = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(dbgChoices), dbgChoices);
 			m_faro_debug_view->SetToolTip(_("Shows an intermediate buffer of the ambient-occlusion chain instead of the game image, to see which stage is unstable. 'Raw depth' is remapped so distant geometry is visible."));
-			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, 6));
+			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, CemuConfig::kFaroDebugWaterHit));
 			m_faro_debug_view->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 				GetConfig().faro_debug_view = event.GetSelection();
 			});
@@ -2604,6 +2634,8 @@ void GeneralSettings2::ApplyConfig()
 	m_faro_postfx->SetValue(config.faro_postfx_enabled);
 	m_faro_ssao->SetValue(config.faro_ssao_enabled);
 	m_faro_gi->SetValue(config.faro_gi_enabled);
+	m_faro_water_reflections->SetValue(config.faro_water_reflections);
+	m_faro_colour_snapshot->SetValue(config.faro_colour_snapshot);
 	m_faro_bitmask_ao->SetValue(config.faro_bitmask_ao_enabled);
 	m_faro_bitmask_ao_intensity->SetValue(config.faro_bitmask_ao_intensity);
 	m_faro_bitmask_ao_intensity_text->SetLabel(wxString::Format("%d%%", config.faro_bitmask_ao_intensity.GetValue()));
@@ -2632,7 +2664,7 @@ void GeneralSettings2::ApplyConfig()
 		m_faro_ssao_quality->SetSelection(q);
 	}
 	m_faro_depth_snapshot->SetValue(config.faro_depth_snapshot);
-	m_faro_debug_view->SetSelection(std::clamp<sint32>(config.faro_debug_view, 0, 6));
+	m_faro_debug_view->SetSelection(std::clamp<sint32>(config.faro_debug_view, 0, CemuConfig::kFaroDebugWaterHit));
 	{
 		const bool on = config.faro_postfx_enabled;
 		m_faro_ssao->Enable(on);

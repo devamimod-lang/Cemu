@@ -589,6 +589,12 @@ struct CemuConfig
 	// is recorded mid-frame from the framebuffer-bind path, the most intrusive
 	// place this renderer touches.
 	ConfigValue<bool> faro_colour_snapshot{false};
+	// Water reflections that reflect the WORLD, not just the sky. Requires the
+	// colour snapshot, since the march has to read the scene.
+	ConfigValue<bool> faro_water_reflections{false};
+	// March length in view units. Longer reaches further but spreads the same
+	// step count over more distance, so hits get coarser.
+	ConfigValue<sint32> faro_water_reflection_distance{40};
 
 	// Faro: output an intermediate buffer of the AO chain instead of the
 	// shaded image, to localise instability by eye. CPU counters can prove a
@@ -606,6 +612,25 @@ struct CemuConfig
 		// means RCAS found no local contrast to sharpen, so the sharpness
 		// slider cannot do anything no matter where it is set.
 		kFaroDebugRcasLobe = 6,
+		// Water reflection diagnostics.
+		//
+		// Added because eight rounds of fixing the reflection were spent
+		// inferring what the shader computed from what the screen showed, and
+		// the eighth fault turned out to be the reflection MATHS: a wrong
+		// reflected vector produces no reflection at all, which looks exactly
+		// like a pass that never ran. These make the intermediate values
+		// visible instead of deduced.
+
+		// Reconstructed surface normal as RGB. Still water should read as one
+		// flat colour and a cliff beside it as a clearly different one; noise
+		// means the depth derivatives are unusable there.
+		kFaroDebugWaterNormal = 7,
+		// The reflected direction. Shows whether rays leave the surface at a
+		// plausible angle or fly off along the camera pitch, which was the bug.
+		kFaroDebugWaterReflectDir = 8,
+		// Green where a ray hit geometry, red where it missed and fell back to
+		// the sky. The most direct answer to an absent reflection.
+		kFaroDebugWaterHit = 9,
 	};
 	ConfigValue<sint32> faro_debug_view{kFaroDebugOff};
 

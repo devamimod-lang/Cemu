@@ -428,7 +428,13 @@ public:
 	// Faro scene-depth snapshot - see Renderer::CaptureSceneDepthSnapshot.
 	void CaptureSceneDepthSnapshot(LatteTextureView* depthView) override;
 	void CaptureSceneColourSnapshot(LatteTextureView* colourView) override;
-	void AnubisRunWaterReflection(LatteTextureView* reflectView);
+	void AnubisRunWaterReflection(LatteTextureView* reflectView, LatteTextureView* gameDepthView);
+	// The reflection itself, in the OUTPUT CHAIN where the colour and depth are
+	// complete - the place ReShade runs and the place GTAO and GI already work.
+	// AnubisRunWaterReflection only supplies the material mask.
+	bool RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+		VkImageView colorInputView, VkSampler colorInputSampler,
+		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent);
 	bool AnubisEnsureWaterScratch(VkFormat format, uint32 width, uint32 height);
 	bool AnubisAllocateWaterScratch(VkFormat format, uint32 width, uint32 height);
 	void ProcessDeferredAnubisTargets();
@@ -877,6 +883,19 @@ private:
 	// recurse without end.
 	bool m_waterReflectPending = false;
 	LatteTextureView* m_waterReflectView = nullptr;
+	// The depth texture the GAME binds to its own reflection shader, at pixel
+	// texture unit 1.
+	//
+	// Every other depth source was measured and found empty at this point in
+	// the frame: the mid-frame snapshot, and the live tracked depth. Both read
+	// 1.0 to five decimal places, which pinned the cause - the reflection pass
+	// runs BEFORE the game draws the scene, so the scene depth is still at its
+	// clear value and there is nothing yet to reflect.
+	//
+	// This one cannot have that problem. The game's reflection shader marches
+	// it in the very draw we are intercepting, so it holds scene depth by
+	// construction, in the same screen space, at exactly the right moment.
+	LatteTextureView* m_waterGameDepthView = nullptr;
 	VkImage m_waterScratchImage = VK_NULL_HANDLE;
 	struct VkImageMemAllocation* m_waterScratchAllocation = nullptr;
 	VkImageView m_waterScratchView = VK_NULL_HANDLE;
@@ -884,9 +903,46 @@ private:
 	VkFormat m_waterScratchFormat = VK_FORMAT_UNDEFINED;
 	VkRenderPass m_waterScratchRenderPass = VK_NULL_HANDLE;
 	uint32 m_waterReflectionCount = 0;
+	// The water mask copy holds a usable frame. Sticky in the same way the
+	// snapshot flags are: the output pass reads it in the NEXT frame, and a
+	// frame where the game drew no water must not invalidate the last good
+	// copy, or the reflection would flicker off whenever water left view for a
+	// single frame.
+	bool m_waterMaskValid = false;
+	// The game's reflection texture itself, kept for the output pass to sample
+	// directly. There is no private copy any more: the mid-frame copy was
+	// recorded, logged 1800 times a session, and never reached the GPU - a
+	// clear issued from the output chain landed on the same image in the same
+	// frame, which localised the fault to that recording and nowhere else.
+	// Removing the copy removes the fault rather than explaining it.
+	LatteTextureView* m_waterMaskView = nullptr;
+	VkSampler m_waterMaskSampler = VK_NULL_HANDLE;
 	VkFormat m_waterScratchPendingFormat = VK_FORMAT_UNDEFINED;
 	uint32 m_waterScratchPendingWidth = 0;
 	uint32 m_waterScratchPendingHeight = 0;
+
+	// Water reflection hit probe: reads the pass's own output back to the CPU
+	// and reports, as NUMBERS in the log, how many pixels the material mask
+	// let through and how many of those found geometry.
+	//
+	// Every other attempt to answer that question was a colour on screen, and
+	// every one of them failed for the same structural reason: this buffer is
+	// multiplied by the water surface shader's Fresnel, tint and alpha before
+	// it is ever seen, so a saturated diagnostic arrives as a tinge that is
+	// indistinguishable from "nothing happened". Counting on the CPU removes
+	// the eye from the loop entirely.
+	VkBuffer m_waterProbeBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_waterProbeMemory = VK_NULL_HANDLE;
+	void* m_waterProbeMapped = nullptr;
+	uint32 m_waterProbeCapacity = 0;
+	uint32 m_waterProbeWidth = 0;
+	uint32 m_waterProbeHeight = 0;
+	// The invocation the copy was recorded on. The result is read many
+	// invocations later instead of waiting on a fence, because this runs in the
+	// middle of a command buffer the GPU has not seen yet - the same mistake
+	// that put a WaitDeviceIdle inside this function once before.
+	uint32 m_waterProbeRecordedAt = 0;
+	bool m_waterProbePending = false;
 
 	bool EnsureFaroDepthSnapshotTarget(VkFormat format, uint32 width, uint32 height);
 	void DestroyFaroDepthSnapshotTarget();

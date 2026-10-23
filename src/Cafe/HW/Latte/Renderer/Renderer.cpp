@@ -143,7 +143,10 @@ void Renderer::CaptureDepthForPostFX(sint32 outputWidth, sint32 outputHeight)
 	m_faroDepthSnapshotCount = 0;
 	if ((++m_depthCaptureProbeCounter % 600) == 0)
 	{
-		cemuLog_log(LogType::Force, "Faro effect dispatch: GTAO ran {}/{} frames, SSR ran {}/{} frames",
+		// Water SSR is counted per INVOCATION, not per frame - the game can
+		// draw its reflection pass more than once in a frame - so it is worded
+		// as a count rather than a ratio. GTAO really is once per frame.
+		cemuLog_log(LogType::Force, "Faro effect dispatch: GTAO ran {}/{} frames, water SSR ran {} times in {} frames",
 			m_faroGtaoRanFrames, m_faroFrameCounter, m_faroSsrRanFrames, m_faroFrameCounter);
 		cemuLog_log(LogType::Force, "Faro depth snapshots per frame: min {} max {} (a varying count means the capture point inside the frame moves)",
 			m_faroDepthSnapshotMin == 0xFFFFFFFF ? 0u : m_faroDepthSnapshotMin, m_faroDepthSnapshotMax);

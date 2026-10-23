@@ -4510,34 +4510,43 @@ void outputShader()
 	colorOut0 = vec4(clamp(outRgb, vec3(0.0), vec3(1.0)), src.a);
 }
 )";
-
-
-// Anubis water reflections: a screen-space march that reflects the WORLD.
+// Anubis water reflections: a ReShade-style screen-space reflection that runs
+// in the OUTPUT CHAIN, with the game's own buffer used only as a material mask.
 //
-// The game's own pass reflects only the sky - its three inputs are a sky array,
-// depth and the water's normal map, with no scene colour anywhere, so the four
-// depth taps it does only ATTENUATE the sky where geometry blocks it. This pass
-// adds what was missing, and it can because the emulator can hand a shader the
-// scene colour while a graphic pack cannot: the guest texture bind loop only
-// walks the units the shader's own resourceMapping declares.
+// WHERE this runs is the whole design, and getting it wrong cost a day. The
+// first version marched at the moment the game finished drawing its reflection
+// buffer, mid-frame. Everything failed there, and never for the reason it
+// looked like:
+//
+//   - the scene depth read 1.0 to five decimal places on 100% of pixels,
+//     because the game draws that buffer BEFORE the scene;
+//   - substituting an end-of-frame depth copy made two capture sites fight
+//     over one allocation and left it empty;
+//   - the game's own reflection depth is valid there, but marching it put 88%
+//     of rays off-screen on the first step.
+//
+// ReShade's SSR works on this game, and ReShade runs in post-processing - at
+// the end of the frame, where colour and depth are complete. This renderer has
+// that exact place, and it is already proven: GTAO and GI read full scene
+// colour and depth here every frame. So the march lives here now, on data that
+// is correct by construction rather than data that has to be rescued.
+//
+// WHAT the output chain cannot know is which surfaces are supposed to reflect.
+// qUINT documents that limitation of its own SSR plainly: it "cannot
+// distinguish between different materials and will add reflections on
+// everything". That is the one thing the emulator can supply and ReShade
+// cannot - the game picks pixel shader 340382e6fbbb3951 for its water
+// reflection and draws that buffer as water geometry, so a copy of it marks
+// where water is. AnubisRunWaterReflection takes that copy; this samples it.
 //
 // Inputs:
-//   textureSrc  - the game's finished reflection buffer, used as the fallback
-//                 wherever the march finds nothing. Keeping it means a miss
-//                 degrades to exactly what the game drew, never to a hole.
-//   textureSrc2 - the scene colour snapshot
-//   textureDepth- the scene depth snapshot, captured at the SAME moment, so a
-//                 position derived from depth indexes colour that was valid
-//                 then.
-//
-// The material question that killed the previous SSR attempt does not arise
-// here. That one marched every surface because it had no way to know which
-// were reflective; this pass runs only where the game itself decided to draw
-// water.
+//   textureSrc       - the complete scene colour, and also what is reflected
+//   textureDepth     - the complete scene depth
+//   textureWaterMask - the game's reflection buffer, as a material mask
 const std::string RendererOutputShader::s_anubis_water_ssr_source =
 R"(
-layout(binding = 2) uniform sampler2D textureSrc2;
-layout(binding = 3) uniform sampler2D textureDepth;
+layout(binding = 2) uniform sampler2D textureDepth;
+layout(binding = 3) uniform sampler2D textureWaterMask;
 
 float WaterLinearize(float d)
 {
@@ -4554,119 +4563,156 @@ vec3 WaterReconstruct(vec2 uv, float viewZ, float aspect)
 
 void outputShader()
 {
-	vec4 gameReflection = texture(textureSrc, passUV);
+	vec3 sceneColor = texture(textureSrc, passUV).rgb;
 
-	// Aspect from the DEPTH snapshot, not from this pass's own target.
+	// THE MATERIAL MASK.
 	//
-	// Positions are reconstructed from the scene depth, so the projection has
-	// to be the scene's. The reflection buffer is 640x384 (1.667) while the
-	// scene can be any shape the graphic pack chose, and using the wrong one
-	// skews every reconstructed position horizontally - the rays would march
-	// in a direction the geometry is not in.
+	// The game draws its reflection buffer as water GEOMETRY, so that buffer is
+	// written where water is and left at its clear value everywhere else. Its
+	// ALPHA is not the signal - a CPU readback measured alpha as 0/255 on every
+	// one of 245760 pixels, which is what killed the first attempt at this -
+	// so the test is on colour presence instead.
+	//
+	// Gated BEFORE the march, so a non-water pixel costs nothing and can never
+	// be altered.
+	vec3 maskRgb = texture(textureWaterMask, passUV).rgb;
+	float maskStrength = max(max(maskRgb.r, maskRgb.g), maskRgb.b);
+
+	int waterDebug = int(faroDebugParams.x + 0.5);
+	// The mask buffer itself. View 10 shows it raw; view 7 shows the same
+	// sample after the capture has overwritten it with a known orange, which
+	// is what distinguishes an empty source from a broken sampling path.
+	//
+	// Both are amplified 64x on the right half of the screen, because content
+	// that is present but very dark is indistinguishable from zero at 8 bits -
+	// a mistake already made once here, when a depth sitting in the last
+	// percent of its range was reported as a constant.
+	if (waterDebug == 10 || waterDebug == 7)
+	{
+		vec3 shown = (passUV.x > 0.5) ? clamp(maskRgb * 64.0, 0.0, 1.0) : maskRgb;
+		colorOut0 = vec4(shown, 1.0);
+		return;
+	}
+
+	if (maskStrength <= 0.004)
+	{
+		// Under the probe, a rejected pixel reports HOW rejected it was rather
+		// than vanishing into the scene.
+		//
+		// The previous version returned the scene colour here even in debug,
+		// so a mask that rejected everything was indistinguishable from a pass
+		// that never ran - and that is exactly what happened: the pass logged
+		// RUNNING 600/600 frames while the screen stayed perfectly normal.
+		// Blue scaled 64x makes the difference between "exactly zero" and
+		// "small but present" visible, which decides whether the threshold is
+		// wrong or the buffer is empty.
+		if (waterDebug == 9)
+		{
+			colorOut0 = vec4(0.0, 0.0, clamp(maskStrength * 64.0, 0.0, 1.0), 1.0);
+			return;
+		}
+		colorOut0 = vec4(sceneColor, 1.0);
+		return;
+	}
+
 	vec2 depthRes = max(faroBitmaskAoParams.xy, vec2(1.0));
 	float aspect = depthRes.x / depthRes.y;
 	float centreDepth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
 	float centreZ = WaterLinearize(centreDepth);
-
-	// Sky, i.e. nothing in front: no surface to reflect from. The game's own
-	// value is already correct there.
-	if (centreDepth >= 0.9999)
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	// Sky: nothing in front to reflect from. Expressed against the far plane
+	// rather than as a raw-depth threshold, because a projected depth puts
+	// almost the whole scene inside the last percent of 0..1 and a literal
+	// 0.9999 cutoff rejected 100% of pixels when it was written that way.
+	if (centreZ >= farPlane * 0.99)
 	{
-		colorOut0 = gameReflection;
+		colorOut0 = vec4(sceneColor, 1.0);
 		return;
 	}
 
 	vec3 origin = WaterReconstruct(passUV, centreZ, aspect);
-
-	// Surface normal reconstructed from the DEPTH buffer, then a real reflect().
-	//
-	// The first version mirrored the view direction in view-space Y, on the
-	// reasoning that water is horizontal. That is only true when the camera is
-	// perfectly level, because view-space Y is the camera's up axis, not the
-	// world's. Breath of the Wild is almost always looked at with the camera
-	// pitched down over the water, so every ray was deflected by exactly the
-	// pitch angle and marched into the sky or the ground instead of at the
-	// geometry. Nothing was reflected, which is precisely what was observed.
-	//
-	// Deriving the normal from depth derivatives is the standard answer when
-	// there is no normal buffer, and it needs no view matrix - which this pass
-	// has no way to obtain.
-	vec2 texel = 1.0 / depthRes;
-	float zRight = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(texel.x, 0.0)).x, 0.0), 1.0));
-	float zDown  = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(0.0, texel.y)).x, 0.0), 1.0));
-	vec3 pRight = WaterReconstruct(passUV + vec2(texel.x, 0.0), zRight, aspect);
-	vec3 pDown  = WaterReconstruct(passUV + vec2(0.0, texel.y), zDown, aspect);
-	vec3 normal = normalize(cross(pRight - origin, pDown - origin));
-	// Face the camera. The cross product's sign depends on which neighbour came
-	// first, and a flipped normal reflects rays into the surface.
 	vec3 viewDir = normalize(origin);
+
+	// Normal from depth, two-texel CENTRAL differences.
+	//
+	// A one-texel forward difference produced a degenerate cross product
+	// wherever neighbouring pixels held the same quantised depth, and
+	// normalize() of a zero vector is undefined - which sent rays in arbitrary
+	// directions. Central differences also avoid the per-pixel side-flipping
+	// the GI pass documents for flat surfaces, which is exactly the water case.
+	vec2 texel = 1.0 / depthRes;
+	vec2 off = texel * 2.0;
+	float zL = WaterLinearize(min(max(texture(textureDepth, passUV - vec2(off.x, 0.0)).x, 0.0), 1.0));
+	float zR = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(off.x, 0.0)).x, 0.0), 1.0));
+	float zU = WaterLinearize(min(max(texture(textureDepth, passUV - vec2(0.0, off.y)).x, 0.0), 1.0));
+	float zD = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(0.0, off.y)).x, 0.0), 1.0));
+	vec3 pL = WaterReconstruct(passUV - vec2(off.x, 0.0), zL, aspect);
+	vec3 pR = WaterReconstruct(passUV + vec2(off.x, 0.0), zR, aspect);
+	vec3 pU = WaterReconstruct(passUV - vec2(0.0, off.y), zU, aspect);
+	vec3 pD = WaterReconstruct(passUV + vec2(0.0, off.y), zD, aspect);
+	vec3 nRaw = cross(pR - pL, pD - pU);
+	float nLen = length(nRaw);
+	if (nLen < 1e-6)
+	{
+		colorOut0 = vec4(sceneColor, 1.0);
+		return;
+	}
+	vec3 normal = nRaw / nLen;
 	if (dot(normal, viewDir) > 0.0)
 		normal = -normal;
 	vec3 reflectDir = reflect(viewDir, normal);
 
-	int waterDebug = int(faroDebugParams.x + 0.5);
-	// Normals and directions are in -1..1; mapped to 0..1 so they are visible
-	// rather than clipped to black over half their range.
-	if (waterDebug == 7)
-	{
-		colorOut0 = vec4(normal * 0.5 + 0.5, 1.0);
-		return;
-	}
-	if (waterDebug == 8)
-	{
-		colorOut0 = vec4(reflectDir * 0.5 + 0.5, 1.0);
-		return;
-	}
-
-	// Hierarchical march: coarse steps to find the crossing, then a binary
-	// refinement to place it. The game uses four fixed taps, which is why its
-	// occlusion is blocky; the refinement is what removes the stair-stepping
-	// without paying for more coarse steps.
-	const int COARSE_STEPS = 24;
-	const int REFINE_STEPS = 5;
+	// The march, as the working ReShade implementations do it.
+	//
+	//  - the step GROWS geometrically (NGLighting: steplength *= RayInc, 1.012
+	//    to 2.0 by preset; qUINT: ray.step *= 1.6). Uniform steps force a
+	//    choice between reach and accuracy; growth samples the near part of the
+	//    ray densely, where precision shows, and the far part cheaply.
+	//  - the first step is proportional to DEPTH (NGLighting: position.z*0.01).
+	//  - the step is divided by how far the ray turns off the view direction
+	//    (qUINT: rcp(1e-3 + saturate(1 - dot(ray.dir, eyedir)))), because a ray
+	//    heading away from the camera barely moves across the screen. Clamped,
+	//    since that reciprocal reaches 1000.
+	const int STEPS = 24;
+	const int REFINE = 6;
+	const float RAY_INC = 1.18;
 	float maxDistance = max(faroGtaoParams.z, 8.0);
-	float stepLen = maxDistance / float(COARSE_STEPS);
 
-	// Dithered start so the step boundaries do not line up into visible bands,
-	// using the same ordered pattern as the AO passes rather than white noise -
-	// an ordered 4x4 covers evenly spaced offsets, so neighbouring pixels
-	// average to the true answer instead of a biased subset.
+	float grazing = clamp(1.0 - dot(reflectDir, viewDir), 0.0, 1.0);
+	float stepScale = min(1.0 / (grazing + 1e-3), 8.0);
 	float dither = dot(floor(mod(gl_FragCoord.xy, 4.0) + 0.1), vec2(0.0625, 0.25));
+	float stepLen = centreZ * 0.01 * stepScale * (0.75 + 0.5 * dither);
 
+	float t = stepLen;
 	float tPrev = 0.0;
-	float t = stepLen * (0.5 + dither);
 	bool hit = false;
 	vec2 hitUV = vec2(0.0);
 
-	for (int i = 0; i < COARSE_STEPS; i++)
+	for (int i = 0; i < STEPS; i++)
 	{
 		vec3 p = origin + reflectDir * t;
-		if (p.z <= 1e-3)
+		if (p.z <= 1e-3 || t > maxDistance)
 			break;
-		// Project back to screen. The inverse of WaterReconstruct.
-		vec2 ndc = vec2(p.x / (p.z * 0.57735027 * aspect), p.y / (p.z * 0.57735027));
-		vec2 uv = ndc * 0.5 + 0.5;
-		// Left the screen: nothing more to find along this ray.
+		vec2 uv = vec2(p.x / (p.z * 0.57735027 * aspect), p.y / (p.z * 0.57735027)) * 0.5 + 0.5;
 		if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
 			break;
 
 		float sceneZ = WaterLinearize(min(max(texture(textureDepth, uv).x, 0.0), 1.0));
-		// Crossed behind a surface. The thickness test is what stops a ray
-		// from matching geometry it passed long ago: without it, anything
-		// nearer than the ray counts as a hit and distant walls smear across
-		// the water.
-		float thickness = max(p.z * 0.05, 0.05);
-		if (sceneZ < p.z && sceneZ > p.z - thickness)
+		// Behind a surface, but by less than the distance just travelled.
+		// Tying the tolerance to the STEP is what makes geometric growth safe:
+		// a long stride would otherwise claim a hit on geometry it flew past,
+		// smearing distant walls across the water.
+		float travelled = t - tPrev;
+		float behind = p.z - sceneZ;
+		if (behind > 0.0 && behind < max(travelled, p.z * 0.04))
 		{
-			// Binary refinement between the last miss and this hit.
 			float lo = tPrev;
 			float hi = t;
-			for (int r = 0; r < REFINE_STEPS; r++)
+			for (int r = 0; r < REFINE; r++)
 			{
 				float mid = (lo + hi) * 0.5;
 				vec3 pm = origin + reflectDir * mid;
-				vec2 ndcm = vec2(pm.x / (pm.z * 0.57735027 * aspect), pm.y / (pm.z * 0.57735027));
-				vec2 uvm = ndcm * 0.5 + 0.5;
+				vec2 uvm = vec2(pm.x / (pm.z * 0.57735027 * aspect), pm.y / (pm.z * 0.57735027)) * 0.5 + 0.5;
 				float zm = WaterLinearize(min(max(texture(textureDepth, uvm).x, 0.0), 1.0));
 				if (zm < pm.z)
 					hi = mid;
@@ -4674,50 +4720,56 @@ void outputShader()
 					lo = mid;
 			}
 			vec3 pf = origin + reflectDir * hi;
-			vec2 ndcf = vec2(pf.x / (pf.z * 0.57735027 * aspect), pf.y / (pf.z * 0.57735027));
-			hitUV = ndcf * 0.5 + 0.5;
+			hitUV = vec2(pf.x / (pf.z * 0.57735027 * aspect), pf.y / (pf.z * 0.57735027)) * 0.5 + 0.5;
 			hit = true;
+			t = hi;
 			break;
 		}
 		tPrev = t;
 		t += stepLen;
+		stepLen *= RAY_INC;
 	}
 
 	if (waterDebug == 9)
 	{
-		// Green hit, red miss. Nothing else, so the answer is unambiguous.
+		// Green hit, red miss, and ONLY on water - everything else returned at
+		// the mask gate, so this doubles as a view of the mask. Visible
+		// directly now: this pass writes the screen, not a buffer the water
+		// surface shader attenuates, which is why every earlier version of
+		// this view showed nothing.
 		colorOut0 = hit ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0);
 		return;
 	}
+
 	if (!hit)
 	{
-		colorOut0 = gameReflection;
+		colorOut0 = vec4(sceneColor, 1.0);
 		return;
 	}
 
-	// The colour snapshot is taller than the scene by its alignment padding -
-	// 1280x736 against a 1280x720 scene, measured. Sampling it with the same UV
-	// as the depth would stretch the image over the padding and shift every
-	// reflection downward, so V is rescaled into the part that holds real
-	// pixels. faroBitmaskAoParams.z carries depthHeight/colourHeight.
-	float colourVScale = faroBitmaskAoParams.z > 0.0 ? faroBitmaskAoParams.z : 1.0;
-	vec3 reflected = texture(textureSrc2, vec2(hitUV.x, hitUV.y * colourVScale)).rgb;
+	vec3 reflected = texture(textureSrc, hitUV).rgb;
 
-	// Fade towards the game's own reflection near the screen edges.
-	//
-	// Not cosmetic: screen-space reflection has no information outside the
-	// frame, so a ray that hits near the border is reflecting the last thing
-	// that happened to be visible. Cutting there produces a hard seam that
-	// swims as the camera turns; fading to the sky the game already computed
-	// makes the limit read as haze instead of a defect.
+	// Screen-space has no data past the frame, so a hit against the border is
+	// reflecting whatever happened to be visible there. Cutting hard gives a
+	// seam that swims as the camera turns.
 	vec2 edge = min(hitUV, vec2(1.0) - hitUV);
 	float edgeFade = clamp(min(edge.x, edge.y) / 0.08, 0.0, 1.0);
-
-	// Also fade with ray length: the further a hit is along the ray, the more
-	// likely it is a thickness-test false positive.
+	// A far hit is likelier to be a thickness-test false positive than a near
+	// one, and a ray turning back toward the camera carries less information.
 	float lengthFade = 1.0 - clamp(t / maxDistance, 0.0, 1.0);
+	float dirFade = clamp(dot(viewDir, reflectDir), 0.0, 1.0);
+	// Schlick, with the 0.04 base reflectance qUINT uses for dielectrics.
+	// Strong at grazing angles, weak looking straight down - which is how water
+	// behaves, and without it the result reads as a mirror laid over the scene.
+	float grazeFade = clamp(1.0 - dot(-viewDir, normal), 0.0, 1.0);
+	float fresnel = mix(0.04, 1.0, pow(grazeFade, 4.0));
 
-	float confidence = edgeFade * mix(0.4, 1.0, lengthFade);
-	colorOut0 = vec4(mix(gameReflection.rgb, reflected, confidence), gameReflection.a);
+	float strength = clamp(faroGtaoParams.x, 0.0, 2.0);
+	float weight = edgeFade * mix(0.5, 1.0, lengthFade) * mix(0.4, 1.0, dirFade) * fresnel * strength;
+	// Also scaled by how strongly the game marked this pixel, so a surface it
+	// treated as barely reflective does not become a mirror.
+	weight *= clamp(maskStrength * 4.0, 0.0, 1.0);
+
+	colorOut0 = vec4(mix(sceneColor, reflected, clamp(weight, 0.0, 1.0)), 1.0);
 }
 )";

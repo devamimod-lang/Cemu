@@ -3322,27 +3322,6 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	LatteTextureViewVk* texViewVk = (LatteTextureViewVk*)texView;
 	draw_endRenderPass();
 
-	// The scene colour, taken here because here it is unambiguous.
-	//
-	// texView is the game's finished image on its way to the screen - the same
-	// view SSAO, GI and TAA already operate on. No heuristic can be wrong about
-	// it, which matters because ten rounds were spent trying to identify the
-	// scene colour mid-frame by matching buffer sizes, draw order and depth
-	// pairing, and every one of those picked the graphic pack's 2560x1440
-	// output or the game's own 640x384 reflection buffer instead.
-	//
-	// The reason that path was taken at all was a correctness argument: capture
-	// colour at the same instant as depth so a reflection ray reads colour at a
-	// position it derived from matching depth. That argument is sound, and
-	// taking it here costs exactly one frame of latency - the water draws
-	// before this runs, so it reads the previous frame's colour and reflections
-	// lag slightly under fast camera movement.
-	//
-	// But optimising temporal correspondence before anything worked at all was
-	// the actual mistake. One frame of latency beats no reflection.
-	if (!padView)
-		CaptureSceneColourSnapshot(texView);
-
 	// barrier for input texture
 	VkMemoryBarrier memoryBarrier{};
 	memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -4739,6 +4718,246 @@ bool VulkanRenderer::RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, 
 		depthLayers.baseArrayLayer = depthView->firstSlice;
 		depthLayers.layerCount = depthView->numSlice;
 		barrier_image<IMAGE_READ, IMAGE_WRITE>(depthTexVk, depthLayers, depthTexVk->GetDefaultLayout());
+	}
+	return true;
+}
+
+// The water reflection march. Runs in the output chain, on complete data.
+//
+// Single pass: it reads the scene colour, the scene depth and the water mask,
+// and writes the composited result straight to the chain's next target. The GI
+// pass needs two because it blurs; a sharp reflection does not, and the user
+// asked for a sharp one.
+bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
+	VkImageView colorInputView, VkSampler colorInputSampler,
+	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent)
+{
+	// One latch PER REASON, and the distinction is not pedantry.
+	//
+	// This started as a single bool for the whole function, and it immediately
+	// did the damage it was written to prevent: on the second frame the pass
+	// reported "no water mask captured yet", latched, and then declined
+	// silently for the rest of the session. The mask arrived 1200 frames later
+	// and nothing ever said whether the pass had started working or was still
+	// refusing for some different reason.
+	//
+	// A shared latch across distinct failures is not "log once" - it is "log
+	// the first one and hide every other". Three separate bugs in this feature
+	// were prolonged by exactly that, and this one was written by the same
+	// person who documented them.
+	static uint32 s_ssrBail = 0;
+	auto bailOnce = [&](uint32 bit, const char* reason) -> bool
+	{
+		if (!(s_ssrBail & (1u << bit)))
+		{
+			s_ssrBail |= (1u << bit);
+			cemuLog_log(LogType::Force, "Anubis water SSR: not running ({})", reason);
+		}
+		return false;
+	};
+
+	if (!GetConfig().faro_postfx_enabled || !GetConfig().faro_water_reflections)
+		return false; // turned off, not a fault
+	// The mask is captured mid-frame by AnubisRunWaterReflection, so on the
+	// very first frames with water in view it does not exist yet.
+	if (!m_waterMaskValid || !m_waterMaskView || !m_waterMaskView->baseTexture)
+		return bailOnce(0, "no water mask captured yet - the game has not drawn its reflection buffer");
+	// The game's reflection texture, sampled directly. Marked in use again
+	// here because the capture ran earlier in the frame and the cache is free
+	// to retire textures in between.
+	LatteTC_MarkTextureStillInUse(m_waterMaskView->baseTexture);
+	auto* maskTexVk = static_cast<LatteTextureVk*>(m_waterMaskView->baseTexture);
+	auto* maskViewVk = static_cast<LatteTextureViewVk*>(m_waterMaskView);
+	VKRObjectTextureView* sampledMaskView = maskViewVk->GetViewRGBA();
+	if (!sampledMaskView || sampledMaskView->m_textureImageView == VK_NULL_HANDLE)
+		return bailOnce(7, "the game reflection texture is not samplable");
+	if (!HasCapturedDepth())
+		return bailOnce(1, "no scene depth captured");
+	LatteTextureView* depthView = GetCapturedDepthView();
+	if (!depthView || !depthView->baseTexture)
+		return bailOnce(2, "depth view gone");
+	LatteTC_MarkTextureStillInUse(depthView->baseTexture);
+	RendererOutputShader* ssrShader = RendererOutputShader::s_anubis_water_ssr_shader;
+	if (!ssrShader)
+		return bailOnce(3, "shader not compiled");
+	auto* depthViewVk = static_cast<LatteTextureViewVk*>(depthView);
+	auto* depthTexVk = static_cast<LatteTextureVk*>(depthView->baseTexture);
+	VKRObjectTextureView* sampledDepthView = depthViewVk->GetViewRGBA();
+	if (!sampledDepthView || sampledDepthView->m_textureImageView == VK_NULL_HANDLE)
+		return bailOnce(4, "depth not samplable");
+
+	// Own sampler rather than borrowing the GI one, whose lifetime belongs to
+	// another feature and which does not exist when SSAO is off.
+	if (m_waterMaskSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_waterMaskSampler) != VK_SUCCESS)
+			return bailOnce(5, "could not create the mask sampler");
+	}
+
+	const bool useDepthSnapshot = m_faroDepthSnapshotValid && m_faroDepthSnapshotView != VK_NULL_HANDLE;
+	VkImageView depthSampleView = useDepthSnapshot ? m_faroDepthSnapshotView : sampledDepthView->m_textureImageView;
+	VkSampler depthSampleSampler = useDepthSnapshot ? m_faroDepthSnapshotSampler : m_waterMaskSampler;
+
+	// Under debug view 7, binding 3 is given the SCENE COLOUR instead of the
+	// mask. This is the test that separates the last two possibilities.
+	//
+	// What is known so far: binding 0 works (debug view 8 falls through to the
+	// normal path and the image is correct), the pass writes the screen (every
+	// debug branch turns it black), the capture runs 1800+ times a session, and
+	// the mask samples as exactly zero even after the capture clears that image
+	// to orange from the CPU. An image written on the CPU and read as zero on
+	// the GPU means either the wrong image is bound, or binding 3 is not being
+	// read at all - and those two have completely different fixes.
+	//
+	// Binding a view already proven good at binding 0 decides it: if the screen
+	// shows the scene, binding 3 works and the mask image is the problem; if it
+	// stays black, binding 3 is the problem and the mask is irrelevant.
+	// The game's texture sits in its default layout, which is GENERAL - that is
+	// samplable, but the descriptor helper declares SHADER_READ_ONLY, so it is
+	// transitioned for the draw and put back immediately after. The same
+	// borrow-and-restore the depth path uses.
+	VkImageSubresourceLayers maskLayers{};
+	maskLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	maskLayers.mipLevel = m_waterMaskView->firstMip;
+	maskLayers.baseArrayLayer = m_waterMaskView->firstSlice;
+	maskLayers.layerCount = 1;
+	barrier_image<IMAGE_WRITE | IMAGE_READ, IMAGE_READ>(maskTexVk, maskLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	const bool bind3Test = int(GetConfig().faro_debug_view.GetValue()) == CemuConfig::kFaroDebugWaterNormal;
+	VkDescriptorSet ssrSet = GetFaroEffectDescriptorSet(colorInputView, colorInputSampler,
+		depthSampleView, depthSampleSampler,
+		bind3Test ? colorInputView : sampledMaskView->m_textureImageView,
+		bind3Test ? colorInputSampler : m_waterMaskSampler);
+	if (ssrSet == VK_NULL_HANDLE)
+		return bailOnce(6, "descriptor set unavailable");
+
+	// Only a LIVE depth needs the transition; the snapshot copy already left
+	// itself in SHADER_READ_ONLY.
+	for (sint32 mip = 0; !useDepthSnapshot && mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_WRITE, IMAGE_READ>(depthTexVk, depthLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
+
+	auto ssrPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, ssrShader, outputRenderPass);
+
+	VkMemoryBarrier inputBarrier{};
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &inputBarrier, 0, nullptr, 0, nullptr);
+
+	auto uniforms = ssrShader->FillUniformBlockBuffer(*texView, { passWidth, passHeight }, padView);
+	uniforms.applySRGBEncoding = false;
+	uniforms.targetGamma = uniforms.displayGamma;
+	// x = strength, z = march length in view units, w = far plane for the
+	// linearisation. The shader derives everything else.
+	uniforms.faroGtaoParams[0] = 1.0f;
+	uniforms.faroGtaoParams[2] = (float)std::clamp(GetConfig().faro_water_reflection_distance.GetValue(), 1, 200);
+	uniforms.faroGtaoParams[3] = 1000.0f;
+	// The dimensions of the depth texture actually sampled, which the shader
+	// needs for both the aspect ratio and its texel size. Reading the output
+	// resolution instead skews every reconstructed position, and reading the
+	// wrong one of two differently sized depth sources takes the normal
+	// derivatives half a texel apart - both were real bugs here.
+	{
+		uint32 dW = 1, dH = 1;
+		if (useDepthSnapshot)
+		{
+			dW = std::max(m_faroDepthSnapshotExtent.width, 1u);
+			dH = std::max(m_faroDepthSnapshotExtent.height, 1u);
+		}
+		else
+		{
+			sint32 sdW = 0, sdH = 0;
+			depthView->baseTexture->GetEffectiveSize(sdW, sdH, depthView->firstMip);
+			dW = (uint32)std::max(sdW, 1);
+			dH = (uint32)std::max(sdH, 1);
+		}
+		uniforms.faroBitmaskAoParams[0] = (float)dW;
+		uniforms.faroBitmaskAoParams[1] = (float)dH;
+	}
+	auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
+
+	VkViewport viewport{};
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)passWidth;
+	viewport.height = (float)passHeight;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	VkRect2D scissor{};
+	scissor.extent = outputExtent;
+
+	VkRenderPassBeginInfo rpInfo{};
+	rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpInfo.renderPass = outputRenderPass;
+	rpInfo.framebuffer = outputFramebuffer;
+	rpInfo.renderArea.offset = { 0, 0 };
+	rpInfo.renderArea.extent = outputExtent;
+	rpInfo.clearValueCount = 0;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ssrPipeline);
+	m_state.currentPipeline = ssrPipeline;
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ssrSet, 1, &uniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	VkMemoryBarrier outputBarrier{};
+	outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	outputBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	outputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &outputBarrier, 0, nullptr, 0, nullptr);
+
+	for (sint32 mip = 0; !useDepthSnapshot && mip < depthView->numMip; mip++)
+	{
+		VkImageSubresourceLayers depthLayers{};
+		depthLayers.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthLayers.mipLevel = depthView->firstMip + mip;
+		depthLayers.baseArrayLayer = depthView->firstSlice;
+		depthLayers.layerCount = depthView->numSlice;
+		barrier_image<IMAGE_READ, IMAGE_WRITE>(depthTexVk, depthLayers, depthTexVk->GetDefaultLayout());
+	}
+
+	// The game's texture goes back to the layout its own rendering expects.
+	barrier_image<IMAGE_READ, IMAGE_READ | IMAGE_WRITE>(maskTexVk, maskLayers, maskTexVk->GetDefaultLayout());
+
+	// Counts the pass that actually REFLECTS.
+	//
+	// This increment was briefly placed in the mask copy instead, which then
+	// reported "water SSR ran 600 times in 600 frames" while this function
+	// may not have executed once. A counter that measures something other
+	// than its name is worse than no counter: the previous SSR in this
+	// renderer was DELETED on the strength of "SSR ran 0/600 frames", from a
+	// counter that nothing incremented at all.
+	m_faroSsrRanFrames++;
+	static bool s_loggedFirstRun = false;
+	if (!s_loggedFirstRun)
+	{
+		s_loggedFirstRun = true;
+		cemuLog_log(LogType::Force, "Anubis water SSR: RUNNING - {}x{}, depth from {}",
+			passWidth, passHeight, useDepthSnapshot ? "the snapshot" : "the live scene buffer");
 	}
 	return true;
 }
@@ -7251,7 +7470,16 @@ void VulkanRenderer::CaptureSceneDepthSnapshot(LatteTextureView* depthView)
 	// touches - so it is opt-in until proven on real hardware, and turning it
 	// off is a settings change rather than a rebuild. GTAO/SSR then read the
 	// game's live depth buffer exactly as they did before this existed.
-	if (!GetConfig().faro_depth_snapshot)
+	// The water reflection pass needs this copy as much as GTAO does, so it
+	// turns the copy on by itself rather than relying on a second checkbox.
+	//
+	// Three independent booleans had to be true for that pass to run, all
+	// defaulting to false, and the only symptom of a half-on configuration was
+	// "no reflections" - indistinguishable from a broken march. The pass never
+	// executed once. A feature switch that silently requires two other
+	// switches is not a switch, so the dependency is expressed here, in the
+	// code that needs it, where no settings dialog can get it wrong.
+	if (!GetConfig().faro_depth_snapshot && !GetConfig().faro_water_reflections)
 	{
 		// Invalidating here, not just returning. The validity flag is sticky
 		// (see OnFaroFrameBoundary for why), so simply stopping the
@@ -8990,6 +9218,29 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 		if (RunFaroGiPass(texView, nativeWidth, nativeHeight, padView,
 			chainColorView, chainColorSampler, giOutRP, giOutFB, giOutExt,
 			chainInfo.m_surfaceFormat.format))
+		{
+			pass1InputSet = chainInB ? m_taaNativeResolveDescriptorSet : m_taaFxaaReadDescriptorSet;
+			chainColorView = chainInB ? m_taaNativeResolveView : m_taaFxaaView;
+			chainColorSampler = chainInB ? m_taaNativeResolveSampler : m_taaFxaaSampler;
+			chainInB = !chainInB;
+		}
+	}
+
+	// Water reflections, immediately after GI and on the same chain pattern.
+	//
+	// Here rather than mid-frame, which is where this lived and why it never
+	// worked: the game draws its reflection buffer before the scene, so the
+	// depth is still at its clear value at that point. In the output chain the
+	// colour and depth are complete - the same place ReShade runs, and the
+	// place GTAO and GI already read successfully every frame.
+	bool wantWaterSsr = GetConfig().faro_postfx_enabled && GetConfig().faro_water_reflections;
+	if (wantWaterSsr)
+	{
+		VkRenderPass ssrOutRP = chainInB ? m_taaNativeResolveRenderPass : m_taaFxaaRenderPass;
+		VkFramebuffer ssrOutFB = chainInB ? m_taaNativeResolveFramebuffer : m_taaFxaaFramebuffer;
+		VkExtent2D ssrOutExt = chainInB ? m_taaNativeResolveExtent : m_taaFxaaExtent;
+		if (RunFaroWaterSsrPass(texView, nativeWidth, nativeHeight, padView,
+			chainColorView, chainColorSampler, ssrOutRP, ssrOutFB, ssrOutExt))
 		{
 			pass1InputSet = chainInB ? m_taaNativeResolveDescriptorSet : m_taaFxaaReadDescriptorSet;
 			chainColorView = chainInB ? m_taaNativeResolveView : m_taaFxaaView;
@@ -11562,7 +11813,9 @@ void VulkanRenderer::CaptureSceneColourSnapshot(LatteTextureView* colourView)
 		}
 	};
 
-	if (!GetConfig().faro_colour_snapshot)
+	// Implied by the water reflection pass - see CaptureSceneDepthSnapshot for
+	// why the dependency lives in the code rather than in the settings dialog.
+	if (!GetConfig().faro_colour_snapshot && !GetConfig().faro_water_reflections)
 	{
 		// Invalidated rather than just skipped. The validity flag is sticky, so
 		// merely stopping the copies would leave readers using the LAST
@@ -11579,7 +11832,10 @@ void VulkanRenderer::CaptureSceneColourSnapshot(LatteTextureView* colourView)
 	}
 	auto* colourTexVk = static_cast<LatteTextureVk*>(colourView->baseTexture);
 	if (!colourTexVk->GetImageObj() || colourTexVk->GetImageObj()->m_image == VK_NULL_HANDLE)
+	{
+		bailOnce(2, "the colour texture has no Vulkan image");
 		return;
+	}
 	if ((colourTexVk->GetImageAspect() & VK_IMAGE_ASPECT_COLOR_BIT) == 0)
 	{
 		bailOnce(1, "attachment is not a colour image");
@@ -11589,7 +11845,10 @@ void VulkanRenderer::CaptureSceneColourSnapshot(LatteTextureView* colourView)
 	sint32 width, height;
 	colourView->baseTexture->GetEffectiveSize(width, height, colourView->firstMip);
 	if (width <= 0 || height <= 0)
+	{
+		bailOnce(3, "the colour view reports a zero size");
 		return;
+	}
 
 	// No size heuristic here any more.
 	//
@@ -11608,12 +11867,16 @@ void VulkanRenderer::CaptureSceneColourSnapshot(LatteTextureView* colourView)
 		m_faroColourSnapshotPendingFormat = colourTexVk->GetFormat();
 		m_faroColourSnapshotPendingWidth = (uint32)width;
 		m_faroColourSnapshotPendingHeight = (uint32)height;
-		return; // no snapshot this frame; the reader falls back
+		bailOnce(4, "target not allocated yet - requested, will be ready next frame");
+		return;
 	}
 
 	draw_endRenderPass();
 	if (m_state.currentCommandBuffer == VK_NULL_HANDLE)
+	{
+		bailOnce(5, "no command buffer is being recorded");
 		return;
+	}
 
 	VkImageSubresourceLayers srcLayers{};
 	srcLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -11840,7 +12103,12 @@ bool VulkanRenderer::AnubisAllocateWaterScratch(VkFormat format, uint32 width, u
 	imageInfo.format = format;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	// TRANSFER_DST so the game reflection buffer can be copied in, SAMPLED so
+	// the output-chain pass can read it. It was COLOR_ATTACHMENT|TRANSFER_SRC
+	// when this image was a render target for a mid-frame march; that march is
+	// gone and this is now only a copy of the game's own buffer, kept so a
+	// later pass can tell which pixels the game treats as reflective.
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_waterScratchImage) != VK_SUCCESS)
@@ -11881,17 +12149,37 @@ bool VulkanRenderer::AnubisAllocateWaterScratch(VkFormat format, uint32 width, u
 // A scratch target is unavoidable. The march needs the game's buffer as its
 // miss fallback, so it reads and writes the same surface - which one pass
 // cannot do. Render to scratch, then copy back.
-void VulkanRenderer::AnubisRunWaterReflection(LatteTextureView* reflectView)
+// Captures the game's water reflection buffer so a later pass can use it as a
+// MATERIAL MASK. It no longer reflects anything itself.
+//
+// This used to run the whole screen-space march here, at the moment the game
+// finishes drawing that buffer. Every problem that cost this feature a day came
+// from that one choice of location, and none of them were the reflection:
+//
+//   - the scene depth read 1.0 to five decimal places, because the game draws
+//     its reflection buffer BEFORE the scene, so the depth buffer is still at
+//     its clear value at that instant;
+//   - trying to substitute an end-of-frame depth copy made two capture sites
+//     fight over one allocation and left it empty;
+//   - the game's own reflection depth is present there but marching it put 88%
+//     of rays off-screen.
+//
+// ReShade's SSR works on this game, and ReShade runs in post-processing, at the
+// end of the frame, where the colour and depth are complete. This emulator has
+// that same place and it already works: the GTAO and GI passes read full scene
+// colour and depth in the output chain every frame. So the march belongs there,
+// and the only thing that place lacks is the one thing a screen-space pass can
+// never derive - which surfaces are supposed to reflect.
+//
+// That is what this function now provides, and nothing else.
+void VulkanRenderer::AnubisRunWaterReflection(LatteTextureView* reflectView, LatteTextureView* gameDepthView)
 {
-	// Reports each reason once. Without this the pass can decline for any of
-	// nine reasons and the only symptom is "no difference", which is exactly
-	// how this landed the first time.
-	static uint32 s_wrBail = 0;
+	static uint32 s_maskBail = 0;
 	auto bailOnce = [&](uint32 bit, const char* why) {
-		if (!(s_wrBail & (1u << bit)))
+		if (!(s_maskBail & (1u << bit)))
 		{
-			s_wrBail |= (1u << bit);
-			cemuLog_log(LogType::Force, "Anubis water reflect: not running - {}", why);
+			s_maskBail |= (1u << bit);
+			cemuLog_log(LogType::Force, "Anubis water mask: not capturing - {}", why);
 		}
 	};
 
@@ -11902,251 +12190,47 @@ void VulkanRenderer::AnubisRunWaterReflection(LatteTextureView* reflectView)
 		bailOnce(0, "no reflection target view");
 		return;
 	}
-	// Both snapshots are required and they must be the matched pair - see
-	// CaptureSceneColourSnapshot for why they share a trigger.
-	if (!m_faroColourSnapshotValid || !m_faroDepthSnapshotValid)
-	{
-		bailOnce(1, m_faroColourSnapshotValid ? "depth snapshot not valid - enable the depth copy too"
-			: "colour snapshot not valid - the scene colour copy has not been taken");
-		return;
-	}
-	if (m_faroColourSnapshotView == VK_NULL_HANDLE || m_faroDepthSnapshotView == VK_NULL_HANDLE)
-	{
-		bailOnce(2, "a snapshot image has not been allocated yet");
-		return;
-	}
-	RendererOutputShader* shader = RendererOutputShader::s_anubis_water_ssr_shader;
-	if (!shader)
-	{
-		bailOnce(3, "the march shader did not compile");
-		return;
-	}
-
 	auto* reflectTexVk = static_cast<LatteTextureVk*>(reflectView->baseTexture);
 	if (!reflectTexVk->GetImageObj() || reflectTexVk->GetImageObj()->m_image == VK_NULL_HANDLE)
 		return;
-	auto* reflectViewVk = static_cast<LatteTextureViewVk*>(reflectView);
-	VKRObjectTextureView* reflectSampleView = reflectViewVk->GetViewRGBA();
-	if (!reflectSampleView || reflectSampleView->m_textureImageView == VK_NULL_HANDLE)
-		return;
 
-	sint32 width, height;
+	sint32 width = 0, height = 0;
 	reflectView->baseTexture->GetEffectiveSize(width, height, reflectView->firstMip);
 	if (width <= 0 || height <= 0)
 		return;
 
+	// Allocation is deferred to the frame boundary when the size changes - see
+	// AnubisEnsureWaterScratch. Creating an image here would free memory that
+	// recorded-but-unsubmitted commands still reference.
 	const VkFormat format = reflectTexVk->GetFormat();
 	if (!AnubisEnsureWaterScratch(format, (uint32)width, (uint32)height))
 	{
-		bailOnce(4, "scratch target could not be allocated");
+		bailOnce(1, "mask target not allocated yet - will be ready next frame");
+		m_waterMaskValid = false;
 		return;
 	}
 
-	// One render pass per scratch format, created once - pipelines are keyed on
-	// the render pass handle.
-	if (m_waterScratchRenderPass == VK_NULL_HANDLE)
-	{
-		VkAttachmentDescription colorAttachment{};
-		colorAttachment.format = format;
-		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-		VkAttachmentReference colorRef{};
-		colorRef.attachment = 0;
-		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		VkSubpassDescription subpass{};
-		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-		subpass.colorAttachmentCount = 1;
-		subpass.pColorAttachments = &colorRef;
-		VkRenderPassCreateInfo rpInfo{};
-		rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-		rpInfo.attachmentCount = 1;
-		rpInfo.pAttachments = &colorAttachment;
-		rpInfo.subpassCount = 1;
-		rpInfo.pSubpasses = &subpass;
-		if (vkCreateRenderPass(m_logicalDevice, &rpInfo, nullptr, &m_waterScratchRenderPass) != VK_SUCCESS)
-		{
-			m_waterScratchRenderPass = VK_NULL_HANDLE;
-			return;
-		}
-	}
+	// No copy. The view is handed to the output pass, which samples the game's
+	// texture directly.
+	//
+	// The copy that used to be here was the last broken link, and it was found
+	// by elimination rather than by reasoning: binding 3 reads correctly, the
+	// image has memory bound, the view is created from that image, the
+	// descriptor cache keys on both, the render pass is properly ended before
+	// this point, and a clear issued from the OUTPUT CHAIN onto this very image
+	// showed up on screen - while the clear issued from here, in this command
+	// buffer, never did. Everything about the destination was sound; the
+	// recording at this point in the frame was not.
+	//
+	// MarkTextureStillInUse is what makes keeping the pointer safe: without it
+	// the texture cache can retire the texture before the output chain runs,
+	// which is the use-after-free class that caused three loading-screen
+	// crashes in this work.
+	LatteTC_MarkTextureStillInUse(reflectView->baseTexture);
+	m_waterMaskView = reflectView;
 
-	VkImageView attachments[1] = { m_waterScratchView };
-	VkFramebufferCreateInfo fbInfo{};
-	fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-	fbInfo.renderPass = m_waterScratchRenderPass;
-	fbInfo.attachmentCount = 1;
-	fbInfo.pAttachments = attachments;
-	fbInfo.width = (uint32)width;
-	fbInfo.height = (uint32)height;
-	fbInfo.layers = 1;
-	VkFramebuffer fb = VK_NULL_HANDLE;
-	if (vkCreateFramebuffer(m_logicalDevice, &fbInfo, nullptr, &fb) != VK_SUCCESS)
-		return;
-
-	auto pipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, false, shader, m_waterScratchRenderPass);
-	if (pipeline == VK_NULL_HANDLE)
-	{
-		vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
-		return;
-	}
-
-	VKRObjectDescriptorSet* dsObj = new VKRObjectDescriptorSet();
-	VkDescriptorSet ds = VK_NULL_HANDLE;
-	{
-		VkDescriptorSetAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-		allocInfo.descriptorPool = m_descriptorPool;
-		allocInfo.descriptorSetCount = 1;
-		allocInfo.pSetLayouts = &m_swapchainDescriptorSetLayout;
-		if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &ds) != VK_SUCCESS)
-		{
-			delete dsObj;
-			vkDestroyFramebuffer(m_logicalDevice, fb, nullptr);
-			return;
-		}
-		dsObj->descriptorSet = ds;
-		performanceMonitor.vk.numDescriptorSets.increment();
-
-		VkDescriptorImageInfo reflectInfo{};
-		reflectInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		reflectInfo.imageView = reflectSampleView->m_textureImageView;
-		reflectInfo.sampler = m_faroColourSnapshotSampler;
-
-		VkDescriptorImageInfo colourInfo{};
-		colourInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		colourInfo.imageView = m_faroColourSnapshotView;
-		colourInfo.sampler = m_faroColourSnapshotSampler;
-
-		VkDescriptorImageInfo depthInfo{};
-		depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		depthInfo.imageView = m_faroDepthSnapshotView;
-		depthInfo.sampler = m_faroDepthSnapshotSampler;
-
-		VkDescriptorBufferInfo uniformBufferInfo{};
-		uniformBufferInfo.buffer = m_uniformVarBuffer;
-		uniformBufferInfo.offset = 0;
-		uniformBufferInfo.range = sizeof(RendererOutputShader::OutputUniformVariables);
-
-		VkWriteDescriptorSet writes[4]{};
-		writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[0].dstSet = ds;
-		writes[0].dstBinding = 0;
-		writes[0].descriptorCount = 1;
-		writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		writes[0].pImageInfo = &reflectInfo;
-		writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[1].dstSet = ds;
-		writes[1].dstBinding = 1;
-		writes[1].descriptorCount = 1;
-		writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-		writes[1].pBufferInfo = &uniformBufferInfo;
-		writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[2].dstSet = ds;
-		writes[2].dstBinding = 2;
-		writes[2].descriptorCount = 1;
-		writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		writes[2].pImageInfo = &colourInfo;
-		writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[3].dstSet = ds;
-		writes[3].dstBinding = 3;
-		writes[3].descriptorCount = 1;
-		writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		writes[3].pImageInfo = &depthInfo;
-		vkUpdateDescriptorSets(m_logicalDevice, 4, writes, 0, nullptr);
-	}
-
-	// The game's buffer has to be readable. It was just a colour attachment, so
-	// this is the transition from written to sampled.
-	VkImageSubresourceLayers reflectLayers{};
-	reflectLayers.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	reflectLayers.mipLevel = reflectView->firstMip;
-	reflectLayers.baseArrayLayer = reflectView->firstSlice;
-	reflectLayers.layerCount = 1;
-	barrier_image<IMAGE_WRITE | ANY_TRANSFER, IMAGE_READ>(reflectTexVk, reflectLayers, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-	VkRenderPassBeginInfo rpBegin{};
-	rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	rpBegin.renderPass = m_waterScratchRenderPass;
-	rpBegin.framebuffer = fb;
-	rpBegin.renderArea.offset = { 0, 0 };
-	rpBegin.renderArea.extent = { (uint32)width, (uint32)height };
-	rpBegin.clearValueCount = 0;
-
-	VkViewport viewport{};
-	viewport.x = 0.0f;
-	viewport.y = 0.0f;
-	viewport.width = (float)width;
-	viewport.height = (float)height;
-	viewport.minDepth = 0.0f;
-	viewport.maxDepth = 1.0f;
-	VkRect2D scissor{};
-	scissor.offset = { 0, 0 };
-	scissor.extent = { (uint32)width, (uint32)height };
-	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
-	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
-
-	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-	m_state.currentPipeline = pipeline;
-
-	auto uniforms = shader->FillUniformBlockBuffer(*reflectViewVk, { width, height }, false);
-	uniforms.applySRGBEncoding = false;
-	uniforms.targetGamma = uniforms.displayGamma;
-	// z = march distance in view units, w = the far plane the depth snapshot was
-	// written against. Both must match what the depth linearisation expects or
-	// every reconstructed position is wrong by a scale factor.
-	uniforms.faroGtaoParams[2] = (float)std::clamp(GetConfig().faro_water_reflection_distance.GetValue(), 1, 200);
-	uniforms.faroGtaoParams[3] = 1000.0f;
-	// The DEPTH snapshot's dimensions, which the shader needs for the
-	// projection. Its own target is 640x384 and the scene is not, so deriving
-	// the aspect from outputResolution skewed every reconstructed position.
-	{
-		uint32 dW = 0, dH = 0;
-		GetCapturedDepthSize(dW, dH);
-		uniforms.faroBitmaskAoParams[0] = (float)std::max<uint32>(dW, 1);
-		uniforms.faroBitmaskAoParams[1] = (float)std::max<uint32>(dH, 1);
-		// Scene height over snapshot height, so the shader can skip the
-		// alignment padding instead of stretching the image across it.
-		uniforms.faroBitmaskAoParams[2] = (m_faroColourSnapshotExtent.height > 0 && dH > 0)
-			? (float)dH / (float)m_faroColourSnapshotExtent.height
-			: 1.0f;
-	}
-	auto uniformOffset = uniformData_uploadUniformDataBufferGetOffset({ (uint8*)&uniforms, sizeof(decltype(uniforms)) });
-	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ds, 1, &uniformOffset);
-	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
-	vkCmdEndRenderPass(m_state.currentCommandBuffer);
-
-	// Copy the result back over the game's buffer, so the water surface samples
-	// the improved reflection without knowing anything changed.
-	barrier_image<IMAGE_READ, ANY_TRANSFER>(reflectTexVk, reflectLayers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-	VkImageCopy region{};
-	region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	region.srcSubresource.mipLevel = 0;
-	region.srcSubresource.baseArrayLayer = 0;
-	region.srcSubresource.layerCount = 1;
-	region.dstSubresource = reflectLayers;
-	region.dstSubresource.layerCount = 1;
-	region.extent = { (uint32)width, (uint32)height, 1 };
-	vkCmdCopyImage(m_state.currentCommandBuffer,
-		m_waterScratchImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		reflectTexVk->GetImageObj()->m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		1, &region);
-
-	// Back to the layout the game expects, or its next use of this texture
-	// reads it in the wrong state.
-	barrier_image<ANY_TRANSFER, IMAGE_READ | IMAGE_WRITE>(reflectTexVk, reflectLayers, reflectTexVk->GetDefaultLayout());
-
-	auto* fbObj = new AnubisUpscaleFramebuffer(m_logicalDevice, fb);
-	fbObj->flagForCurrentCommandBuffer();
-	ReleaseDestructibleObject(fbObj);
-	dsObj->flagForCurrentCommandBuffer();
-	ReleaseDestructibleObject(dsObj);
-
+	m_waterMaskValid = true;
 	m_waterReflectionCount++;
+	if ((m_waterReflectionCount % 600u) == 1u)
+		cemuLog_log(LogType::Force, "Anubis water mask: captured {} times, {}x{}", m_waterReflectionCount, width, height);
 }

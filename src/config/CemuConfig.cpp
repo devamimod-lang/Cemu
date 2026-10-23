@@ -159,7 +159,11 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	faro_colour_snapshot = graphic.get("FaroColourSnapshot", false);
 	faro_water_reflections = graphic.get("FaroWaterReflections", false);
 	faro_water_reflection_distance = graphic.get("FaroWaterReflectionDistance", 40);
-	faro_debug_view = std::clamp<sint32>(graphic.get("FaroDebugView", 0), 0, 6);
+	// Clamped to the LAST enum value, not a literal. A hard-coded 6 here
+	// silently discarded the three water debug views on every startup - the
+	// value saved correctly and was then thrown away on load, which reads as
+	// "the setting will not stay selected".
+	faro_debug_view = std::clamp<sint32>(graphic.get("FaroDebugView", 0), 0, (sint32)kFaroDebugWaterForce);
 	force_anisotropic_level = graphic.get("ForceAnisotropicLevel", kForceAnisoOff);
 	// Faro Global Enhancements (see CemuConfig.h)
 	faro_postfx_enabled = graphic.get("FaroPostFX", false);

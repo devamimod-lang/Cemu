@@ -1585,6 +1585,62 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 				usedFsr1, downscaling, imageWidth, imageHeight, effectiveWidth, effectiveHeight, GetConfig().antialiasing_mode.GetValue());
 		}
 	}
+	// Scene colour snapshot, taken BEFORE the output dispatch below.
+	//
+	// Here and not inside a renderer function, because there are four separate
+	// output chains - plain, two-pass, TAA and FSR1+TAA - and which one runs
+	// depends on the user's upscale and antialiasing settings. Hooking
+	// VulkanRenderer::DrawBackbufferQuad caught only the fallback path, so with
+	// FSR1 selected the capture never executed at all and the reflection pass
+	// reported "colour snapshot not valid" forever.
+	//
+	// That is the second time this exact trap has been hit in this work: the GI
+	// pass had the same problem, with its call site on a chain the user's FSR1
+	// setting never takes. One call site above the dispatch cannot miss.
+	//
+	// textureView is the game's finished scene image, which is what every chain
+	// below is about to display, so there is nothing to disambiguate.
+	if (!isPadView)
+	{
+		g_renderer->CaptureSceneColourSnapshot(textureView);
+
+		// Refresh the DEPTH snapshot here too, at the same moment as the
+		// colour, so the pair really is a matched end-of-frame pair.
+		//
+		// The other call site (further up this file) fires mid-frame, when a
+		// depth buffer is unbound with the most vertices so far. That is right
+		// for GTAO, which reads the snapshot later in the same frame. It is
+		// useless to anything that reads it EARLY in a frame: the water
+		// reflection pass runs before the game has drawn the scene, and a CPU
+		// readback measured the depth it got as 1.0 to five decimal places on
+		// 100% of pixels - the buffer is simply still at its clear value then.
+		//
+		// This is also the moment ReShade sees, which settles it: ReShade's SSR
+		// does reflect nearby geometry in this game, so the data is present in
+		// the normal scene depth and the only thing we had wrong was when we
+		// looked at it.
+		//
+		// REVERTED, and worth keeping the reason.
+		//
+		// This called CaptureSceneDepthSnapshot(GetCapturedDepthView()) here.
+		// That view is the post-FX depth SELECTION, and the log says what it
+		// actually points at:
+		//
+		//   Faro depth capture: using depth 1280x720 for post FX
+		//                       (4 drawcalls / 12 vertices last frame)
+		//
+		// Twelve vertices - an essentially empty buffer - while the real scene
+		// depth that frame was 2560x1440 with 5.2 million. Copying the small
+		// one into a snapshot allocated for the large one fails the size check
+		// in CaptureSceneDepthSnapshot, which defers a resize; the mid-frame
+		// call site then defers it back. The two fought over the allocation
+		// every frame and left the snapshot with nothing in it, which the probe
+		// measured as a depth pinned at the far plane on 100% of pixels.
+		//
+		// The mid-frame call site passes the best-vertices candidate directly
+		// and keeps the snapshot correct, so it is left as the only writer.
+	}
+
 	// FSR1 always needs a 2nd pass (RCAS, see s_fsr1_rcas_shader's doc comment)
 	// on top of the EASU pass selected above. FXAA/SMAA (only offered as
 	// add-ons to FSR1 - see GeneralSettings2.cpp / CemuConfig.h:AntialiasingMode)

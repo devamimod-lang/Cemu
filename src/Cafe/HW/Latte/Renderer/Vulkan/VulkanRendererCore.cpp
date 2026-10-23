@@ -1204,8 +1204,28 @@ void VulkanRenderer::draw_prepareDescriptorSets(PipelineInfo* pipeline_info, VkD
 	// every surface reflects").
 	if (pixelShader && pixelShader->baseHash == 0x340382e6fbbb3951ull && GetConfig().faro_water_reflections)
 	{
+		// Only a flag. The target is read from the FBO at the moment its render
+		// pass closes - see draw_endRenderPass for why storing a view here was a
+		// dangling pointer.
 		m_waterReflectPending = true;
-		m_waterReflectView = LatteMRT::GetColorAttachment(0);
+
+		// The depth the game's own reflection shader reads, at pixel texture
+		// unit 1 - textureUnitPS1 in the decompiled shader, which it linearises
+		// and marches itself. Captured here because this is the only moment it
+		// is known to be bound.
+		//
+		// MarkTextureStillInUse is what makes storing this safe, and it is the
+		// difference from the dangling-pointer bug above: without it the texture
+		// cache can retire the texture before draw_endRenderPass runs.
+		m_waterGameDepthView = nullptr;
+		if (LatteTextureViewVk* gameDepth = m_state.boundTexture[LATTE_CEMU_PS_TEX_UNIT_BASE + 1])
+		{
+			if (gameDepth->baseTexture)
+			{
+				LatteTC_MarkTextureStillInUse(gameDepth->baseTexture);
+				m_waterGameDepthView = gameDepth;
+			}
+		}
 	}
 
 	auto prepareShaderDescriptors = [this, &pipeline_info](LatteDecompilerShader* shader) -> VkDescriptorSetInfo* {
@@ -1331,18 +1351,40 @@ void VulkanRenderer::draw_endRenderPass()
 	else
 		vkCmdEndRenderPass(m_state.currentCommandBuffer);
 	sync_RenderPassStoreTextures(m_state.activeRenderpassFBO);
+
+	// The target is taken from the FBO being closed RIGHT NOW, not from a
+	// pointer stored when the draw was seen.
+	//
+	// Storing the view across those two points was a dangling pointer. The
+	// water shader is detected in draw_prepareDescriptorSets and the pass runs
+	// here, and between them Cemu's texture cache is free to destroy the view -
+	// which is exactly what happens on a save-game loading screen, where views
+	// churn constantly. That accounts for both symptoms at once: writes landing
+	// in freed memory are invisible, and the crash only ever happened on that
+	// screen.
+	//
+	// This FBO's colour attachment is alive by construction: we are inside the
+	// call that ends its render pass.
+	LatteTextureView* reflectTarget = nullptr;
+	if (m_waterReflectPending && m_state.activeRenderpassFBO &&
+		m_state.activeRenderpassFBO->colorBuffer[0].texture)
+		reflectTarget = m_state.activeRenderpassFBO->colorBuffer[0].texture;
+
 	m_state.activeRenderpassFBO = nullptr;
 
-	// The game's reflection buffer is complete now, so the march can run over
-	// it. Flag and view are taken and CLEARED FIRST - AnubisRunWaterReflection
-	// calls this same function for its own pass, and leaving the flag set would
-	// recurse until the stack ran out.
+	// Cleared BEFORE the call: AnubisRunWaterReflection calls this same
+	// function for its own pass, and leaving the flag set would recurse without
+	// end.
 	if (m_waterReflectPending)
 	{
 		m_waterReflectPending = false;
-		LatteTextureView* view = m_waterReflectView;
 		m_waterReflectView = nullptr;
-		AnubisRunWaterReflection(view);
+		LatteTextureView* gameDepth = m_waterGameDepthView;
+		// Cleared before the call, not after: the pass must never see a view
+		// captured for an earlier draw.
+		m_waterGameDepthView = nullptr;
+		if (reflectTarget)
+			AnubisRunWaterReflection(reflectTarget, gameDepth);
 	}
 }
 

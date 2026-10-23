@@ -589,9 +589,16 @@ struct CemuConfig
 	// is recorded mid-frame from the framebuffer-bind path, the most intrusive
 	// place this renderer touches.
 	ConfigValue<bool> faro_colour_snapshot{false};
-	// Water reflections that reflect the WORLD, not just the sky. Requires the
-	// colour snapshot, since the march has to read the scene.
-	ConfigValue<bool> faro_water_reflections{false};
+	// Water reflections that reflect the WORLD, not just the sky.
+	//
+	// On by default, unlike the two snapshots it depends on. Those are opt-in
+	// because they are diagnostic copies with no effect of their own; this is
+	// the feature, and leaving it off meant it had never run at all.
+	//
+	// It no longer needs the snapshot settings to be enabled separately - the
+	// capture paths treat this flag as implying both, so there is one switch
+	// and it cannot be half-on. See CaptureSceneDepthSnapshot.
+	ConfigValue<bool> faro_water_reflections{true};
 	// March length in view units. Longer reaches further but spreads the same
 	// step count over more distance, so hits get coarser.
 	ConfigValue<sint32> faro_water_reflection_distance{40};
@@ -631,6 +638,17 @@ struct CemuConfig
 		// Green where a ray hit geometry, red where it missed and fell back to
 		// the sky. The most direct answer to an absent reflection.
 		kFaroDebugWaterHit = 9,
+		// Writes a solid magenta into the reflection buffer, ignoring the march
+		// entirely. This tests the OUTPUT PATH rather than the maths: if the
+		// water does not turn magenta, our writes never reach the screen - the
+		// copy-back failed, or the game overwrites that buffer after us - and no
+		// amount of correcting the ray march would ever show anything.
+		//
+		// Needed because the other water views write their colours INTO that
+		// buffer, and the game's water surface then multiplies it by Fresnel,
+		// tint and alpha. A pure colour arrives as a faint tinge, so "I see
+		// nothing" could not be told apart from "the pass did nothing".
+		kFaroDebugWaterForce = 10,
 	};
 	ConfigValue<sint32> faro_debug_view{kFaroDebugOff};
 

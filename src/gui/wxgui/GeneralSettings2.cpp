@@ -954,10 +954,10 @@ wxPanel* GeneralSettings2::AddGraphicsPage(wxBookCtrlBase* notebook)
 			auto* dbgSizer = new wxBoxSizer(wxHORIZONTAL);
 			dbgSizer->Add(new wxStaticText(graphics_panel, wxID_ANY, _("Debug view")), 0, wxALL | wxALIGN_CENTER_VERTICAL, 5);
 			// Order matters: the index IS the FaroDebugView value.
-			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter"), _("FSR1 sharpening lobe"), _("Water: surface normal"), _("Water: reflected direction"), _("Water: ray hit or miss") };
+			wxString dbgChoices[] = { _("Off"), _("Raw depth"), _("AO before filter"), _("Sample confidence"), _("March radius"), _("AO after filter"), _("FSR1 sharpening lobe"), _("Water: surface normal"), _("Water: reflected direction"), _("Water: ray hit or miss"), _("Water: force magenta (output test)") };
 			m_faro_debug_view = new wxChoice(graphics_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, std::size(dbgChoices), dbgChoices);
 			m_faro_debug_view->SetToolTip(_("Shows an intermediate buffer of the ambient-occlusion chain instead of the game image, to see which stage is unstable. 'Raw depth' is remapped so distant geometry is visible."));
-			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, CemuConfig::kFaroDebugWaterHit));
+			m_faro_debug_view->SetSelection(std::clamp<sint32>(GetConfig().faro_debug_view, 0, CemuConfig::kFaroDebugWaterForce));
 			m_faro_debug_view->Bind(wxEVT_CHOICE, [](wxCommandEvent& event) {
 				GetConfig().faro_debug_view = event.GetSelection();
 			});
@@ -2664,7 +2664,7 @@ void GeneralSettings2::ApplyConfig()
 		m_faro_ssao_quality->SetSelection(q);
 	}
 	m_faro_depth_snapshot->SetValue(config.faro_depth_snapshot);
-	m_faro_debug_view->SetSelection(std::clamp<sint32>(config.faro_debug_view, 0, CemuConfig::kFaroDebugWaterHit));
+	m_faro_debug_view->SetSelection(std::clamp<sint32>(config.faro_debug_view, 0, CemuConfig::kFaroDebugWaterForce));
 	{
 		const bool on = config.faro_postfx_enabled;
 		m_faro_ssao->Enable(on);

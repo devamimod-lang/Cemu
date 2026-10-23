@@ -5030,8 +5030,8 @@ void outputShader()
 const std::string RendererOutputShader::s_anubis_sssr_temporal_blend_source =
 R"(
 layout(binding = 0) uniform sampler2D textureCurrent;
-layout(binding = 1) uniform sampler2D textureHistory;
-layout(binding = 2) uniform sampler2D textureWaterMask;
+layout(binding = 2) uniform sampler2D textureHistory;
+layout(binding = 3) uniform sampler2D textureWaterMask;
 
 void outputShader()
 {

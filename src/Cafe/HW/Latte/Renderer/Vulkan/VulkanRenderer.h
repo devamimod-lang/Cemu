@@ -922,8 +922,10 @@ private:
 	uint32 m_waterScratchPendingHeight = 0;
 
 	// SSSR temporal history
-	LatteTextureView* m_sssrHistoryView = nullptr;
+	VkImage m_sssrHistoryImage = VK_NULL_HANDLE;
+	VkImageView m_sssrHistoryView = VK_NULL_HANDLE;
 	VkSampler m_sssrHistorySampler = VK_NULL_HANDLE;
+	VkDeviceMemory m_sssrHistoryMemory = VK_NULL_HANDLE;
 	bool m_sssrHistoryValid = false;
 
 	// Water reflection hit probe: reads the pass's own output back to the CPU

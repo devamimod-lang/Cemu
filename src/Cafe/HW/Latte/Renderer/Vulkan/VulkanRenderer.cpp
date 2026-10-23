@@ -4823,13 +4823,60 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 			return bailOnce(8, "could not create SSSR history sampler");
 	}
 	// Ensure history texture exists and matches current size
-	if (!m_sssrHistoryValid || m_waterScratchPendingWidth != passWidth || m_waterScratchPendingHeight != passHeight)
+	if (m_sssrHistoryImage == VK_NULL_HANDLE || m_waterScratchPendingWidth != passWidth || m_waterScratchPendingHeight != passHeight)
 	{
-		// For brevity, reuse water scratch allocation logic as placeholder.
-		// Real implementation should allocate a persistent RGBA8 image with the pass size.
+		// Cleanup old
+		if (m_sssrHistoryView != VK_NULL_HANDLE)
+		{
+			vkDestroyImageView(m_logicalDevice, m_sssrHistoryView, nullptr);
+			m_sssrHistoryView = VK_NULL_HANDLE;
+		}
+		if (m_sssrHistoryImage != VK_NULL_HANDLE)
+		{
+			vkDestroyImage(m_logicalDevice, m_sssrHistoryImage, nullptr);
+			m_sssrHistoryImage = VK_NULL_HANDLE;
+		}
+		// Create new RGBA8 image
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		imageInfo.extent.width = passWidth;
+		imageInfo.extent.height = passHeight;
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &m_sssrHistoryImage) != VK_SUCCESS)
+			return bailOnce(9, "could not create SSSR history image");
+		// Allocate memory
+		VkMemoryRequirements memReq{};
+		vkGetImageMemoryRequirements(m_logicalDevice, m_sssrHistoryImage, &memReq);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = m_memoryManager->FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (vkAllocateMemory(m_logicalDevice, &allocInfo, nullptr, &m_sssrHistoryMemory) != VK_SUCCESS)
+			return bailOnce(9, "could not allocate SSSR history memory");
+		vkBindImageMemory(m_logicalDevice, m_sssrHistoryImage, m_sssrHistoryMemory, 0);
+		// Create view
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_sssrHistoryImage;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &m_sssrHistoryView) != VK_SUCCESS)
+			return bailOnce(9, "could not create SSSR history view");
 		m_waterScratchPendingWidth = passWidth;
 		m_waterScratchPendingHeight = passHeight;
-		m_sssrHistoryValid = false; // trigger reallocation next frame
+		m_sssrHistoryValid = true;
 	}
 
 	const bool useDepthSnapshot = m_faroDepthSnapshotValid && m_faroDepthSnapshotView != VK_NULL_HANDLE;

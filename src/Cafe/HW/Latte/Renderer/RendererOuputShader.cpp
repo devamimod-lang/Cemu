@@ -1716,6 +1716,7 @@ RendererOutputShader* RendererOutputShader::s_anubis_sssr_depth_downsample_shade
 RendererOutputShader* RendererOutputShader::s_anubis_sssr_normal_reconstruct_shader;
 RendererOutputShader* RendererOutputShader::s_anubis_sssr_march_shader;
 RendererOutputShader* RendererOutputShader::s_anubis_sssr_temporal_shader;
+RendererOutputShader* RendererOutputShader::s_anubis_sssr_temporal_blend_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader_ud;
 
@@ -3330,6 +3331,7 @@ void RendererOutputShader::InitializeStatic()
      s_anubis_sssr_normal_reconstruct_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_normal_reconstruct_source);
      s_anubis_sssr_march_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_march_source);
      s_anubis_sssr_temporal_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_temporal_accumulate_source);
+     s_anubis_sssr_temporal_blend_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_temporal_blend_source);
 
      s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
     	s_fsr1_easu_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr1_easu_shader_source);
@@ -3388,6 +3390,7 @@ void RendererOutputShader::ShutdownStatic()
 	delete s_anubis_sssr_normal_reconstruct_shader;
 	delete s_anubis_sssr_march_shader;
 	delete s_anubis_sssr_temporal_shader;
+	delete s_anubis_sssr_temporal_blend_shader;
 
 	delete s_fsr1_easu_shader;
 	delete s_fsr1_easu_shader_ud;
@@ -3441,6 +3444,7 @@ void RendererOutputShader::ShutdownStatic()
 	s_anubis_sssr_normal_reconstruct_shader = nullptr;
 	s_anubis_sssr_march_shader = nullptr;
 	s_anubis_sssr_temporal_shader = nullptr;
+	s_anubis_sssr_temporal_blend_shader = nullptr;
 	s_fsr1_easu_shader = nullptr;
 	s_fsr1_easu_shader_ud = nullptr;
 	s_fsr1_rcas_shader = nullptr;
@@ -5019,6 +5023,28 @@ void outputShader()
 	float blend = mix(1.0, 0.9, stability) * accept;
 	vec3 outCol = mix(current, history, blend);
 
+	colorOut0 = vec4(outCol,1.0);
+}
+)";
+
+const std::string RendererOutputShader::s_anubis_sssr_temporal_blend_source =
+R"(
+layout(binding = 0) uniform sampler2D textureCurrent;
+layout(binding = 1) uniform sampler2D textureHistory;
+layout(binding = 2) uniform sampler2D textureWaterMask;
+
+void outputShader()
+{
+	vec3 current = texture(textureCurrent, passUV).rgb;
+	vec3 history = texture(textureHistory, passUV).rgb;
+	vec3 maskRgb = texture(textureWaterMask, passUV).rgb;
+	float maskStrength = max(max(maskRgb.r, maskRgb.g), maskRgb.b);
+	if(maskStrength <= 0.004){
+		colorOut0 = vec4(current,1.0);
+		return;
+	}
+	float blend = 0.9;
+	vec3 outCol = mix(current, history, blend);
 	colorOut0 = vec4(outCol,1.0);
 }
 )";

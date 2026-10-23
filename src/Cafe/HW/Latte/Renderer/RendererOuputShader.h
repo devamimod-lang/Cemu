@@ -117,6 +117,7 @@ public:
   static RendererOutputShader* s_anubis_sssr_normal_reconstruct_shader;
   static RendererOutputShader* s_anubis_sssr_march_shader;
   static RendererOutputShader* s_anubis_sssr_temporal_shader;
+  static RendererOutputShader* s_anubis_sssr_temporal_blend_shader;
   static RendererOutputShader* s_lanczos_shader;
   static RendererOutputShader* s_lanczos_shader_ud;
 
@@ -318,6 +319,8 @@ private:
   static const std::string s_anubis_sssr_march_source;
   // Anubis SSSR FidelityFX - temporal accumulate with depth/normal rejection
   static const std::string s_anubis_sssr_temporal_accumulate_source;
+  // Anubis SSSR FidelityFX - simple temporal blend for history
+  static const std::string s_anubis_sssr_temporal_blend_source;
 
   static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;

@@ -4795,3 +4795,49 @@ void outputShader()
 	colorOut0 = vec4(avg, avg, avg, 1.0);
 }
 )";
+
+const std::string RendererOutputShader::s_anubis_sssr_normal_reconstruct_source =
+R"(
+layout(binding = 0) uniform sampler2D textureDepth;
+layout(binding = 1) uniform sampler2D textureNormalHelper; // unused
+
+float WaterLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+vec3 WaterReconstruct(vec2 uv, float viewZ, float aspect)
+{
+	float tanFov = 0.57735027;
+	vec2 ndc = uv * 2.0 - 1.0;
+	return vec3(ndc.x * tanFov * aspect, ndc.y * tanFov, 1.0) * viewZ;
+}
+
+void outputShader()
+{
+	vec2 depthRes = max(faroBitmaskAoParams.xy, vec2(1.0));
+	float aspect = depthRes.x / depthRes.y;
+	float centreDepth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
+	float centreZ = WaterLinearize(centreDepth);
+	vec3 origin = WaterReconstruct(passUV, centreZ, aspect);
+
+	vec2 texel = 1.0 / depthRes;
+	vec2 off = texel * 2.0;
+	float zL = WaterLinearize(min(max(texture(textureDepth, passUV - vec2(off.x,0.0)).x, 0.0), 1.0));
+	float zR = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(off.x,0.0)).x, 0.0), 1.0));
+	float zU = WaterLinearize(min(max(texture(textureDepth, passUV - vec2(0.0,off.y)).x, 0.0), 1.0));
+	float zD = WaterLinearize(min(max(texture(textureDepth, passUV + vec2(0.0,off.y)).x, 0.0), 1.0));
+	vec3 pL = WaterReconstruct(passUV - vec2(off.x,0.0), zL, aspect);
+	vec3 pR = WaterReconstruct(passUV + vec2(off.x,0.0), zR, aspect);
+	vec3 pU = WaterReconstruct(passUV - vec2(0.0,off.y), zU, aspect);
+	vec3 pD = WaterReconstruct(passUV + vec2(0.0,off.y), zD, aspect);
+	vec3 nRaw = cross(pR - pL, pD - pU);
+	float nLen = length(nRaw);
+	vec3 normal = nLen > 1e-6 ? normalize(nRaw) : vec3(0.0,0.0,1.0);
+	if(dot(normal, normalize(origin)) > 0.0) normal = -normal;
+	normal = normalize(normal);
+	// Encode to [0,1]
+	colorOut0 = vec4(normal * 0.5 + 0.5, 1.0);
+}
+)";

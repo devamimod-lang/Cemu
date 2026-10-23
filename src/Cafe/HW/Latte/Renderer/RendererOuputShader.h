@@ -308,6 +308,8 @@ private:
   static const std::string s_anubis_water_ssr_source;
   // Anubis SSSR FidelityFX - depth pyramid downsample for SPD
   static const std::string s_anubis_sssr_depth_downsample_source;
+  // Anubis SSSR FidelityFX - normal reconstruction from depth
+  static const std::string s_anubis_sssr_normal_reconstruct_source;
 
   static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;

@@ -1712,6 +1712,10 @@ RendererOutputShader* RendererOutputShader::s_texture_upscale_shader;
 RendererOutputShader* RendererOutputShader::s_a4k_restore_pass[4];
 RendererOutputShader* RendererOutputShader::s_fsrcnn_pass[31];
 RendererOutputShader* RendererOutputShader::s_anubis_water_ssr_shader;
+RendererOutputShader* RendererOutputShader::s_anubis_sssr_depth_downsample_shader;
+RendererOutputShader* RendererOutputShader::s_anubis_sssr_normal_reconstruct_shader;
+RendererOutputShader* RendererOutputShader::s_anubis_sssr_march_shader;
+RendererOutputShader* RendererOutputShader::s_anubis_sssr_temporal_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader;
 RendererOutputShader* RendererOutputShader::s_lanczos_shader_ud;
 
@@ -3246,9 +3250,13 @@ void RendererOutputShader::InitializeStatic()
 	s_fsrcnn_pass[27] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a1_source);
 	s_fsrcnn_pass[28] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a2_source);
 	s_fsrcnn_pass[29] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a3_source);
-	s_fsrcnn_pass[30] = new RendererOutputShader(vertex_source, s_fsrcnn_recon_source);
-	s_anubis_water_ssr_shader = new RendererOutputShader(vertex_source, s_anubis_water_ssr_source);
-		break;
+  s_fsrcnn_pass[30] = new RendererOutputShader(vertex_source, s_fsrcnn_recon_source);
+  s_anubis_water_ssr_shader = new RendererOutputShader(vertex_source, s_anubis_water_ssr_source);
+  s_anubis_sssr_depth_downsample_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_depth_downsample_source);
+  s_anubis_sssr_normal_reconstruct_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_normal_reconstruct_source);
+  s_anubis_sssr_march_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_march_source);
+  s_anubis_sssr_temporal_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_temporal_accumulate_source);
+    break;
     }
 #endif
 #ifdef ENABLE_VULKAN
@@ -3316,10 +3324,14 @@ void RendererOutputShader::InitializeStatic()
     	s_fsrcnn_pass[27] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a1_source);
     	s_fsrcnn_pass[28] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a2_source);
     	s_fsrcnn_pass[29] = new RendererOutputShader(vertex_source, s_fsrcnn_f5_a3_source);
-    	s_fsrcnn_pass[30] = new RendererOutputShader(vertex_source, s_fsrcnn_recon_source);
-    	s_anubis_water_ssr_shader = new RendererOutputShader(vertex_source, s_anubis_water_ssr_source);
+     s_fsrcnn_pass[30] = new RendererOutputShader(vertex_source, s_fsrcnn_recon_source);
+     s_anubis_water_ssr_shader = new RendererOutputShader(vertex_source, s_anubis_water_ssr_source);
+     s_anubis_sssr_depth_downsample_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_depth_downsample_source);
+     s_anubis_sssr_normal_reconstruct_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_normal_reconstruct_source);
+     s_anubis_sssr_march_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_march_source);
+     s_anubis_sssr_temporal_shader = new RendererOutputShader(vertex_source, s_anubis_sssr_temporal_accumulate_source);
 
-    	s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
+     s_fsr1_easu_shader = new RendererOutputShader(vertex_source, s_fsr1_easu_shader_source);
     	s_fsr1_easu_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr1_easu_shader_source);
     	s_fsr1_rcas_shader = new RendererOutputShader(vertex_source, s_fsr1_rcas_shader_source);
 
@@ -3372,6 +3384,10 @@ void RendererOutputShader::ShutdownStatic()
 	for (int i = 0; i < 31; i++)
 		delete s_fsrcnn_pass[i];
 	delete s_anubis_water_ssr_shader;
+	delete s_anubis_sssr_depth_downsample_shader;
+	delete s_anubis_sssr_normal_reconstruct_shader;
+	delete s_anubis_sssr_march_shader;
+	delete s_anubis_sssr_temporal_shader;
 
 	delete s_fsr1_easu_shader;
 	delete s_fsr1_easu_shader_ud;
@@ -3421,6 +3437,10 @@ void RendererOutputShader::ShutdownStatic()
 	for (int i = 0; i < 31; i++)
 		s_fsrcnn_pass[i] = nullptr;
 	s_anubis_water_ssr_shader = nullptr;
+	s_anubis_sssr_depth_downsample_shader = nullptr;
+	s_anubis_sssr_normal_reconstruct_shader = nullptr;
+	s_anubis_sssr_march_shader = nullptr;
+	s_anubis_sssr_temporal_shader = nullptr;
 	s_fsr1_easu_shader = nullptr;
 	s_fsr1_easu_shader_ud = nullptr;
 	s_fsr1_rcas_shader = nullptr;

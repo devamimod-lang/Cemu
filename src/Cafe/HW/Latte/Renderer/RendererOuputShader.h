@@ -112,9 +112,13 @@ public:
 	// FSRCNN-small x2 chain, in execution order. See AnubisRunFsrcnnChain for
 	// which target each one writes and why the order cannot change.
 	static RendererOutputShader* s_fsrcnn_pass[31];
-	static RendererOutputShader* s_anubis_water_ssr_shader;
-	static RendererOutputShader* s_lanczos_shader;
-	static RendererOutputShader* s_lanczos_shader_ud;
+  static RendererOutputShader* s_anubis_water_ssr_shader;
+  static RendererOutputShader* s_anubis_sssr_depth_downsample_shader;
+  static RendererOutputShader* s_anubis_sssr_normal_reconstruct_shader;
+  static RendererOutputShader* s_anubis_sssr_march_shader;
+  static RendererOutputShader* s_anubis_sssr_temporal_shader;
+  static RendererOutputShader* s_lanczos_shader;
+  static RendererOutputShader* s_lanczos_shader_ud;
 
 	// Not available under Metal - AMD's FSR1 reference has no Metal/MSL port and
 	// Cemu's Metal output-shader path skips the shared GLSL preamble entirely

@@ -4841,3 +4841,108 @@ void outputShader()
 	colorOut0 = vec4(normal * 0.5 + 0.5, 1.0);
 }
 )";
+
+const std::string RendererOutputShader::s_anubis_sssr_march_source =
+R"(
+layout(binding = 0) uniform sampler2D textureScene;
+layout(binding = 1) uniform sampler2D textureDepthPyramid; // depth mips packed as layers? simplified to base
+layout(binding = 2) uniform sampler2D textureNormal;
+layout(binding = 3) uniform sampler2D textureWaterMask;
+layout(binding = 4) uniform sampler2D textureBlueNoise;
+
+float WaterLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+vec3 WaterReconstruct(vec2 uv, float viewZ, float aspect)
+{
+	float tanFov = 0.57735027;
+	vec2 ndc = uv * 2.0 - 1.0;
+	return vec3(ndc.x * tanFov * aspect, ndc.y * tanFov, 1.0) * viewZ;
+}
+
+float LoadDepthMip(vec2 uv, int mip)
+{
+	// Simplificado: usamos textura base para prototipo
+	return texture(textureDepthPyramid, uv).r;
+}
+
+vec3 ScreenToView(vec3 p)
+{
+	return p;
+}
+
+void outputShader()
+{
+	vec3 sceneColor = texture(textureScene, passUV).rgb;
+	vec3 maskRgb = texture(textureWaterMask, passUV).rgb;
+	float maskStrength = max(max(maskRgb.r, maskRgb.g), maskRgb.b);
+	if(maskStrength <= 0.004){
+		colorOut0 = vec4(sceneColor,1.0);
+		return;
+	}
+
+	vec2 depthRes = max(faroBitmaskAoParams.xy, vec2(1.0));
+	float aspect = depthRes.x / depthRes.y;
+	float centreDepth = min(max(texture(textureDepthPyramid, passUV).x, 0.0), 1.0);
+	float centreZ = WaterLinearize(centreDepth);
+	vec3 origin = WaterReconstruct(passUV, centreZ, aspect);
+	vec3 viewDir = normalize(origin);
+
+	vec3 normalEnc = texture(textureNormal, passUV).rgb;
+	vec3 normal = normalize(normalEnc * 2.0 - 1.0);
+	if(dot(normal, viewDir) > 0.0) normal = -normal;
+
+	vec3 reflectDir = reflect(viewDir, normal);
+
+	// Marchado jerárquico simplificado: 1 muestra, 32 pasos con incremento geométrico
+	const int STEPS = 32;
+	const float RAY_INC = 1.18;
+	float maxDistance = max(faroGtaoParams.z, 8.0);
+	float grazing = clamp(1.0 - dot(reflectDir, viewDir), 0.0, 1.0);
+	float stepScale = min(1.0 / (grazing + 1e-3), 8.0);
+	float dither = texture(textureBlueNoise, passUV * 4.0).r;
+	float stepLen = centreZ * 0.01 * stepScale * (0.75 + 0.5 * dither);
+	float t = stepLen;
+	float tPrev = 0.0;
+	bool hit = false;
+	vec2 hitUV = vec2(0.0);
+	for(int i=0;i<STEPS;i++){
+		vec3 p = origin + reflectDir * t;
+		if(p.z <= 1e-3 || t > maxDistance) break;
+		vec2 uv = vec2(p.x / (p.z * 0.57735027 * aspect), p.y / (p.z * 0.57735027)) * 0.5 + 0.5;
+		if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+		float sceneZ = WaterLinearize(min(max(texture(textureDepthPyramid, uv).x, 0.0), 1.0));
+		float travelled = t - tPrev;
+		float behind = p.z - sceneZ;
+		if(behind > 0.0 && behind < max(travelled, p.z * 0.04)){
+			hitUV = uv;
+			hit = true;
+			break;
+		}
+		tPrev = t;
+		t += stepLen;
+		stepLen *= RAY_INC;
+	}
+
+	if(!hit){
+		colorOut0 = vec4(sceneColor,1.0);
+		return;
+	}
+
+	vec3 reflected = texture(textureScene, hitUV).rgb;
+	vec2 edge = min(hitUV, vec2(1.0) - hitUV);
+	float edgeFade = clamp(min(edge.x, edge.y) / 0.08, 0.0, 1.0);
+	float lengthFade = 1.0 - clamp(t / maxDistance, 0.0, 1.0);
+	float dirFade = clamp(dot(viewDir, reflectDir), 0.0, 1.0);
+	float grazeFade = clamp(1.0 - dot(-viewDir, normal), 0.0, 1.0);
+	float fresnel = mix(0.04, 1.0, pow(grazeFade, 4.0));
+	float strength = clamp(faroGtaoParams.x, 0.0, 2.0);
+	float weight = edgeFade * mix(0.5, 1.0, lengthFade) * mix(0.4, 1.0, dirFade) * fresnel * strength;
+	weight *= clamp(maskStrength * 4.0, 0.0, 1.0);
+
+	colorOut0 = vec4(mix(sceneColor, reflected, clamp(weight,0.0,1.0)), 1.0);
+}
+)";

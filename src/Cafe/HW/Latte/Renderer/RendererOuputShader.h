@@ -310,6 +310,8 @@ private:
   static const std::string s_anubis_sssr_depth_downsample_source;
   // Anubis SSSR FidelityFX - normal reconstruction from depth
   static const std::string s_anubis_sssr_normal_reconstruct_source;
+  // Anubis SSSR FidelityFX - hierarchical march pass
+  static const std::string s_anubis_sssr_march_source;
 
   static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;

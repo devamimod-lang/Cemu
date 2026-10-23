@@ -4865,10 +4865,8 @@ void outputShader()
 const std::string RendererOutputShader::s_anubis_sssr_march_source =
 R"(
 layout(binding = 0) uniform sampler2D textureScene;
-layout(binding = 1) uniform sampler2D textureDepthPyramid; // depth mips packed as layers? simplified to base
-layout(binding = 2) uniform sampler2D textureNormal;
+layout(binding = 2) uniform sampler2D textureDepth;
 layout(binding = 3) uniform sampler2D textureWaterMask;
-layout(binding = 4) uniform sampler2D textureBlueNoise;
 
 float WaterLinearize(float d)
 {
@@ -4883,15 +4881,25 @@ vec3 WaterReconstruct(vec2 uv, float viewZ, float aspect)
 	return vec3(ndc.x * tanFov * aspect, ndc.y * tanFov, 1.0) * viewZ;
 }
 
-float LoadDepthMip(vec2 uv, int mip)
+vec3 ReconstructNormal(vec2 uv, float aspect)
 {
-	// Simplificado: usamos textura base para prototipo
-	return texture(textureDepthPyramid, uv).r;
-}
-
-vec3 ScreenToView(vec3 p)
-{
-	return p;
+	vec2 texel = 1.0 / max(faroBitmaskAoParams.xy, vec2(1.0));
+	vec2 off = texel * 2.0;
+	float zC = WaterLinearize(min(max(texture(textureDepth, uv).x,0.0),1.0));
+	float zL = WaterLinearize(min(max(texture(textureDepth, uv - vec2(off.x,0.0)).x,0.0),1.0));
+	float zR = WaterLinearize(min(max(texture(textureDepth, uv + vec2(off.x,0.0)).x,0.0),1.0));
+	float zU = WaterLinearize(min(max(texture(textureDepth, uv - vec2(0.0,off.y)).x,0.0),1.0));
+	float zD = WaterLinearize(min(max(texture(textureDepth, uv + vec2(0.0,off.y)).x,0.0),1.0));
+	vec3 pC = WaterReconstruct(uv, zC, aspect);
+	vec3 pL = WaterReconstruct(uv - vec2(off.x,0.0), zL, aspect);
+	vec3 pR = WaterReconstruct(uv + vec2(off.x,0.0), zR, aspect);
+	vec3 pU = WaterReconstruct(uv - vec2(0.0,off.y), zU, aspect);
+	vec3 pD = WaterReconstruct(uv + vec2(0.0,off.y), zD, aspect);
+	vec3 nRaw = cross(pR - pL, pD - pU);
+	float nLen = length(nRaw);
+	vec3 n = nLen > 1e-6 ? normalize(nRaw) : vec3(0.0,0.0,1.0);
+	if(dot(n, normalize(pC)) > 0.0) n = -n;
+	return normalize(n);
 }
 
 void outputShader()
@@ -4906,24 +4914,20 @@ void outputShader()
 
 	vec2 depthRes = max(faroBitmaskAoParams.xy, vec2(1.0));
 	float aspect = depthRes.x / depthRes.y;
-	float centreDepth = min(max(texture(textureDepthPyramid, passUV).x, 0.0), 1.0);
+	float centreDepth = min(max(texture(textureDepth, passUV).x, 0.0), 1.0);
 	float centreZ = WaterLinearize(centreDepth);
 	vec3 origin = WaterReconstruct(passUV, centreZ, aspect);
 	vec3 viewDir = normalize(origin);
 
-	vec3 normalEnc = texture(textureNormal, passUV).rgb;
-	vec3 normal = normalize(normalEnc * 2.0 - 1.0);
-	if(dot(normal, viewDir) > 0.0) normal = -normal;
-
+	vec3 normal = ReconstructNormal(passUV, aspect);
 	vec3 reflectDir = reflect(viewDir, normal);
 
-	// Marchado jerárquico simplificado: 1 muestra, 32 pasos con incremento geométrico
 	const int STEPS = 32;
 	const float RAY_INC = 1.18;
 	float maxDistance = max(faroGtaoParams.z, 8.0);
 	float grazing = clamp(1.0 - dot(reflectDir, viewDir), 0.0, 1.0);
 	float stepScale = min(1.0 / (grazing + 1e-3), 8.0);
-	float dither = texture(textureBlueNoise, passUV * 4.0).r;
+	float dither = dot(floor(mod(gl_FragCoord.xy, 4.0)), vec2(0.0625, 0.25));
 	float stepLen = centreZ * 0.01 * stepScale * (0.75 + 0.5 * dither);
 	float t = stepLen;
 	float tPrev = 0.0;
@@ -4934,7 +4938,7 @@ void outputShader()
 		if(p.z <= 1e-3 || t > maxDistance) break;
 		vec2 uv = vec2(p.x / (p.z * 0.57735027 * aspect), p.y / (p.z * 0.57735027)) * 0.5 + 0.5;
 		if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
-		float sceneZ = WaterLinearize(min(max(texture(textureDepthPyramid, uv).x, 0.0), 1.0));
+		float sceneZ = WaterLinearize(min(max(texture(textureDepth, uv).x, 0.0), 1.0));
 		float travelled = t - tPrev;
 		float behind = p.z - sceneZ;
 		if(behind > 0.0 && behind < max(travelled, p.z * 0.04)){

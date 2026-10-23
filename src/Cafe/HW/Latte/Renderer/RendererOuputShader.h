@@ -303,11 +303,13 @@ private:
 	static const std::string s_fsrcnn_f5_a2_source;
 	static const std::string s_fsrcnn_f5_a3_source;
 	static const std::string s_fsrcnn_recon_source;
-	// Anubis water reflections - see the source for why this exists and what
-	// the game's own pass does not do.
-	static const std::string s_anubis_water_ssr_source;
+  // Anubis water reflections - see the source for why this exists and what
+  // the game's own pass does not do.
+  static const std::string s_anubis_water_ssr_source;
+  // Anubis SSSR FidelityFX - depth pyramid downsample for SPD
+  static const std::string s_anubis_sssr_depth_downsample_source;
 
-	static const std::string s_lanczos_shader_source;
+  static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;
 	static const std::string s_fsr1_rcas_shader_source;
 	static const std::string s_fxaa_shader_source;

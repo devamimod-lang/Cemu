@@ -4773,3 +4773,25 @@ void outputShader()
 	colorOut0 = vec4(mix(sceneColor, reflected, clamp(weight, 0.0, 1.0)), 1.0);
 }
 )";
+
+const std::string RendererOutputShader::s_anubis_sssr_depth_downsample_source =
+R"(
+layout(binding = 0) uniform sampler2D textureSrc;
+
+void outputShader()
+{
+	// Simple 2x2 average downsample for SPD depth pyramid
+	vec2 texel = 1.0 / vec2(textureSize(textureSrc, 0));
+	vec2 uv = passUV * vec2(textureSize(textureSrc, 0)) - 0.5;
+	vec2 uv0 = (uv + vec2(-0.5, -0.5)) * texel;
+	vec2 uv1 = (uv + vec2(+0.5, -0.5)) * texel;
+	vec2 uv2 = (uv + vec2(-0.5, +0.5)) * texel;
+	vec2 uv3 = (uv + vec2(+0.5, +0.5)) * texel;
+	float s0 = texture(textureSrc, uv0).r;
+	float s1 = texture(textureSrc, uv1).r;
+	float s2 = texture(textureSrc, uv2).r;
+	float s3 = texture(textureSrc, uv3).r;
+	float avg = (s0 + s1 + s2 + s3) * 0.25;
+	colorOut0 = vec4(avg, avg, avg, 1.0);
+}
+)";

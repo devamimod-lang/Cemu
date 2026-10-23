@@ -434,7 +434,8 @@ public:
 	// AnubisRunWaterReflection only supplies the material mask.
 	bool RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
 		VkImageView colorInputView, VkSampler colorInputSampler,
-		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent);
+		VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent,
+		VkImage outputImage);
 	bool AnubisEnsureWaterScratch(VkFormat format, uint32 width, uint32 height);
 	bool AnubisAllocateWaterScratch(VkFormat format, uint32 width, uint32 height);
 	void ProcessDeferredAnubisTargets();
@@ -931,6 +932,8 @@ private:
 	VkImage m_sssrIntermediateImage = VK_NULL_HANDLE;
 	VkImageView m_sssrIntermediateView = VK_NULL_HANDLE;
 	VkDeviceMemory m_sssrIntermediateMemory = VK_NULL_HANDLE;
+	VkRenderPass m_sssrIntermediateRenderPass = VK_NULL_HANDLE;
+	VkFramebuffer m_sssrIntermediateFramebuffer = VK_NULL_HANDLE;
 
 	// Water reflection hit probe: reads the pass's own output back to the CPU
 	// and reports, as NUMBERS in the log, how many pixels the material mask

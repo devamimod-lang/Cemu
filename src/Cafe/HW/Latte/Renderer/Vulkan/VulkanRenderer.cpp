@@ -4730,7 +4730,8 @@ bool VulkanRenderer::RunFaroGiPass(LatteTextureView* texView, sint32 passWidth, 
 // asked for a sharp one.
 bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passWidth, sint32 passHeight, bool padView,
 	VkImageView colorInputView, VkSampler colorInputSampler,
-	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent)
+	VkRenderPass outputRenderPass, VkFramebuffer outputFramebuffer, VkExtent2D outputExtent,
+	VkImage outputImage)
 {
 	// One latch PER REASON, and the distinction is not pedantry.
 	//
@@ -4852,7 +4853,9 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 			VkMemoryAllocateInfo allocInfo{};
 			allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 			allocInfo.allocationSize = memReq.size;
-			allocInfo.memoryTypeIndex = m_memoryManager->FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+			uint32 sssrMemIndex = 0;
+			if (!memoryManager->FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sssrMemIndex)) return false;
+			allocInfo.memoryTypeIndex = sssrMemIndex;
 			if (vkAllocateMemory(m_logicalDevice, &allocInfo, nullptr, mem) != VK_SUCCESS) return false;
 			vkBindImageMemory(m_logicalDevice, *img, *mem, 0);
 			VkImageViewCreateInfo viewInfo{};
@@ -4868,6 +4871,68 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 		};
 		if (!createImage(&m_sssrHistoryImage, &m_sssrHistoryView, &m_sssrHistoryMemory)) return bailOnce(9, "could not create SSSR history image");
 		if (!createImage(&m_sssrIntermediateImage, &m_sssrIntermediateView, &m_sssrIntermediateMemory)) return bailOnce(9, "could not create SSSR intermediate image");
+
+		// Render pass + framebuffer for the intermediate target, same shape as
+		// the GI scratch pass: finalLayout SHADER_READ_ONLY so the blend pass
+		// samples the march result without a manual barrier between passes.
+		if (m_sssrIntermediateFramebuffer != VK_NULL_HANDLE) { vkDestroyFramebuffer(m_logicalDevice, m_sssrIntermediateFramebuffer, nullptr); m_sssrIntermediateFramebuffer = VK_NULL_HANDLE; }
+		if (m_sssrIntermediateRenderPass != VK_NULL_HANDLE) { vkDestroyRenderPass(m_logicalDevice, m_sssrIntermediateRenderPass, nullptr); m_sssrIntermediateRenderPass = VK_NULL_HANDLE; }
+		{
+			VkAttachmentDescription marchAttachment{};
+			marchAttachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+			marchAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+			marchAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			marchAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+			marchAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+			marchAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+			marchAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			marchAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			VkAttachmentReference marchAttachmentRef{};
+			marchAttachmentRef.attachment = 0;
+			marchAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			VkSubpassDescription marchSubpass{};
+			marchSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+			marchSubpass.colorAttachmentCount = 1;
+			marchSubpass.pColorAttachments = &marchAttachmentRef;
+			VkRenderPassCreateInfo marchRpInfo{};
+			marchRpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+			marchRpInfo.attachmentCount = 1;
+			marchRpInfo.pAttachments = &marchAttachment;
+			marchRpInfo.subpassCount = 1;
+			marchRpInfo.pSubpasses = &marchSubpass;
+			if (vkCreateRenderPass(m_logicalDevice, &marchRpInfo, nullptr, &m_sssrIntermediateRenderPass) != VK_SUCCESS)
+				return bailOnce(9, "could not create SSSR intermediate render pass");
+			VkImageView marchAttachments[1] = { m_sssrIntermediateView };
+			VkFramebufferCreateInfo marchFbInfo{};
+			marchFbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+			marchFbInfo.renderPass = m_sssrIntermediateRenderPass;
+			marchFbInfo.attachmentCount = 1;
+			marchFbInfo.pAttachments = marchAttachments;
+			marchFbInfo.width = passWidth;
+			marchFbInfo.height = passHeight;
+			marchFbInfo.layers = 1;
+			if (vkCreateFramebuffer(m_logicalDevice, &marchFbInfo, nullptr, &m_sssrIntermediateFramebuffer) != VK_SUCCESS)
+				return bailOnce(9, "could not create SSSR intermediate framebuffer");
+		}
+
+		// A fresh history starts black rather than undefined: sampling an
+		// undefined-layout image is a validation error, and a garbage first
+		// frame flashes whatever the allocation happened to contain. Cleared
+		// mid-recording, outside any render pass, and left in SHADER_READ_ONLY
+		// which is the layout every later use expects.
+		{
+			VkImageSubresourceRange clearRange{};
+			clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			clearRange.baseMipLevel = 0;
+			clearRange.levelCount = 1;
+			clearRange.baseArrayLayer = 0;
+			clearRange.layerCount = 1;
+			barrier_image<IMAGE_WRITE | ANY_TRANSFER, ANY_TRANSFER>(m_sssrHistoryImage, clearRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			VkClearColorValue clearColor{};
+			vkCmdClearColorImage(m_state.currentCommandBuffer, m_sssrHistoryImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &clearRange);
+			barrier_image<ANY_TRANSFER, IMAGE_READ | IMAGE_WRITE>(m_sssrHistoryImage, clearRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		}
+
 		m_waterScratchPendingWidth = passWidth;
 		m_waterScratchPendingHeight = passHeight;
 		m_sssrHistoryValid = true;
@@ -4910,6 +4975,18 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	if (ssrSet == VK_NULL_HANDLE)
 		return bailOnce(6, "descriptor set unavailable");
 
+	// Blend set: binding 0 carries the march result, binding 2 the previous
+	// frame's history, binding 3 the same mask the march saw. The intermediate
+	// is already in SHADER_READ_ONLY (its render pass finalLayout did that) and
+	// the history is kept in SHADER_READ_ONLY from the end of the previous
+	// frame's copy.
+	VkDescriptorSet blendSet = GetFaroEffectDescriptorSet(m_sssrIntermediateView, m_waterMaskSampler,
+		m_sssrHistoryView, m_sssrHistorySampler,
+		bind3Test ? colorInputView : sampledMaskView->m_textureImageView,
+		bind3Test ? colorInputSampler : m_waterMaskSampler);
+	if (blendSet == VK_NULL_HANDLE)
+		return bailOnce(6, "blend descriptor set unavailable");
+
 	// Only a LIVE depth needs the transition; the snapshot copy already left
 	// itself in SHADER_READ_ONLY.
 	for (sint32 mip = 0; !useDepthSnapshot && mip < depthView->numMip; mip++)
@@ -4923,7 +5000,15 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	}
 
 
-	auto ssrPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, ssrShader, outputRenderPass);
+	// Two pipelines against two render passes: the march writes its raw result
+	// into the intermediate target (its own pass, finalLayout SHADER_READ_ONLY),
+	// the temporal blend reads that plus last frame's history and writes the
+	// final composite into the output chain target.
+	auto marchPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, ssrShader, m_sssrIntermediateRenderPass);
+	RendererOutputShader* blendShader = RendererOutputShader::s_anubis_sssr_temporal_blend_shader;
+	if (!blendShader)
+		return bailOnce(3, "blend shader not compiled");
+	auto blendPipeline = backbufferBlit_createGraphicsPipeline(m_swapchainDescriptorSetLayout, padView, blendShader, outputRenderPass);
 
 	VkMemoryBarrier inputBarrier{};
 	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -4974,6 +5059,27 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	VkRect2D scissor{};
 	scissor.extent = outputExtent;
 
+	// Pass 1: hierarchical march into the intermediate target.
+	VkRenderPassBeginInfo marchRpBegin{};
+	marchRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	marchRpBegin.renderPass = m_sssrIntermediateRenderPass;
+	marchRpBegin.framebuffer = m_sssrIntermediateFramebuffer;
+	marchRpBegin.renderArea.offset = { 0, 0 };
+	marchRpBegin.renderArea.extent = { (uint32)passWidth, (uint32)passHeight };
+	marchRpBegin.clearValueCount = 0;
+	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
+	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &marchRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, marchPipeline);
+	m_state.currentPipeline = marchPipeline;
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ssrSet, 1, &uniformOffset);
+	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
+	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+
+	// Pass 2: temporal blend. The march target arrived in SHADER_READ_ONLY via
+	// its render pass finalLayout, so it is sampled here without a manual
+	// barrier; the output chain pass leaves the composite where the rest of
+	// the chain expects it.
 	VkRenderPassBeginInfo rpInfo{};
 	rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	rpInfo.renderPass = outputRenderPass;
@@ -4981,12 +5087,10 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	rpInfo.renderArea.offset = { 0, 0 };
 	rpInfo.renderArea.extent = outputExtent;
 	rpInfo.clearValueCount = 0;
-	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
-	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ssrPipeline);
-	m_state.currentPipeline = ssrPipeline;
-	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ssrSet, 1, &uniformOffset);
+	vkCmdBindPipeline(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, blendPipeline);
+	m_state.currentPipeline = blendPipeline;
+	vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &blendSet, 1, &uniformOffset);
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
 
@@ -5010,6 +5114,34 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	// The game's texture goes back to the layout its own rendering expects.
 	barrier_image<IMAGE_READ, IMAGE_READ | IMAGE_WRITE>(maskTexVk, maskLayers, maskTexVk->GetDefaultLayout());
 
+	// History update: the blend result sits in the chain target, in
+	// SHADER_READ_ONLY via that pass's finalLayout. Copy it into the
+	// persistent history image for next frame's blend, then put BOTH images
+	// back into SHADER_READ_ONLY - the chain target because the rest of the
+	// chain samples it next, the history because that is the layout every
+	// later use of it expects.
+	{
+		VkImageSubresourceRange histRange{};
+		histRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		histRange.baseMipLevel = 0;
+		histRange.levelCount = 1;
+		histRange.baseArrayLayer = 0;
+		histRange.layerCount = 1;
+		barrier_image<IMAGE_READ, ANY_TRANSFER>(outputImage, histRange, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		barrier_image<IMAGE_READ | IMAGE_WRITE, ANY_TRANSFER>(m_sssrHistoryImage, histRange, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		VkImageCopy histCopy{};
+		histCopy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		histCopy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		histCopy.extent = { std::min<uint32>(outputExtent.width, (uint32)passWidth),
+			std::min<uint32>(outputExtent.height, (uint32)passHeight), 1 };
+		vkCmdCopyImage(m_state.currentCommandBuffer,
+			outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_sssrHistoryImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &histCopy);
+		barrier_image<ANY_TRANSFER, IMAGE_READ | IMAGE_WRITE>(outputImage, histRange, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		barrier_image<ANY_TRANSFER, IMAGE_READ | IMAGE_WRITE>(m_sssrHistoryImage, histRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
 	// Counts the pass that actually REFLECTS.
 	//
 	// This increment was briefly placed in the mask copy instead, which then
@@ -5020,9 +5152,6 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	// counter that nothing incremented at all.
 	m_faroSsrRanFrames++;
 	m_sssrHistoryValid = true;
-	// Update history texture with current output for next frame
-	// Placeholder: copy will be added once intermediate texture is available
-	// For now, keep history valid flag for future use
 	static bool s_loggedFirstRun = false;
 	if (!s_loggedFirstRun)
 	{
@@ -9310,8 +9439,9 @@ bool VulkanRenderer::DrawBackbufferQuadTaa(LatteTextureView* texView, RendererOu
 		VkRenderPass ssrOutRP = chainInB ? m_taaNativeResolveRenderPass : m_taaFxaaRenderPass;
 		VkFramebuffer ssrOutFB = chainInB ? m_taaNativeResolveFramebuffer : m_taaFxaaFramebuffer;
 		VkExtent2D ssrOutExt = chainInB ? m_taaNativeResolveExtent : m_taaFxaaExtent;
+		VkImage ssrOutImage = chainInB ? m_taaNativeResolveImage : m_taaFxaaImage;
 		if (RunFaroWaterSsrPass(texView, nativeWidth, nativeHeight, padView,
-			chainColorView, chainColorSampler, ssrOutRP, ssrOutFB, ssrOutExt))
+			chainColorView, chainColorSampler, ssrOutRP, ssrOutFB, ssrOutExt, ssrOutImage))
 		{
 			pass1InputSet = chainInB ? m_taaNativeResolveDescriptorSet : m_taaFxaaReadDescriptorSet;
 			chainColorView = chainInB ? m_taaNativeResolveView : m_taaFxaaView;

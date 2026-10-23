@@ -5026,6 +5026,9 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	// counter that nothing incremented at all.
 	m_faroSsrRanFrames++;
 	m_sssrHistoryValid = true;
+	// Update history texture with current output for next frame
+	// Placeholder: copy will be added once intermediate texture is available
+	// For now, keep history valid flag for future use
 	static bool s_loggedFirstRun = false;
 	if (!s_loggedFirstRun)
 	{

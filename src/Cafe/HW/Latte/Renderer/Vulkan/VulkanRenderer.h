@@ -927,6 +927,10 @@ private:
 	VkSampler m_sssrHistorySampler = VK_NULL_HANDLE;
 	VkDeviceMemory m_sssrHistoryMemory = VK_NULL_HANDLE;
 	bool m_sssrHistoryValid = false;
+	// SSSR intermediate target for march -> temporal blend
+	VkImage m_sssrIntermediateImage = VK_NULL_HANDLE;
+	VkImageView m_sssrIntermediateView = VK_NULL_HANDLE;
+	VkDeviceMemory m_sssrIntermediateMemory = VK_NULL_HANDLE;
 
 	// Water reflection hit probe: reads the pass's own output back to the CPU
 	// and reports, as NUMBERS in the log, how many pixels the material mask

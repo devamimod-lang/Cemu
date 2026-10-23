@@ -4805,6 +4805,23 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_waterMaskSampler) != VK_SUCCESS)
 			return bailOnce(5, "could not create the mask sampler");
 	}
+	if (m_sssrHistorySampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_sssrHistorySampler) != VK_SUCCESS)
+			return bailOnce(8, "could not create SSSR history sampler");
+	}
 
 	const bool useDepthSnapshot = m_faroDepthSnapshotValid && m_faroDepthSnapshotView != VK_NULL_HANDLE;
 	VkImageView depthSampleView = useDepthSnapshot ? m_faroDepthSnapshotView : sampledDepthView->m_textureImageView;
@@ -4952,6 +4969,7 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	// renderer was DELETED on the strength of "SSR ran 0/600 frames", from a
 	// counter that nothing incremented at all.
 	m_faroSsrRanFrames++;
+	m_sssrHistoryValid = true;
 	static bool s_loggedFirstRun = false;
 	if (!s_loggedFirstRun)
 	{

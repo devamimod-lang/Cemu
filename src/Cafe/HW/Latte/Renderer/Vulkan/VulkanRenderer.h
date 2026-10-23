@@ -921,6 +921,11 @@ private:
 	uint32 m_waterScratchPendingWidth = 0;
 	uint32 m_waterScratchPendingHeight = 0;
 
+	// SSSR temporal history
+	LatteTextureView* m_sssrHistoryView = nullptr;
+	VkSampler m_sssrHistorySampler = VK_NULL_HANDLE;
+	bool m_sssrHistoryValid = false;
+
 	// Water reflection hit probe: reads the pass's own output back to the CPU
 	// and reports, as NUMBERS in the log, how many pixels the material mask
 	// let through and how many of those found geometry.

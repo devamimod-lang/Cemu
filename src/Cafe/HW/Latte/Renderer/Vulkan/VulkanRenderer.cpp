@@ -4777,8 +4777,8 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 	if (!depthView || !depthView->baseTexture)
 		return bailOnce(2, "depth view gone");
 	LatteTC_MarkTextureStillInUse(depthView->baseTexture);
-	RendererOutputShader* ssrShader = RendererOutputShader::s_anubis_water_ssr_shader;
-	if (!ssrShader)
+  RendererOutputShader* ssrShader = RendererOutputShader::s_anubis_sssr_march_shader;
+  if (!ssrShader)
 		return bailOnce(3, "shader not compiled");
 	auto* depthViewVk = static_cast<LatteTextureViewVk*>(depthView);
 	auto* depthTexVk = static_cast<LatteTextureVk*>(depthView->baseTexture);

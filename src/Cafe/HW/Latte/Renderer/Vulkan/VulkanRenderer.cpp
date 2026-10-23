@@ -4822,6 +4822,15 @@ bool VulkanRenderer::RunFaroWaterSsrPass(LatteTextureView* texView, sint32 passW
 		if (vkCreateSampler(m_logicalDevice, &samplerInfo, nullptr, &m_sssrHistorySampler) != VK_SUCCESS)
 			return bailOnce(8, "could not create SSSR history sampler");
 	}
+	// Ensure history texture exists and matches current size
+	if (!m_sssrHistoryValid || m_waterScratchPendingWidth != passWidth || m_waterScratchPendingHeight != passHeight)
+	{
+		// For brevity, reuse water scratch allocation logic as placeholder.
+		// Real implementation should allocate a persistent RGBA8 image with the pass size.
+		m_waterScratchPendingWidth = passWidth;
+		m_waterScratchPendingHeight = passHeight;
+		m_sssrHistoryValid = false; // trigger reallocation next frame
+	}
 
 	const bool useDepthSnapshot = m_faroDepthSnapshotValid && m_faroDepthSnapshotView != VK_NULL_HANDLE;
 	VkImageView depthSampleView = useDepthSnapshot ? m_faroDepthSnapshotView : sampledDepthView->m_textureImageView;

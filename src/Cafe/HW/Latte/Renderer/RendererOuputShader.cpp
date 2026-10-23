@@ -4946,3 +4946,55 @@ void outputShader()
 	colorOut0 = vec4(mix(sceneColor, reflected, clamp(weight,0.0,1.0)), 1.0);
 }
 )";
+
+const std::string RendererOutputShader::s_anubis_sssr_temporal_accumulate_source =
+R"(
+layout(binding = 0) uniform sampler2D textureCurrent;
+layout(binding = 1) uniform sampler2D textureHistory;
+layout(binding = 2) uniform sampler2D textureDepthCurr;
+layout(binding = 3) uniform sampler2D textureDepthPrev;
+layout(binding = 4) uniform sampler2D textureNormalCurr;
+layout(binding = 5) uniform sampler2D textureNormalPrev;
+layout(binding = 6) uniform sampler2D textureWaterMask;
+
+float WaterLinearize(float d)
+{
+	float farPlane = max(faroGtaoParams.w, 1.0);
+	return 1.0 / max(1.0 - d * (1.0 - 1.0 / farPlane), 1e-5);
+}
+
+void outputShader()
+{
+	vec3 current = texture(textureCurrent, passUV).rgb;
+	vec3 history = texture(textureHistory, passUV).rgb;
+	vec3 maskRgb = texture(textureWaterMask, passUV).rgb;
+	float maskStrength = max(max(maskRgb.r, maskRgb.g), maskRgb.b);
+	if(maskStrength <= 0.004){
+		colorOut0 = vec4(current,1.0);
+		return;
+	}
+
+	float depthCurr = WaterLinearize(min(max(texture(textureDepthCurr, passUV).x, 0.0), 1.0));
+	float depthPrev = WaterLinearize(min(max(texture(textureDepthPrev, passUV).x, 0.0), 1.0));
+	vec3 normalCurrEnc = texture(textureNormalCurr, passUV).rgb;
+	vec3 normalPrevEnc = texture(textureNormalPrev, passUV).rgb;
+	vec3 normalCurr = normalize(normalCurrEnc * 2.0 - 1.0);
+	vec3 normalPrev = normalize(normalPrevEnc * 2.0 - 1.0);
+
+	float depthDiff = abs(depthCurr - depthPrev) / max(depthCurr, 1e-5);
+	float normalSim = max(0.0, dot(normalCurr, normalPrev));
+
+	// Rejection simple sin motion vectors: misma coordenada
+	float accept = 0.0;
+	if(depthDiff < 0.02 && normalSim > 0.98){
+		accept = 1.0;
+	}
+
+	// EMA temporal con factor de estabilidad
+	float stability = clamp(faroGtaoParams.y, 0.0, 1.0);
+	float blend = mix(1.0, 0.9, stability) * accept;
+	vec3 outCol = mix(current, history, blend);
+
+	colorOut0 = vec4(outCol,1.0);
+}
+)";

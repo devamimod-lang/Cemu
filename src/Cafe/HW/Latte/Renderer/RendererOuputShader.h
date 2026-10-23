@@ -312,6 +312,8 @@ private:
   static const std::string s_anubis_sssr_normal_reconstruct_source;
   // Anubis SSSR FidelityFX - hierarchical march pass
   static const std::string s_anubis_sssr_march_source;
+  // Anubis SSSR FidelityFX - temporal accumulate with depth/normal rejection
+  static const std::string s_anubis_sssr_temporal_accumulate_source;
 
   static const std::string s_lanczos_shader_source;
 	static const std::string s_fsr1_easu_shader_source;
